@@ -24,6 +24,7 @@
     - [2. Overall gpt performance](#overall-gpt-performance)
     - [3. Convert coordinates to places](#convert-coordinates-to-places)
     - [4. Geographic location: GPT versus metadata](#geographic-location-gpt-versus-metadata)
+- [Ontology Mapping Toolkit](#ontology-mapping-toolkit)
 
 
 
@@ -567,8 +568,103 @@ The script above is set to use the GPT output files from the production run (wit
 To exit the session just type `exit`
 
 
+---
+<a name="ontology-mapping-toolkit"></a>
+## Ontology Mapping Toolkit
 
+For experiments that map metadata to full ontologies such as ENVO and Uberon, three helper scripts are available:
 
+- `build_ontology_term_index.py`: exports ontology terms into a flat table with labels, synonyms, definitions, and direct parent labels.
+- `prepare_metalog_for_ontology_mapping.py`: converts Metalog long-format exports into sample-level ENVO/Uberon examples ready for the mapper.
+- `prepare_ontology_subset.py`: creates a small labeled subset for cheap experiments and can assemble mention/context text from cleaned metadata files.
+- `map_metadata_to_ontology.py`: runs a hybrid baseline mapper with exact matching, TF-IDF retrieval, optional embedding retrieval, and optional top-k reranking with a larger model.
+
+Example flow:
+
+1. Build the ontology term table
+
+```bash
+python /app/scripts/build_ontology_term_index.py \
+  --ontologies ENVO UBERON \
+  --output_dir /MicrobeAtlasProject \
+  --output_prefix ontology_terms
+```
+
+2. Prepare a Metalog-derived training/evaluation subset
+
+This uses the long-format Metalog files in `/MicrobeAtlasProject/metalog` or a local `metalog/` folder and extracts only ENVO/Uberon examples from curated fields such as `environment_biome`, `environment_feature`, and `environment_material`. It builds `mention_text` and `context_text` from other metadata fields to reduce leakage from already-standardized values.
+
+```bash
+python /app/scripts/prepare_metalog_for_ontology_mapping.py \
+  --metalog_dir /MicrobeAtlasProject/metalog \
+  --output_file /MicrobeAtlasProject/metalog/metalog_ontology_examples.tsv \
+  --summary_file /MicrobeAtlasProject/metalog/metalog_ontology_examples_summary.json \
+  --max_samples_per_term 20 \
+  --max_total_samples 1000
+```
+
+3. Optionally prepare another small labeled subset
+
+Use this if you already have your own annotation file and want to assemble mention/context text from cleaned metadata files in `sample_info_split_dirs`.
+
+Expected annotation columns:
+- `sample_id`
+- `target_ontology`
+- `term_id`
+
+Optional annotation columns:
+- `mention_text`
+- `context_text`
+
+```bash
+python /app/scripts/prepare_ontology_subset.py \
+  --annotations /MicrobeAtlasProject/metalog_annotations.tsv \
+  --split_metadata_dir /MicrobeAtlasProject/sample_info_split_dirs \
+  --output_file /MicrobeAtlasProject/ontology_subset.tsv \
+  --max_samples_per_term 20 \
+  --max_total_samples 1000
+```
+
+4. Run the hybrid mapper
+
+Lexical-only baseline:
+
+```bash
+python /app/scripts/map_metadata_to_ontology.py \
+  --ontology_terms /MicrobeAtlasProject/ontology_terms.tsv \
+  --sample_mentions /MicrobeAtlasProject/metalog/metalog_ontology_examples.tsv \
+  --output_dir /MicrobeAtlasProject/ontology_mapping_run_lexical
+```
+
+Hybrid retrieval with embeddings:
+
+```bash
+python /app/scripts/map_metadata_to_ontology.py \
+  --ontology_terms /MicrobeAtlasProject/ontology_terms.tsv \
+  --sample_mentions /MicrobeAtlasProject/metalog/metalog_ontology_examples.tsv \
+  --output_dir /MicrobeAtlasProject/ontology_mapping_run_hybrid \
+  --embedding_api_key_path /MicrobeAtlasProject/my_api_key_embeddings \
+  --embedding_model text-embedding-3-small
+```
+
+Hybrid retrieval plus top-k reranking:
+
+```bash
+python /app/scripts/map_metadata_to_ontology.py \
+  --ontology_terms /MicrobeAtlasProject/ontology_terms.tsv \
+  --sample_mentions /MicrobeAtlasProject/metalog/metalog_ontology_examples.tsv \
+  --output_dir /MicrobeAtlasProject/ontology_mapping_run_reranked \
+  --embedding_api_key_path /MicrobeAtlasProject/my_api_key_embeddings \
+  --embedding_model text-embedding-3-small \
+  --reranker_api_key_path /MicrobeAtlasProject/my_api_key \
+  --reranker_model gpt-5-mini
+```
+
+Outputs:
+
+- `ontology_mapping_predictions.tsv`: one prediction row per sample
+- `ontology_mapping_candidates.tsv`: scored candidate terms per sample
+- `ontology_mapping_metrics.json`: exact-match and top-k metrics when `term_id` is provided
 
 
 

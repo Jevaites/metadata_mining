@@ -17,6 +17,7 @@ Created on Thu Jul 11 17:30:42 2024
 
 import os
 import pickle
+import sys
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
@@ -40,7 +41,7 @@ parser.add_argument(
 
 parser.add_argument(
     '--split_dir',
-    default='sample_info_split_dirs',
+    default='sample_info_split_dirs_test',
     help='Directory name containing split metadata files (default: sample_info_split_dirs)'
 )
 args = parser.parse_args()
@@ -147,7 +148,17 @@ for sample_id, info in list(gold_dict.items())[:1000]:
         
 
 data_items = [(field, counts['full'], counts['partial']) for field, counts in match_count.items()]
+
+if not data_items:
+    sys.exit(
+        f"No metadata files under '{split_dir}' matched any sample_id in "
+        f"'{input_gold_dict}' (checked {min(len(gold_dict), 1000)} gold_dict entries). "
+        "Nothing to analyze -- check that --split_dir/--work_dir point to the metadata "
+        "split directory that actually contains files for the samples in --gold_dict."
+    )
+
 match_count_df = pd.DataFrame(data_items, columns=['Field', 'FullMatches', 'PartialMatches'])
+match_count_df = match_count_df.astype({'FullMatches': int, 'PartialMatches': int})
 match_count_df.sort_values(by='FullMatches', ascending=False, inplace=True)
 #print(match_count_df)
 

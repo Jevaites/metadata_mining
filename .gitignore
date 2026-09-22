@@ -138,3 +138,9 @@ dmypy.json
 middle_dir/metadata.out
 middle_dir/sample.coordinates.reparsed.filtered
 .DS_Store
+
+# large local data, not for the repo
+data/
+metalog/
+_to_delete/
+*.h5
