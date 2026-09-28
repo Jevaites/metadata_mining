@@ -572,62 +572,11 @@ To exit the session just type `exit`
 <a name="ontology-mapping-toolkit"></a>
 ## Ontology Mapping Toolkit
 
-Maps MicrobeAtlas free-text metadata to ENVO/Uberon terms for the three Metalog slots
-(`biome`, `feature`, `material`), learning from the samples that Metalog has already
-curated. Five scripts (originals of the 2026-09 Codex version: `scripts/_before_review/ontology_mapping/`):
-
-- `build_ontology_term_index.py`: ENVO + Uberon OBO files -> one term table (label, synonyms, definition, is_a parents, obsolete flag).
-- `build_metalog_training_set.py`: links MicrobeAtlas `sample.info` records to Metalog samples by BioSample/SRS accession and writes one row per linked sample: cleaned MicrobeAtlas text (input) + Metalog ENVO/Uberon term per slot (labels). ~58k linked samples, 552 studies.
-- `map_samples_to_ontology.py`: study-grouped cross-validation of four methods on the same text encoder (`majority`, zero-shot `retrieval`, `knn` label transfer, `linear` probe), plus `--predict` to label new samples. `--features`: `tfidf` (local), an embedding model name (OpenAI-compatible API, cached) and/or precomputed `.npz` sample vectors, concatenated.
-- `extract_sample_embeddings.py`: per-sample vectors for the labelled samples, looked up in the *unique* GPT keyword / sub-biome embedding files.
-- `embed_ontology_terms.py`: embeds every ENVO/Uberon term ("label; synonyms") with the same model/dim as the GPT embeddings; pass the result to `map_samples_to_ontology.py --term_vectors` to enable `retrieval` (zero-shot), `hybrid` (linear + retrieval, `--open_vocab` for unseen terms), `label_reg` (regression onto term embeddings) and the `pred_gold_cosine` metric.
-- `predict_atlas.py`: labels every MicrobeAtlas sample (biome/feature/material + confidence) from its keyword + sub-biome embeddings, streaming the unique .h5 files.
-
-```bash
-python scripts/build_ontology_term_index.py \
-  --obo ENVO=https://raw.githubusercontent.com/EnvironmentOntology/envo/master/envo.obo \
-        UBERON=https://raw.githubusercontent.com/obophenotype/uberon/master/uberon.obo \
-  --output ~/MicrobeAtlasProject/ontology_terms.tsv.gz
-
-python scripts/build_metalog_training_set.py \
-  --metalog_dir ~/MicrobeAtlasProject/metalog \
-  --sample_info ~/MicrobeAtlasProject/sample.info.gz \
-  --ontology_terms ~/MicrobeAtlasProject/ontology_terms.tsv.gz \
-  --output ~/MicrobeAtlasProject/metalog/metalog_training_set.tsv.gz
-
-# precomputed GPT keyword / sub-biome embeddings -> per-sample vectors for the labelled samples
-L=~/MicrobeAtlasProject/sidequest/latest
-for kind in keywords sub_biomes; do
-python scripts/extract_sample_embeddings.py --kind $kind --texts $L/GPT_$kind.txt \
-  --unique_h5 $L/embeddings/GPT_${kind}_unique_embeddings__text-embedding-3-large__dim1024__full.h5 \
-  --sample_ids ~/MicrobeAtlasProject/metalog/metalog_training_set.tsv.gz \
-  --output ~/MicrobeAtlasProject/metalog/${kind}__large1024.npz
-done
-
-# study-grouped cross-validation; --features: tfidf, an embedding model name, and/or .npz files
-python scripts/map_samples_to_ontology.py \
-  --ontology_terms ~/MicrobeAtlasProject/ontology_terms.tsv.gz \
-  --samples ~/MicrobeAtlasProject/metalog/metalog_training_set.tsv.gz \
-  --output_dir ~/MicrobeAtlasProject/ontology_mapping/cv_kw_sb \
-  --features ~/MicrobeAtlasProject/metalog/keywords__large1024.npz ~/MicrobeAtlasProject/metalog/sub_biomes__large1024.npz \
-  --term_vectors ~/MicrobeAtlasProject/ontology_mapping/ontology_terms_unique_embeddings__text-embedding-3-large__dim1024.h5
-
-# label all 3.4M MicrobeAtlas samples with the kw+sb linear model (~2 min, resumable)
-python scripts/predict_atlas.py \
-  --ontology_terms ~/MicrobeAtlasProject/ontology_terms.tsv.gz \
-  --samples ~/MicrobeAtlasProject/metalog/metalog_training_set.tsv.gz \
-  --train_vectors ~/MicrobeAtlasProject/metalog/keywords__large1024.npz ~/MicrobeAtlasProject/metalog/sub_biomes__large1024.npz \
-  --keywords_texts $L/GPT_keywords.txt \
-  --keywords_h5 $L/embeddings/GPT_keywords_unique_embeddings__text-embedding-3-large__dim1024__full.h5 \
-  --sub_biomes_texts $L/GPT_sub_biomes.txt \
-  --sub_biomes_h5 $L/embeddings/GPT_sub_biomes_unique_embeddings__text-embedding-3-large__dim1024__full.h5 \
-  --output_dir ~/MicrobeAtlasProject/ontology_mapping/atlas_kw_sb
-```
-
-Outputs: `metrics.json` (top1 / top5 / top1-or-parent-child / macro-top1 per slot and method) and
-`predictions.tsv` (one row per test sample x slot x method).
+Maps every MicrobeAtlas sample to ENVO/Uberon terms for the three Metalog slots (`biome`,
+`feature`, `material`), learning from the ~58k MicrobeAtlas samples that Metalog curated.
+Six numbered scripts, one per step, in [`scripts/ontology_mapping/`](scripts/ontology_mapping/README.md);
+that README documents the data flow, the methods, the metrics and how to extend them.
 
 `clean_and_envo_translate.py` (Container 1) is independent of this toolkit; it was fixed in 2026-09
 (missing values are now detected on the value, e.g. `China: Hunan` is no longer dropped as "nan" and
 `=NA` lines are dropped; ontology codes are matched exactly so `sludge(ENVO:00002046)` keeps its text).
-
