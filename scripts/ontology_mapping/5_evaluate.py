@@ -18,6 +18,15 @@ Methods that also need term vectors (text encoders, or .npz features + --term_ve
                   so this is the only supervised method that can output an unseen term
   label_reg       (dense features, --term_vectors) ridge regression from the sample vector
                   to the embedding of its gold term, then the closest term (closed vocab)
+Upgraded "trivial" methods (added 2026-09-28; see experiments/README.md for how they were chosen):
+  knn_study       knn in which each training *study* has one vote, split over its samples among
+                  the --knn_study_k nearest neighbours (so one big study cannot outvote the rest)
+  retrieval_prior (dense) retrieval after centring both sides + --prototype_beta x log(label
+                  frequency in the training fold), closed vocabulary
+  prototype       (dense) nearest class prototype: each term's (centred) vector is blended with the
+                  centroid of its training samples (--prototype_alpha), + the same log prior
+  prototype_open  same over all 18.8k terms; terms without training samples keep their term
+                  vector (+ --prototype_unseen_bonus), so this can output an unseen term
 
 Evaluation: cross-validation over Metalog `study_code` (common.study_folds), so no
 study is in both train and test (samples of a study share most of their text). At most
@@ -57,7 +66,7 @@ from sklearn.linear_model import Ridge, RidgeClassifier
 from sklearn.preprocessing import normalize
 from sklearn.svm import LinearSVC
 
-from common import SLOTS, load_npz, load_term_vectors, load_terms, path, select_samples, study_folds
+from common import SLOTS, ancestor_sets, load_npz, load_term_vectors, load_terms, path, select_samples, study_folds
 
 
 # ----------------------------------------------------------------------------- features
@@ -128,7 +137,8 @@ def dense(matrix):
 def rank(scores, ids, n=5, margin=True):
     """Top-n ids per row of a (samples x ids) score matrix; confidence = best minus second-best
     score (margin=True) or the best score itself."""
-    order = np.argsort(-scores, axis=1)[:, :n]
+    # row blocks keep memory low (samples x 18.8k terms); argsort is per row, so the result is the same
+    order = np.vstack([np.argsort(-scores[i:i + 1000], axis=1)[:, :n] for i in range(0, max(len(scores), 1), 1000)])
     top2 = np.take_along_axis(scores, order[:, :2], axis=1)
     return [ids[row].tolist() for row in order], top2[:, 0] - top2[:, -1] if margin else top2[:, 0]
 
@@ -148,6 +158,80 @@ def knn(test, train, train_labels, k):
             ranked.append(sorted(votes, key=votes.get, reverse=True)[:5])
             confidence.append(votes[ranked[-1][0]] / max(sum(votes.values()), 1e-9))
     return ranked, np.array(confidence)
+
+
+TIE_BREAK = 1e-13  # knn_study: equal similarities (identical texts) are ordered by training-sample index
+
+
+def knn_study(test, train, train_labels, train_studies, k):
+    """knn in which every training *study* has one vote. The k most similar training samples are
+    found as in knn(); each neighbour then votes 1 / (number of the k neighbours from its study).
+    Metalog studies contribute up to --max_per_study near-identical samples, so without this one
+    study fills the neighbour list and outvotes every other curator. Votes are not weighted by
+    similarity (nested CV preferred unweighted votes, see experiments/).
+    Many samples share an identical text, so similarities tie exactly; ties are broken by training
+    sample index (the TIE_BREAK offset is far below float32 resolution), which makes the result
+    deterministic and identical to 6_predict_atlas.py --method knn_study.
+    Confidence = the winner's share of the vote."""
+    ranked, confidence = [], []
+    offset = TIE_BREAK * np.arange(train.shape[0])
+    for start in range(0, test.shape[0], 2000):
+        sim = dense(test[start:start + 2000] @ train.T).astype(np.float64) - offset
+        idx = np.argpartition(-sim, min(k, sim.shape[1] - 1), axis=1)[:, :k]
+        idx = np.take_along_axis(idx, np.argsort(-np.take_along_axis(sim, idx, axis=1), axis=1), axis=1)
+        for row_idx in idx:  # closest first, so ties go to the label met first
+            studies = train_studies[row_idx]
+            per_study = Counter(studies)
+            votes = defaultdict(float)
+            for i, study in zip(row_idx, studies):
+                votes[train_labels[i]] += 1 / per_study[study]
+            # rounded, so that float noise in sums like 1/3 + 1/3 + 1/3 cannot break a tie;
+            # sorted() is stable, so equal votes keep the closest-first order
+            ranked.append(sorted(votes, key=lambda label: round(votes[label], 9), reverse=True)[:5])
+            confidence.append(votes[ranked[-1][0]] / sum(votes.values()))
+    return ranked, np.array(confidence)
+
+
+def prototype_model(train, train_labels, vocab_vectors, vocab_ids, alpha, beta, unseen_bonus=0.0):
+    """Class prototypes for prototype() -> (sample mean, prototypes: vocab x dim, bias: vocab).
+
+    1. Centre both sides: samples minus the training mean, terms minus the vocabulary mean. Keyword
+       lists and short term names sit in different regions of the embedding space; centring
+       removes that offset ("modality gap").
+    2. prototype(term) = normalise(alpha * normalise(centroid of its training samples)
+                                   + (1 - alpha) * normalise(centred term vector)).
+       A term without training samples keeps its term vector alone.
+       alpha = 0 is retrieval_prior, alpha = 1 a nearest-centroid classifier.
+    3. bias(term) = beta * log((n_train(term) + 0.5) / sum): the label frequencies. Curators use a
+       few conventional terms far more often than their names suggest (fecal material, not
+       intestine environment); this is where most of the gain over plain retrieval comes from.
+    4. + unseen_bonus for terms without training samples. A bare term vector scores lower than a
+       centroid-blended prototype, so with 0 an unseen term (almost) never wins. Raising it trades
+       accuracy on seen labels for recovering unseen ones (sweep in experiments/README.md).
+    """
+    mean = train.mean(axis=0)
+    prototypes = normalize(vocab_vectors - vocab_vectors.mean(axis=0))
+    column = {t: i for i, t in enumerate(vocab_ids)}
+    labels, inverse, counts = np.unique(train_labels, return_inverse=True, return_counts=True)
+    sums = np.zeros((len(labels), train.shape[1]))
+    np.add.at(sums, inverse, normalize(train - mean))
+    rows = [column[t] for t in labels]
+    if alpha > 0:
+        prototypes[rows] = normalize(alpha * normalize(sums) + (1 - alpha) * prototypes[rows])
+    n = np.zeros(len(vocab_ids))
+    n[rows] = counts
+    return mean, prototypes, beta * np.log((n + 0.5) / (n + 0.5).sum()) + unseen_bonus * (n == 0)
+
+
+def prototype(test, model, vocab_ids):
+    """Rank terms by cosine(centred sample, prototype) + bias (see prototype_model)."""
+    mean, prototypes, bias = model
+    ranked, confidence = [], []
+    for start in range(0, max(test.shape[0], 1), 1000):  # row blocks keep memory low with 18.8k terms
+        r, c = rank(normalize(test[start:start + 1000] - mean) @ prototypes.T + bias, vocab_ids)
+        ranked += r
+        confidence.append(c)
+    return ranked, np.concatenate(confidence)
 
 
 def linear_scores(test, train, train_labels):
@@ -188,10 +272,14 @@ def precision_threshold(confidence, correct, target=0.9):
     return round(float(confidence[order][ok[-1]]), 4), round((ok[-1] + 1) / len(order), 4)
 
 
-def score(g, parents, term_vector_of):
+def score(g, parents, term_vector_of, ancestors):
     """Metrics for one (slot, method) group of predictions.tsv rows:
       top1, top5                accuracy of the first / any of the five predictions
       top1_or_parent_child      top-1 counted as a hit if it is the gold term or one is_a step away
+      top1_gold_or_ancestor     top-1 counted as a hit if it is the gold term or any is_a ancestor of it
+                                (true but coarser)
+      top1_near_synonym         top-1 counted as a hit if its term vector has cosine >= 0.8 with the
+                                gold term's (near-synonyms such as "microbial mat" / "microbial mat material")
       macro_top1                mean of per-label top-1 (weights rare labels like frequent ones)
       top1_confident_half       top-1 on the 50 % most confident samples
       top1_unseen_label         top-1 on samples whose gold term never occurs in the training fold
@@ -205,13 +293,17 @@ def score(g, parents, term_vector_of):
     threshold, coverage = precision_threshold(confidence, hit)
     result = {
         "n": len(g), "top1": hit.mean(), "top5": np.mean([t in r for r, t in zip(top5, gold)]),
-        "top1_or_parent_child": near.mean(), "macro_top1": pd.Series(hit).groupby(gold).mean().mean(),
+        "top1_or_parent_child": near.mean(),
+        "top1_gold_or_ancestor": np.mean([p == t or p in ancestors.get(t, ()) for p, t in zip(pred, gold)]),
+        "macro_top1": pd.Series(hit).groupby(gold).mean().mean(),
         "top1_confident_half": hit[np.argsort(-confidence)[:len(g) // 2]].mean(),
         "n_unseen_label": int(unseen.sum()), "top1_unseen_label": hit[unseen].mean() if unseen.any() else None,
         "margin_for_90pct_precision": threshold, "coverage_at_90pct_precision": coverage,
     }
     if term_vector_of is not None:
-        result["pred_gold_cosine"] = np.mean([term_vector_of[p] @ term_vector_of[t] for p, t in zip(pred, gold)])
+        cosine = np.array([term_vector_of[p] @ term_vector_of[t] for p, t in zip(pred, gold)])
+        result["pred_gold_cosine"] = cosine.mean()
+        result["top1_near_synonym"] = (cosine >= 0.8).mean()
     result = {k: round(float(v), 4) if isinstance(v, (float, np.floating)) else v for k, v in result.items()}
     result["top1_by_domain"] = pd.Series(hit).groupby(g["domain"].to_numpy()).mean().round(4).to_dict()
     return result
@@ -229,6 +321,13 @@ def main():
                         help=".npz files: also require a vector there (to compare runs on identical samples)")
     parser.add_argument("--k", type=int, default=25, help="Neighbours for knn")
     parser.add_argument("--hybrid_weight", type=float, default=2.0, help="Weight of the cosine in hybrid")
+    parser.add_argument("--knn_study_k", type=int, default=50, help="Neighbours for knn_study")
+    parser.add_argument("--prototype_alpha", type=float, default=0.5,
+                        help="prototype: weight of the training centroid vs the term vector (0-1)")
+    parser.add_argument("--prototype_beta", type=float, default=0.1,
+                        help="retrieval_prior / prototype: weight of the log label frequency")
+    parser.add_argument("--prototype_unseen_bonus", type=float, default=0.0,
+                        help="prototype_open: score bonus for terms never seen in training (see prototype_model)")
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--fold_seed", type=int, default=0, help="Which study-to-fold assignment (see study_folds)")
     parser.add_argument("--max_per_study", type=int, default=50, help="0 = no cap")
@@ -268,6 +367,7 @@ def main():
             predictions = {
                 "majority": ([[label for label, _ in Counter(y).most_common(5)]] * te.sum(), np.zeros(te.sum())),
                 "knn": knn(x_te, x_tr, y, args.k),
+                "knn_study": knn_study(x_te, x_tr, y, train["study_code"].to_numpy()[tr], args.knn_study_k),
                 "linear": rank(linear, classes),
             }
             if term_matrix is not None:
@@ -277,6 +377,13 @@ def main():
                 predictions["retrieval_open"] = rank(cosine, term_ids, margin=False)
                 predictions["hybrid"] = hybrid(classes, linear, cosine[:, closed], term_ids[closed], args.hybrid_weight)
                 predictions["hybrid_open"] = hybrid(classes, linear, cosine, term_ids, args.hybrid_weight)
+            if term_matrix is not None and not sparse.issparse(x_tr):
+                a, b = args.prototype_alpha, args.prototype_beta
+                vocab = term_matrix[closed]
+                predictions["retrieval_prior"] = prototype(x_te, prototype_model(x_tr, y, vocab, term_ids[closed], 0, b), term_ids[closed])
+                predictions["prototype"] = prototype(x_te, prototype_model(x_tr, y, vocab, term_ids[closed], a, b), term_ids[closed])
+                predictions["prototype_open"] = prototype(x_te, prototype_model(x_tr, y, term_matrix, term_ids, a, b,
+                                                                             args.prototype_unseen_bonus), term_ids)
             if term_vectors is not None and not sparse.issparse(x_tr):
                 predictions["label_reg"] = label_regression(x_te, x_tr, term_vectors[[term_row[t] for t in y]],
                                                             term_vectors[closed], term_ids[closed])
@@ -290,7 +397,8 @@ def main():
     info = samples.loc[pred["row"], ["sample_id", "study_code", "domain"]].reset_index(drop=True)
     pred = pd.concat([info, pred.drop(columns="row")], axis=1)
     term_vector_of = dict(zip(term_ids, term_vectors)) if term_vectors is not None else None
-    metrics = {slot: {method: score(g, parents, term_vector_of) for method, g in by_slot.groupby("method")}
+    ancestors = ancestor_sets(parents)
+    metrics = {slot: {method: score(g, parents, term_vector_of, ancestors) for method, g in by_slot.groupby("method")}
                for slot, by_slot in pred.groupby("slot")}
     with open(os.path.join(out_dir, "metrics.json"), "w") as handle:
         json.dump(metrics, handle, indent=2)

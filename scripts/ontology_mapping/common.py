@@ -50,6 +50,19 @@ def load_term_vectors(p, texts):
     return normalize(vectors[[row_of[t] for t in texts]])
 
 
+def ancestor_sets(parents):
+    """{term: set of all its is_a ancestors}, from {term: set of direct parents}."""
+    result = {}
+    def up(term):
+        if term not in result:
+            result[term] = set()  # guards against cycles
+            result[term] = set().union(*[{p} | up(p) for p in parents.get(term, ())])
+        return result[term]
+    for term in parents:
+        up(term)
+    return result
+
+
 # ----------------------------------------------------------------------------- samples
 def load_npz(p):
     """Per-sample vectors written by 3_extract_sample_embeddings.py.

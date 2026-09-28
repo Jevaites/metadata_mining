@@ -38,8 +38,8 @@ unique GPT embeddings (.h5) ───┴──3──> keywords.npz, sub_biomes.
 | 2 | `2_build_training_set.py` | Links MicrobeAtlas records to Metalog samples by accession, and writes the labels and a cleaned text for each linked sample. | ~5 min |
 | 3 | `3_extract_sample_embeddings.py` | Looks up the GPT keyword or sub-biome embedding of each labelled sample (run once per kind). | < 1 min |
 | 4 | `4_embed_terms.py` | Embeds every term text (`label; synonyms`) with the model used for the GPT texts. Costs about $0.01. | ~2 min |
-| 5 | `5_evaluate.py` | Runs cross-validation grouped by study for every method on the same features. Writes metrics and per-sample predictions. | 2–10 min |
-| 6 | `6_predict_atlas.py` | Trains `linear` on all labelled samples and labels every atlas sample, streaming the 6.4 GB keyword `.h5`. Resumable. | ~2 min |
+| 5 | `5_evaluate.py` | Runs cross-validation grouped by study for every method on the same features. Writes metrics and per-sample predictions. | 5–15 min |
+| 6 | `6_predict_atlas.py` | Trains `linear` (or `--method prototype / knn_study`) on the evaluated samples and labels every atlas sample, streaming the 6.4 GB keyword `.h5`. Resumable. | ~2 min (knn_study: longer) |
 | – | `analyses.py` | Optional. Computes the extra analyses behind the findings report: bootstrap CIs, hierarchy of errors, label ceiling, coarser labels. | ~3 min |
 | – | `common.py` | Shared helpers: term loading, sample selection, study folds. | |
 
@@ -79,6 +79,13 @@ python 6_predict_atlas.py --ontology_terms $TERMS --samples $TRAIN --train_vecto
   --keywords_h5 $E/GPT_keywords_unique_embeddings__text-embedding-3-large__dim1024__full.h5 \
   --sub_biomes_h5 $E/GPT_sub_biomes_unique_embeddings__text-embedding-3-large__dim1024__full.h5 \
   --output_dir $P/ontology_mapping/atlas_kw_sb
+# same with another model (use a separate --output_dir per method):
+#   ... --method prototype --term_vectors $TV --output_dir $P/ontology_mapping/atlas_kw_sb_prototype
+#   ... --method knn_study --output_dir $P/ontology_mapping/atlas_kw_sb_knn_study
+
+# experiments behind knn_study / prototype (≈ 1.5-3 h), and the atlas consistency check
+bash experiments/run_all.sh
+python experiments/verify_atlas_methods.py
 ```
 
 ## How it works
@@ -155,10 +162,19 @@ training fold is used.
 |---|---|---|
 | `majority` | most frequent training label | none |
 | `knn` | vote of the k = 25 most similar training samples, weighted by similarity | winner's vote share |
+| `knn_study` | k-NN where each training *study* has one vote: of the k = 50 most similar training samples (`--knn_study_k`), each votes 1 / (number of them from its study) | winner's vote share |
 | `linear` | `RidgeClassifier` on dense features (`LinearSVC` on sparse TF-IDF) | margin between the best and second-best score |
 | `retrieval` / `retrieval_open` | nearest term vector, among the slot's training labels / among all 18.8k terms | best cosine |
 | `hybrid` / `hybrid_open` | linear score + 2 × cosine to the term. With `_open`, terms never seen in training get linear score −1, so they can still win on cosine | margin |
 | `label_reg` | ridge regression from the sample vector to the embedding of its gold term, then the nearest term | margin |
+| `retrieval_prior` | `retrieval` after centring both sides, + β·log(label frequency in the training fold) (`--prototype_beta`, 0.1) | margin |
+| `prototype` | nearest class prototype: each term's centred vector blended with the centroid of its training samples (`--prototype_alpha`, 0.5), + the same log prior | margin |
+| `prototype_open` | `prototype` over all 18.8k terms; a term without training samples keeps its term vector, + `--prototype_unseen_bonus` (default 0) | margin |
+
+`knn_study`, `retrieval_prior` and `prototype(_open)` were added on 2026-09-28: they are the
+"trivial" methods with the cheap upgrades that made them as accurate as `linear` (see
+[experiments/README.md](experiments/README.md) for how they were chosen and every number). All
+other methods are unchanged, and their predictions are byte-identical to the previous version.
 
 **Metrics** (see `score()` in `metrics.json`):
 
@@ -167,6 +183,8 @@ training fold is used.
 | `top1`, `top5` | accuracy of the first prediction, and of any of the five |
 | `macro_top1` | mean per-label top-1. Rare labels count as much as frequent ones. |
 | `top1_or_parent_child` | a hit if the prediction is the gold term or one `is_a` step away from it |
+| `top1_gold_or_ancestor` | a hit if the prediction is the gold term or any `is_a` ancestor of it (true but coarser) |
+| `top1_near_synonym` | a hit if the prediction's term vector has cosine ≥ 0.8 with the gold term's (near-synonyms) |
 | `top1_confident_half` | top-1 on the 50 % of samples with the highest confidence |
 | `top1_unseen_label` | top-1 on test samples whose gold term never occurs in the training fold (14–17 % of samples). Only retrieval-based methods can get these right. |
 | `pred_gold_cosine` | cosine between the predicted and gold term embeddings. Gives partial credit for near-misses. |
@@ -178,9 +196,15 @@ top-5, confidence, domain and study. Every metric can be recomputed from it.
 
 ### Step 6: atlas labels
 
-The linear score splits over the two blocks: `W_kw·kw + W_sb·sb + b`. The script therefore
-computes `W_kw·kw` once per distinct keyword text, streaming the unique `.h5` in chunks of
-20k rows, and `W_sb·sb` once per distinct sub-biome. It then adds the two for each sample.
+`--method` picks the model: `linear` (default, as before), `prototype` (needs `--term_vectors`)
+or `knn_study`. Each is trained exactly as in step 5 and gives the same top-1 and confidence as
+step 5 would on the same vectors (checked by `experiments/verify_atlas_methods.py`).
+
+The score splits over the two blocks, e.g. `W_kw·kw + W_sb·sb + b` for `linear`. The script therefore
+computes the keyword part once per distinct keyword text, streaming the unique `.h5` in chunks of
+20k rows, and the sub-biome part once per distinct sub-biome. It then adds the two for each sample.
+`prototype` also splits (the centring norm is expanded, see the script docstring). `knn_study` needs
+a similarity to every training sample, so it is slower (chunks are capped at 4k rows).
 
 - The model is trained on exactly the samples that were evaluated (same cap and seed), so the
   atlas labels come from the model that was scored.
@@ -192,6 +216,8 @@ computes `W_kw·kw` once per distinct keyword text, streaming the unique `.h5` i
 - **A new feature block** (for example 16S composition): write an `.npz` with `sample_ids`,
   `index` and `vectors` (the same layout as step 3), then pass it to `--features`. Nothing
   else changes.
+- **Experiments** that motivated the methods (nested-CV ladders, 5 fold assignments, label
+  processing) are in `experiments/`; `bash experiments/run_all.sh` reproduces all of them.
 - **A new method**: write a function that returns `(top5_lists, confidence)` and add it to the
   `predictions` dict in `5_evaluate.main`. All metrics and outputs pick it up automatically.
 - **A new metric**: add it to `score()`. It receives every prediction row of one
