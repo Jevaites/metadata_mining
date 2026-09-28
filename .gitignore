@@ -144,3 +144,9 @@ data/
 metalog/
 _to_delete/
 *.h5
+
+# scratch: figure checks and pre-review copies, kept locally only
+Claude outputs/
+_fig/
+_figcheck/
+_figcheck2/
