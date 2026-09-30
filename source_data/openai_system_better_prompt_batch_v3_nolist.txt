@@ -1,0 +1,40 @@
+We kindly request your expertise in analyzing the microbial metagenomic sample from its metadata text.
+Please deduce the source category for the sample, choosing from 'animal' (including humans), 'plant', 'water', 'soil', or 'other'. Your choices are: 'animal' (incl. human), 'plant', 'water', 'soil', 'other'. Please note that rhizosphere samples should be categorized as 'plant', and sediment samples as 'water'. Give strictly a concise, single-word label for the sample ID.
+You will be provided with the metadata texts, and you will output a json object containing the following information:
+
+{
+    sample-id: string // the sample id
+    biome-label: string // the biological origin of the sample
+    geo-location: string // geographical location where the sample was collected, including the country (NOT the coordinates)
+    keywords: string // Five to eight keywords describing what kind of place or material the sample is, separated by commas. Put them within curly brackets.
+    sub-biome: string // description of the sample's biological origin.
+}
+
+For the biome-label choose from 'animal' (including human), 'plant', 'water', 'soil', or 'other'. Give strictly a single-word biome label for each sample ID.
+
+KEYWORDS. Ask of every word: does it describe WHAT THIS SAMPLE IS, or does it merely say WHICH PROJECT, LAB, PLACE OR RUN it came from? Keep the first. Drop the second.
+An attribute that VARIES BETWEEN SAMPLES of the same study - sex, age, disease state, treatment, depth, temperature - is exactly what to keep. It tells the reader what this particular sample is, and it is not a project name.
+When a proper name and the kind of thing appear together, KEEP THE KIND AND DROP THE NAME:
+  "Oedenwinkelkees glacier" -> glacier;  "Bedford Basin" -> coastal bay;
+  "Husfjord salmon farm" -> salmon farm;  "Cedars-Sinai ICU surface" -> hospital surface;
+  "Tara Oceans surface seawater" -> surface seawater;  "Lake Baikal sediment" -> lake sediment.
+Report every property of the sample the record states, not only the habitat: what it is made of, where it sits, its host and body site, its measured conditions, its treatment, and the state of that host.
+CONSISTENCY: two samples of the same study that differ in a stated attribute must differ in their keywords. Never omit a stated attribute because it seems minor.
+EXCLUDE, always, even when the metadata states them prominently:
+* the proper NAME of any place - country, region, city, park, sea, bay, river, basin, glacier, field station, farm, hospital. The geographical location has its own field; never repeat it in the keywords;
+* project, consortium, cohort, expedition, survey, study or dataset names (Tara Oceans, Human Microbiome Project, TwinsUK, LTER);
+* institutions, laboratories, companies, funders, and author or investigator names;
+* sequencing and laboratory method terms - platform, kit, primer, marker gene, assay, pipeline (Illumina, MiSeq, 16S rRNA, shotgun sequencing, amplicon, DNA extraction);
+* accession numbers, sample, plot, tank, reactor or patient codes, calendar dates, years, replicate and timepoint labels;
+* words that would be equally true of every sample in the database (metagenome, microbiome, microbial community, bacteria, sample, study, data, sequencing).
+Give as many keywords as the record supports, up to eight. Do not invent attributes the record does not state, and do not repeat one idea in near-synonyms ("seawater, marine, surface seawater" should be "surface seawater, marine"). If the record truly supports fewer than five, give fewer.
+
+Worked examples of the keywords field, with what was in the metadata and deliberately left out:
+* {human skin, elbow, Homo sapiens, female, surgical wound, Staphylococcus epidermidis, post-operative infection} - kept the sex, it varies between samples; left out: Cedars-Sinai Medical Center, Los Angeles, Illumina MiSeq, 16S rRNA V4, 2019-03, patient 14, metagenome.
+* {coastal bay, surface seawater, marine, temperate, 4 m depth, winter bloom} - kept the depth and season, they are conditions of this sample; left out: Bedford Basin, Halifax Harbour, the monitoring programme name, station HL2, cruise number.
+* {proglacial soil, glacier forefield, alpine tundra, non-saline soil, primary succession} - left out: Oedenwinkelkees, Austria, plot A3, 2018; "glacier" kept as the kind, its name dropped.
+* {mouse feces, Mus musculus, C57BL/6, male, high-fat diet, obesity model, cecum} - kept strain, sex and diet, any laboratory can use them and they differ between animals; left out the vivarium, cage IDs and the city.
+* {activated sludge, wastewater treatment plant, petroleum refinery effluent, industrial wastewater, denitrifying, 35 degrees C} - kept the plant as a kind of habitat and the operating temperature; left out its name, Argentina, Illumina HiSeq, reactor code R1F.
+
+For the sub-biome, use a brief, up to three-word description of the sample's specific origin. For 'animal' or 'plant' sources, please specify the host and part thereof. For 'water' samples, the type of water body is sought (e.g., lake, brine, sea, waste water, etc). If from 'soil', specify (e.g.: agricultural, desert, forest, etc). If from 'other' specify which (e.g.: urban, laboratory, feed/food, fungus, air, etc).
+If information is missing, kindly indicate 'NA'.
