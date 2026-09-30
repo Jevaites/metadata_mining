@@ -36,6 +36,7 @@ unique GPT embeddings (.h5) ───┴──3──> keywords.npz, sub_biomes.
 |---|---|---|---|
 | 1 | `1_build_term_index.py` | Parses the OBO files into one row per term: label, synonyms, definition, `is_a` parents, obsolete flag. | < 1 min |
 | 2 | `2_build_training_set.py` | Links MicrobeAtlas records to Metalog samples by accession, and writes the labels and a cleaned text for each linked sample. | ~5 min |
+| 2b | `2b_clean_metalog.py` | Flags every Metalog sample (controls, perturbed and ancient samples, duplicate accessions, unusable labels) and writes a clean and a gold version of the training set. Nothing is deleted. | < 1 min |
 | 3 | `3_extract_sample_embeddings.py` | Looks up the GPT keyword or sub-biome embedding of each labelled sample (run once per kind). | < 1 min |
 | 4 | `4_embed_terms.py` | Embeds every term text (`label; synonyms`) with the model used for the GPT texts. Costs about $0.01. | ~2 min |
 | 5 | `5_evaluate.py` | Runs cross-validation grouped by study for every method on the same features. Writes metrics and per-sample predictions. | 5–15 min |
@@ -60,6 +61,8 @@ python 1_build_term_index.py --output $TERMS \
         UBERON=https://raw.githubusercontent.com/obophenotype/uberon/master/uberon.obo
 python 2_build_training_set.py --metalog_dir $P/metalog --sample_info $P/sample.info.gz \
   --ontology_terms $TERMS --output $TRAIN
+python 2b_clean_metalog.py --metalog_dir $P/metalog --ontology_terms $TERMS --training_set $TRAIN \
+  --output_dir $P/metalog/clean        # then review clean/audit_review.tsv and re-run with --overrides
 for kind in keywords sub_biomes; do
   python 3_extract_sample_embeddings.py --kind $kind --texts $L/GPT_$kind.txt --sample_ids $TRAIN \
     --unique_h5 $E/GPT_${kind}_unique_embeddings__text-embedding-3-large__dim1024__full.h5 \
@@ -120,6 +123,44 @@ generic words, such as country names, that match noise in the metadata.
   - Values that mean "missing" are dropped.
   - `ENVO:…` codes are replaced by their label.
   - The result is written as `key: value; …` and truncated to 2,000 characters.
+
+### Step 2b: cleaning flags
+
+Flag, don't delete. `metalog_flags.tsv.gz` has one row per Metalog sample (all ~159k, not only
+the linked ones) with the raw values and these flags:
+
+- **`artificial_bucket`**, from Metalog's `artificial` field:
+  - `control`: negative control, mock, spike-in, marked as contaminated. These are hard drops:
+    the label is not a habitat, and 247 of them carry the study's default habitat label.
+  - `perturbed`: cultivation, (virome) enrichment, sorted cells, mesocosm. The label is the
+    source environment, so they stay in training, but they are excluded from gold evaluation.
+  - `degraded`: paleosample, post-mortem, museum specimen. Same treatment as `perturbed`.
+- **Audit.** Metalog's flag misses some samples (e.g. `Gaffney_2019_marine_Doggerland`
+  negative controls labelled marine sediment). Regexes run over the alias and a short list of
+  sample-level free-text keys (`AUDIT_KEYS`; study abstracts and questionnaires are excluded).
+  Hits on unflagged samples go to `audit_review.tsv`, one row per study × category. They count
+  as `audit_unreviewed` (kept for training, out of gold) until someone fills `decision`
+  (`control` / `perturbed` / `degraded` / `ok`) and the script is re-run with
+  `--overrides audit_review.tsv`. Decided rows are carried into the rewritten file, so re-running the same
+  command is idempotent, and a review file with decisions is backed up to
+  `audit_review.previous.tsv` before it is overwritten.
+- **`drop_reason`**: `no_accession`, `conflicting_duplicate` (same accession under two
+  aliases with different labels, e.g. `Pascelli_2020_sponge_virus`), `duplicate_alias`,
+  `artificial_control`.
+- **Labels.** `<slot>_status` is `ok`, `obsolete` (the human biome `ENVO:00009003`),
+  `other_ontology` (PO, FOODON, CL), `not_in_index`, `no_code`, `control_value` or `empty`.
+  `<slot>_clean` is the usable id. `--label_map` (TSV: slot, from_id, to_id, reason) remaps
+  ids, including obsolete and other-ontology ones; raw ids stay in `<slot>_raw`.
+  `biome_in_biome_subtree` says whether the biome is under ENVO *biome*.
+
+With `--training_set`, it also writes:
+
+- `training_set.clean.tsv.gz`: step-2 rows without hard drops, with cleaned labels in
+  `biome/feature/material`. A drop-in replacement for `$TRAIN`.
+- `training_set.gold.tsv.gz`: rows with `in_gold_eval` (bucket `none`, no unreviewed audit
+  hit), first copy of each text per study. Use it for evaluation numbers.
+
+`summary.md` has the counts.
 
 ### Step 3: sample vectors
 

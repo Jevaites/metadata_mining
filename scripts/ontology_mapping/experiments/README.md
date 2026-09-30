@@ -21,7 +21,10 @@ python experiments/verify_atlas_methods.py   # step 6 == step 5 for every --meth
 | `summarise_runs.py` | the tables of sections 1–2 below | `summary.txt`, `summary.json` |
 | `trivial_knn.py` | the k-NN ladder (section 3) | `trivial_knn.json`, `.log` |
 | `trivial_nearest_term.py` | the nearest-term ladder and the unseen-term bonus sweep (section 4) | `trivial_nearest_term.json`, `.log` |
+| `term_text_variants.py` | build / embed / evaluate six term-text variants (section 5) | `variants.tsv.gz`, `term_variants.h5`, `results.json` |
+| `term_keywords.py` | idea B: LLM-written, sample-style keywords for every term (section 5b) | `term_keywords_raw.jsonl`, `llm_variants.tsv.gz` |
 | `verify_atlas_methods.py` | `6_predict_atlas.py --method X` gives the same top-1 and confidence as step 5's functions | prints OK / FAIL per method and slot |
+| `cleaning_effect.py` | effect of `2b_clean_metalog.py` on training and evaluation, and an artificial-sample detector (see the end of this file) | `cleaning_effect.json`, `audit_review_with_detector.tsv` |
 | `_setup.py` | shared loading (paths, samples, folds) | |
 
 All numbers are top-1 accuracy on the 17,723 capped Metalog-linked samples (539 studies), with
@@ -151,7 +154,64 @@ never wins. For material, a bonus of 0.4–0.5 recovers 7–11 % of unseen label
 overall accuracy; for biome it only costs accuracy. The bonus is tuned on this same CV, so treat
 these gains as optimistic (like `--hybrid_weight`).
 
-## 5. Verification
+## 5. What text represents a term? (`term_text_variants.py`)
+
+Six texts per term, embedded with text-embedding-3-large @ 1024 (about $0.36), scored with the same
+models as `5_evaluate.py` (`label_syn`, the current text, reproduces its numbers exactly). Top-1
+biome / feature / material, mean over fold seeds 0–4:
+
+| method | `label` | `label_exact` | `label_syn` | `label_syn_def` | `label_syn_parents` | `label_syn_def_parents` |
+|---|---|---|---|---|---|---|
+| retrieval (slot vocabulary) | 0.204 / 0.419 / 0.442 | 0.207 / 0.403 / 0.320 | 0.181 / 0.393 / 0.251 | 0.176 / 0.264 / 0.189 | 0.138 / 0.493 / 0.172 | 0.184 / 0.158 / 0.260 |
+| retrieval, sub-biome query | 0.136 / 0.223 / 0.462 | 0.107 / 0.229 / 0.346 | 0.097 / 0.167 / 0.320 | 0.093 / 0.156 / 0.303 | 0.075 / 0.270 / 0.200 | 0.088 / 0.129 / 0.339 |
+| retrieval_open (all terms) | 0.033 / 0.128 / 0.339 | 0.051 / 0.192 / 0.142 | 0.050 / 0.141 / 0.095 | 0.035 / 0.080 / 0.051 | 0.047 / 0.261 / 0.094 | 0.035 / 0.087 / 0.091 |
+| retrieval_open, unseen labels | 0.143 / 0.122 / 0.213 | 0.149 / 0.097 / 0.194 | 0.134 / 0.101 / 0.186 | 0.112 / 0.080 / 0.092 | 0.122 / 0.106 / 0.148 | 0.132 / 0.128 / 0.121 |
+| retrieval_prior | 0.441 / 0.598 / 0.680 | 0.466 / 0.600 / 0.680 | 0.475 / 0.596 / 0.677 | 0.458 / 0.599 / 0.680 | 0.467 / 0.586 / 0.671 | 0.451 / 0.596 / 0.680 |
+| prototype | 0.503 / 0.640 / 0.720 | 0.506 / 0.639 / 0.722 | 0.507 / 0.636 / 0.723 | 0.504 / 0.638 / 0.724 | 0.502 / 0.637 / 0.720 | 0.504 / 0.637 / 0.723 |
+| prototype_open (bonus 0.5) | 0.463 / 0.635 / 0.729 | 0.478 / 0.636 / 0.731 | 0.477 / 0.633 / 0.732 | 0.482 / 0.634 / 0.729 | 0.479 / 0.632 / 0.725 | 0.484 / 0.635 / 0.730 |
+| prototype_open, unseen labels | 0.068 / 0.067 / 0.123 | 0.077 / 0.063 / 0.116 | 0.034 / 0.052 / 0.110 | 0.022 / 0.025 / 0.068 | 0.017 / 0.023 / 0.048 | 0.018 / 0.024 / 0.069 |
+| label_reg | 0.531 / 0.636 / 0.723 | 0.530 / 0.637 / 0.720 | 0.530 / 0.637 / 0.726 | 0.538 / 0.638 / 0.719 | 0.541 / 0.638 / 0.718 | 0.539 / 0.638 / 0.720 |
+
+- **Trained methods do not care** (prototype, retrieval_prior within ±1 point; label_reg +1 on
+  biome with definitions or parents, −0.5 on material). The class centroids and label counts carry
+  the signal, not the term text.
+- **Zero-shot retrieval swings a lot, but mostly on one decision.** 45 % of material and 48 % of
+  feature labels are *fecal material* / *intestine environment*, and the variants mainly change which
+  of the gut terms wins. With `label`, *fecal material* is predicted for 29 % of material samples;
+  with `label_syn` (its synonyms are "droppings; frass; pellet") only 12 %, and *intestine
+  environment* takes over. Macro top-1 (mean per label), which is not dominated by that one term,
+  moves only a few points (slot vocabulary: biome 0.29–0.32, feature 0.31–0.33, material 0.32–0.38).
+- **Definitions hurt zero-shot** (feature 0.393 → 0.264, material 0.251 → 0.189): a sentence-long
+  definition embeds far from a keyword list. **Parents help feature** (0.393 → 0.493: "Is a:
+  digestive tract environment" pulls gut samples to *intestine environment*) and hurt the others.
+- **The plain label is the best zero-shot text** overall, and for terms never seen in training:
+  open retrieval material 0.095 → 0.339, prototype_open unseen-label recovery 3.4 / 5.2 / 11.0 % →
+  6.8 / 6.7 / 12.3 %.
+
+### 5b. Terms described like samples (`term_keywords.py`, idea B)
+
+For each term, gpt-5.1 imagines 3 microbial samples that would carry the term and writes the same
+fields the production prompt extracts from sample metadata (5-8 keywords in curly brackets and a
+sub-biome; prompt: `term_keywords_prompt.txt`; production sampling settings). Three new variants:
+`llm_kw` (average of the imagined keyword lists), `llm_kw_sb` (keyword block + sub-biome block, like
+the samples) and `label_llm_kw_parents` (label + imagined keywords + parent labels).
+
+```bash
+X=~/MicrobeAtlasProject/ontology_mapping/experiments/term_text
+python3 experiments/term_keywords.py generate --raw $X/term_keywords_raw.jsonl --dry_run      # cost estimate
+python3 experiments/term_keywords.py generate --raw $X/term_keywords_raw.jsonl --max_terms 50 # pilot, measured cost
+python3 experiments/term_keywords.py generate --raw $X/term_keywords_raw.jsonl                # all terms (resumable)
+#   or: batch_submit / batch_collect (Batch API, about half the price, up to 24 h)
+python3 experiments/term_keywords.py build --raw $X/term_keywords_raw.jsonl --output $X/llm_variants.tsv.gz
+python3 experiments/term_text_variants.py embed --variants $X/llm_variants.tsv.gz --output $X/term_variants.h5
+python3 experiments/term_text_variants.py evaluate --variants $X/variants.tsv.gz $X/llm_variants.tsv.gz \
+  --vectors $X/term_variants.h5 --only label label_syn llm_kw llm_kw_sb label_llm_kw_parents --output $X/results_llm.json
+```
+
+`evaluate` now also reports macro top-1 (`| macro`), because micro top-1 of zero-shot retrieval is
+dominated by the *fecal material* / *intestine environment* decision.
+
+## 6. Verification
 
 | check | result |
 |---|---|
@@ -172,4 +232,48 @@ up to ~2 points (fold noise), but every conclusion holds. Two corrections:
   with the training-fold vocabulary it is 0.259 / 0.453 / 0.106 (was 0.281 / 0.480 / 0.148);
 - `prototype_open` does **not** recover unseen labels unless `--prototype_unseen_bonus` is raised
   (table above).
+
+## Does the Metalog cleaning help? (`cleaning_effect.py`, 2026-09-29)
+
+```bash
+python experiments/cleaning_effect.py --clean_dir ~/MicrobeAtlasProject/metalog/clean \
+  --output ~/MicrobeAtlasProject/metalog/clean/experiments/cleaning_effect.json   # ~4 min
+```
+
+`linear`, keyword + sub-biome embeddings, the pipeline's 50-per-study cap and folds (the `raw` arm
+on the raw test set is the 0.514 / 0.634 / 0.708 of fold seed 0 above). Fold seeds 0–2; CIs are a
+paired bootstrap over test studies (seed 0), in points vs `raw`.
+
+**A. Cleaning the training data does nothing measurable.** Fixed gold test set; accuracy is the
+mean over the 3 seeds, the difference [95 % CI] is seed 0. Only 3 controls survive the cap in the
+linked set (hence `no_controls` ≈ `raw`); the perturbed samples (~930) are what the arms remove.
+
+| training arm | biome | feature | material |
+|---|---|---|---|
+| raw | 0.521 | 0.641 | 0.733 |
+| no_controls | 0.520 (+0.0 [−0.1, 0.1]) | 0.641 (+0.0 [−0.0, 0.1]) | 0.733 (+0.0 [0.0, 0.0]) |
+| no_artificial | 0.520 (−0.7 [−2.4, 0.8]) | 0.639 (−0.3 [−0.9, 0.2]) | 0.735 (+0.2 [−0.1, 0.6]) |
+| no_audit | 0.522 (−0.6 [−2.4, 0.8]) | 0.639 (−0.3 [−1.0, 0.3]) | 0.736 (+0.3 [−0.1, 0.6]) |
+| dedup | 0.523 (−0.8 [−3.2, 1.6]) | 0.631 (−0.8 [−1.6, 0.0]) | 0.734 (−0.2 [−1.0, 0.5]) |
+
+Perturbed samples cost nothing and carry rare real labels (biome macro 0.101 → 0.093 without
+them), so they stay in training. Deduplicating *training* texts slightly hurts; dedupe the test only.
+
+**B. It changes the measurement.** The raw-trained model, by group of test sample:
+
+| group | biome | feature | material |
+|---|---|---|---|
+| gold | 0.521 | 0.642 | 0.734 |
+| perturbed + degraded | 0.361 | 0.312 | 0.430 |
+| unreviewed audit hits | 0.254 | 0.190 | 0.395 |
+| repeated text in study | 0.607 | 0.734 | 0.706 |
+
+Raw → gold test: +0.6 / +0.5 / +2.4 points. The pending review can move the gold numbers by
+≤ 0.5 points (`test_gold` vs `test_gold_audit_ok`).
+
+**C. An artificial-sample detector works across studies.** Logistic regression on the same vectors,
+study-grouped CV, 1,879 artificial samples from 58 studies: ROC AUC 0.82, AP 0.35 (base rate
+0.055); precision 0.78 at recall 0.10 (score ≥ 0.9); controls: recall 0.77 at 0.5. Never trained on
+the audit hits, it scores them 0.42 on average, like Metalog-flagged samples (0.38) and far above
+gold (0.08). `audit_review_with_detector.tsv` adds its mean score per review row.
 
