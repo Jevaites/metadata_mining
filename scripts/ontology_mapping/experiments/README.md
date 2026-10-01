@@ -201,7 +201,13 @@ X=~/MicrobeAtlasProject/ontology_mapping/experiments/term_text
 python3 experiments/term_keywords.py generate --raw $X/term_keywords_raw.jsonl --dry_run      # cost estimate
 python3 experiments/term_keywords.py generate --raw $X/term_keywords_raw.jsonl --max_terms 50 # pilot, measured cost
 python3 experiments/term_keywords.py generate --raw $X/term_keywords_raw.jsonl                # all terms (resumable)
-#   or: batch_submit / batch_collect (Batch API, about half the price, up to 24 h)
+#   or through the Batch API (about half the price, results within 24 h; terms already in --raw are skipped):
+python3 experiments/term_keywords.py batch_submit --raw $X/term_keywords_raw_v2.jsonl --dry_run
+python3 experiments/term_keywords.py batch_submit --raw $X/term_keywords_raw_v2.jsonl
+python3 experiments/term_keywords.py batch_collect --raw $X/term_keywords_raw_v2.jsonl  # rerun until all collected
+#   state in <raw>.batch.json; submit/generate refuse to run while a batch is uncollected (no double paying);
+#   failed requests or batches just leave their terms missing, and another batch_submit retries only those.
+#   A batch rejected for the enqueued-token limit: collect it, then batch_submit --batch_requests 300
 python3 experiments/term_keywords.py build --raw $X/term_keywords_raw.jsonl --output $X/llm_variants.tsv.gz
 python3 experiments/term_text_variants.py embed --variants $X/llm_variants.tsv.gz --output $X/term_variants.h5
 python3 experiments/term_text_variants.py evaluate --variants $X/variants.tsv.gz $X/llm_variants.tsv.gz \
@@ -277,3 +283,44 @@ study-grouped CV, 1,879 artificial samples from 58 studies: ROC AUC 0.82, AP 0.3
 the audit hits, it scores them 0.42 on average, like Metalog-flagged samples (0.38) and far above
 gold (0.08). `audit_review_with_detector.tsv` adds its mean score per review row.
 
+## 7. Hierarchical back-off + simulated reranking (`hierarchical_backoff.py`, 2026-10-01)
+
+Calibrated base probabilities (cross-fitted temperature) -> sum up the ontology (q = P @ A) ->
+climb from the top-1 label to the most specific node with q >= tau; tau chosen on the other folds
+for a target hierarchical accuracy. A flat baseline (abstain below tau) is scored the same way.
+The reranker is simulated (accuracy r inside the top-5, confidence AUROC 0.85) on the gated
+least-confident share, so no API call is needed. Results: project doc `hierarchical-backoff-results.md`.
+
+```bash
+X=~/MicrobeAtlasProject/ontology_mapping/experiments
+python3 experiments/hierarchical_backoff.py --fold_seeds 3 --models prototype linear \
+  --gates 0.2 0.3 0.5 1.0 --rerank_acc 0.7 0.85 1.0 --output $X/backoff/results.json   # ~10 min
+```
+
+### 7b. Biome-slot label map (`draft_biome_label_map.py`, 2026-10-01)
+
+45 % of Metalog biome labels are not ENVO biomes. This drafts, for each of the 54 such terms, the
+biome to use instead (cross-study kNN votes + a biome-only prototype + closest ENVO biome term by
+label), drops the slot root 'biome', and keeps animal- / plant-associated environment as
+conventions. Output = the `2b_clean_metalog.py --label_map` format plus evidence columns for
+reviewers (`review_decision`, `review_notes`). `hierarchical_backoff.py --label_map` applies it.
+
+```bash
+python3 experiments/draft_biome_label_map.py --output ~/MicrobeAtlasProject/metalog/clean/biome_label_map.tsv
+python3 experiments/hierarchical_backoff.py --fold_seeds 3 --models prototype --gates 0.3 0.5 --rerank_acc 0.85 1.0 \
+  --label_map ~/MicrobeAtlasProject/metalog/clean/biome_label_map.tsv --output $X/backoff/results_mapped.json
+```
+
+### 7c. Real reranker pilot (`rerank_pilot.py`, 2026-10-01)
+
+Measures the reranker accuracy inside the top-5 (r) and its confidence AUROC on 1,500 gated
+least-confident out-of-fold samples (500 per slot; fold seed 0, biome label map applied), which the
+simulation in section 7 needs. `pilot.jsonl` is already built; run the API step on the Mac:
+
+```bash
+R=~/MicrobeAtlasProject/ontology_mapping/experiments/rerank
+python3 experiments/rerank_pilot.py run --pilot $R/pilot.jsonl --model gpt-4.1-mini --output $R/resp_gpt-4.1-mini.jsonl --dry_run
+python3 experiments/rerank_pilot.py run --pilot $R/pilot.jsonl --model gpt-4.1-mini --output $R/resp_gpt-4.1-mini.jsonl
+python3 experiments/rerank_pilot.py run --pilot $R/pilot.jsonl --model gpt-5.1 --output $R/resp_gpt-5.1.jsonl
+python3 experiments/rerank_pilot.py score --pilot $R/pilot.jsonl --responses $R/resp_gpt-4.1-mini.jsonl
+```

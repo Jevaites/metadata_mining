@@ -27,6 +27,21 @@ Confidence is the same as in 5_evaluate.py for the chosen method (margin for lin
 winner's vote share for knn_study): use that method's margin_for_90pct_precision in metrics.json to
 decide which labels to trust.
 
+Calibrated probabilities and hierarchical back-off (--calibration, linear and prototype): with the
+calibration.json that 5_evaluate.py wrote for the same method and training settings, every slot also
+gets (hierarchy.py; claude/hierarchical-backoff-results.md):
+  <slot>_p              calibrated probability of the top-1 term (softmax of the scores / temperature)
+  <slot>_backoff        the most specific term, among the top-1 and its broader terms that Metalog uses
+                        in the slot, whose summed probability reaches the slot's tau; "" = abstain
+  <slot>_backoff_label / _backoff_p   its label / summed probability
+  <slot>_backoff_kind   top1 (no back-off needed), coarser, or abstain
+  <slot>_candidates     the --topk best terms, then their broader terms that are labels of the slot
+                        (up to --max_candidates), with probabilities, "id:p;id:p;...": the candidate
+                        list of the LLM reranker (7_rerank_atlas.py; "top-5 + ancestors" in the pilot)
+tau per slot = the lowest tau whose out-of-fold accuracy (--accuracy strict: the answer is gold or a
+coarser true term; lenient: also a more specific one) reaches --target_accuracy in 5_evaluate's curve.
+The accuracy is that of Metalog-like studies; check it on hand-labelled atlas samples before relying on it.
+
 Resumable: model.npz, index.npz and every finished chunk are kept in --output_dir, and
 --max_seconds stops cleanly; rerun the same command to continue. Delete --output_dir
 to retrain (for example after changing the training options).
@@ -57,7 +72,8 @@ import pandas as pd
 from sklearn.linear_model import RidgeClassifier
 from sklearn.preprocessing import normalize
 
-from common import SLOTS, load_npz, load_term_vectors, load_terms, path, read_tsv, select_samples
+import hierarchy
+from common import SLOTS, ancestor_sets, load_npz, load_term_vectors, load_terms, path, read_tsv, select_samples
 
 evaluate = importlib.import_module("5_evaluate")  # prototype_model: exactly the evaluated model
 TIE_BREAK = evaluate.TIE_BREAK
@@ -155,6 +171,73 @@ def build_index(args, index_path):
     return index
 
 
+def load_backoff(args, model, terms, out_dir):
+    """Per slot: (temperature, tau, Closure over the model's labels), from 5_evaluate's calibration.json.
+    The settings must match the model's; run_settings.json in --output_dir stops a resumed run from
+    mixing chunks written with other back-off settings."""
+    import json
+    run = {"calibration": os.path.abspath(path(args.calibration)) if args.calibration else None,
+           "target_accuracy": args.target_accuracy, "accuracy": args.accuracy, "topk": args.topk,
+           "max_candidates": args.max_candidates}
+    settings_path = os.path.join(out_dir, "run_settings.json")
+    if os.path.exists(settings_path):
+        previous = json.load(open(settings_path))
+        if previous != run:
+            raise SystemExit(f"{out_dir} has chunks written with {previous}, not {run}: use another --output_dir")
+    elif glob.glob(os.path.join(out_dir, "parts", "rows_*.tsv.gz")):
+        if args.calibration or args.topk:
+            raise SystemExit(f"{out_dir} has chunks from a run without back-off: use another --output_dir")
+    else:
+        json.dump(run, open(settings_path, "w"), indent=1)
+    if not args.calibration:
+        return None
+    if args.method == "knn_study":
+        raise SystemExit("--calibration needs --method linear or prototype (knn_study has no scores to calibrate)")
+    calibration = json.load(open(path(args.calibration)))
+    anc = ancestor_sets({t: set(p.split("||")) for t, p in zip(terms["term_id"], terms["parents"]) if p})
+    out = {}
+    for slot in SLOTS:
+        if args.method not in calibration.get(slot, {}):
+            raise SystemExit(f"{args.calibration} has no {args.method} calibration for {slot}: "
+                             f"run 5_evaluate.py with --backoff_methods {args.method}")
+        c = calibration[slot][args.method]
+        st = c["settings"]
+        mismatch = [f"{k}={st[k]} (here {v})" for k, v in
+                    [("max_per_study", args.max_per_study), ("seed", args.seed)] +
+                    ([("prototype_alpha", args.prototype_alpha), ("prototype_beta", args.prototype_beta)]
+                     if args.method == "prototype" else []) if st.get(k) != v]
+        if mismatch:
+            raise SystemExit(f"{args.calibration} was fitted with other settings: {', '.join(mismatch)}")
+        if os.path.abspath(path(st["samples"])) != os.path.abspath(path(args.samples)):
+            print(f"warning: calibration fitted on {st['samples']}, training on {args.samples}")
+        tau = hierarchy.choose_tau(c["curve"], args.target_accuracy, f"accuracy_{args.accuracy}")
+        row = next(r for r in c["curve"] if r["tau"] == tau)
+        print(f"{slot}: temperature {c['temperature']:.4f}, tau {tau} -> out-of-fold coverage {row['coverage']:.2f}, "
+              f"accuracy {row['accuracy_' + args.accuracy]:.3f} ({args.accuracy}), exact {row['exact']:.2f}")
+        classes = model[f"{slot}_classes"]
+        col = {t: i for i, t in enumerate(classes)}
+        broader = [[col[a] for a in anc.get(t, ()) if a in col and a not in hierarchy.NO_ANSWER] for t in classes]
+        out[slot] = (c["temperature"], tau, hierarchy.Closure(classes, anc), broader)
+    return out
+
+
+def candidate_strings(P, classes, k, broader, max_candidates):
+    """Per row 'id:p;id:p;...': the k most probable classes, then the classes that are broader terms of
+    those (broader[c] = their indices), most probable first, up to max_candidates in all
+    (as rerank_pilot.py build --add_ancestors)."""
+    k = min(k, P.shape[1])
+    idx = np.argpartition(-P, k - 1, axis=1)[:, :k]
+    idx = np.take_along_axis(idx, np.argsort(-np.take_along_axis(P, idx, axis=1), axis=1), axis=1)
+    out = []
+    for i, row in enumerate(idx):
+        row = list(row)
+        if max_candidates > k:
+            extra = {a for c in row for a in broader[c]} - set(row)
+            row += sorted(extra, key=lambda c: -P[i, c])[:max_candidates - k]
+        out.append(";".join(f"{classes[j]}:{P[i, j]:.4g}" for j in row))
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--ontology_terms", required=True)
@@ -172,6 +255,15 @@ def main():
     parser.add_argument("--knn_study_k", type=int, default=50, help="As in 5_evaluate.py")
     parser.add_argument("--max_per_study", type=int, default=50, help="Same cap as the evaluation (0 = all)")
     parser.add_argument("--seed", type=int, default=22, help="Same seed as the evaluation")
+    parser.add_argument("--calibration", default=None,
+                        help="calibration.json of 5_evaluate.py (same method and settings): adds probabilities, "
+                             "the back-off term and the top-k columns")
+    parser.add_argument("--target_accuracy", type=float, default=0.9, help="Back-off: out-of-fold accuracy to reach")
+    parser.add_argument("--accuracy", choices=["strict", "lenient"], default="strict",
+                        help="strict: gold or a coarser true term; lenient: also a more specific term")
+    parser.add_argument("--topk", type=int, default=5, help="With --calibration: top terms written in <slot>_candidates (0 = none)")
+    parser.add_argument("--max_candidates", type=int, default=10,
+                        help="<slot>_candidates: top-k + their broader slot labels, up to this many (= --topk: no broader terms)")
     parser.add_argument("--chunk_rows", type=int, default=20_000, help="Keyword .h5 rows per chunk (memory)")
     parser.add_argument("--max_seconds", type=float, default=None, help="Stop after this long (resume later)")
     args = parser.parse_args()
@@ -183,6 +275,9 @@ def main():
     index = build_index(args, os.path.join(out_dir, "index.npz"))
     terms = read_tsv(args.ontology_terms)
     label_of = dict(zip(terms["term_id"], terms["label"]))
+    if not args.calibration:
+        args.topk = 0
+    backoff = load_backoff(args, model, terms, out_dir)
     kw_dim = int(model["kw_dim"])
     with h5py.File(path(args.sub_biomes_h5), "r") as handle:
         sb = BLOCK_WEIGHT * normalize(handle["embeddings"][:])
@@ -223,7 +318,7 @@ def main():
             in_chunk = (index["kw_rows"] >= first) & (index["kw_rows"] < first + len(kw))
             kw_local, sb_local = index["kw_rows"][in_chunk] - first, sb_rows[in_chunk]
             out = pd.DataFrame({"sample_id": index["sample_ids"][in_chunk]})
-            best, confidence = {}, {}
+            best, confidence, extra = {}, {}, {}
             if args.method == "knn_study":
                 kw_sim = kw @ train_kw.T                                  # distinct keyword rows x training
                 sb_ids, sb_inverse = np.unique(sb_local, return_inverse=True)
@@ -251,10 +346,24 @@ def main():
                     top2 = np.take_along_axis(top2, np.argsort(-np.take_along_axis(scores, top2, axis=1), axis=1), axis=1)
                     best[slot] = top2[:, 0]
                     confidence[slot] = np.take_along_axis(scores, top2, axis=1) @ [1, -1]
+                    if backoff:
+                        T, tau, closure, broader = backoff[slot]
+                        prob = hierarchy.softmax(scores.astype(np.float64), T)
+                        pick, q = closure.decode(prob, tau)
+                        node = np.where(pick >= 0, closure.nodes[np.maximum(pick, 0)], "")
+                        extra[slot] = {"p": np.round(prob.max(axis=1), 4), "backoff": node,
+                                       "backoff_label": [label_of.get(t, "") for t in node], "backoff_p": np.round(q, 4),
+                                       "backoff_kind": np.where(pick < 0, "abstain", np.where(
+                                           pick == closure.label_col[prob.argmax(axis=1)], "top1", "coarser"))}
+                        if args.topk:
+                            extra[slot]["candidates"] = candidate_strings(prob, model[f"{slot}_classes"], args.topk,
+                                                                          broader, args.max_candidates)
             for slot in SLOTS:
                 terms_out = model[f"{slot}_classes"][best[slot]]
                 out[slot], out[f"{slot}_label"] = terms_out, [label_of.get(t, "") for t in terms_out]
                 out[f"{slot}_confidence"] = np.round(confidence[slot], 4)
+                for name, values in extra.get(slot, {}).items():
+                    out[f"{slot}_{name}"] = values
             out.to_csv(part + ".tmp", sep="\t", index=False, compression="gzip")
             os.replace(part + ".tmp", part)  # a chunk counts as done only once fully written
             print(f"rows {first}-{first + len(kw)}: {in_chunk.sum()} samples ({time.time() - start:.0f}s)")

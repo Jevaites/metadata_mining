@@ -40,9 +40,23 @@ study is in both train and test (samples of a study share most of their text). A
   <model>     any other value: an OpenAI-compatible embedding model applied to the text
               (--api_key_path, --base_url, --dimensions); every distinct text is cached
 
+Calibrated probabilities and hierarchical back-off (--backoff_methods, default prototype and linear;
+hierarchy.py): the out-of-fold scores become probabilities (softmax, temperature fitted on the other
+folds); the answer climbs from the top-1 to the most specific broader term Metalog uses in the slot
+whose summed probability reaches tau, or abstains. For each target accuracy (--backoff_targets),
+tau is chosen on the other folds and applied to the held-out fold. Accuracy is reported strict (gold
+or a coarser true term) and lenient (also a more specific term than Metalog's).
+
 Outputs in --output_dir:
-  metrics.json      per slot and method, see score()
-  predictions.tsv   one row per test sample x slot x method: gold, top-1, top-5, confidence
+  metrics.json      per slot and method, see score(); back-off methods also have "backoff":
+                    temperature, the curve (coverage / accuracy / exact / too specific per tau) and,
+                    per target, strict_<t> / lenient_<t> (coverage, accuracies, outcome shares)
+  calibration.json  per slot and back-off method: temperature fitted on all folds, the pooled curve,
+                    the top-1 probability quantiles and the training settings: the input of
+                    6_predict_atlas.py --calibration and 7_rerank_atlas.py fit
+  predictions.tsv   one row per test sample x slot x method: gold, top-1, top-5, confidence; back-off
+                    methods also: prob (calibrated top-1 probability), backoff (answer at
+                    --backoff_target, "" = abstain), backoff_q (its summed probability)
 
 python 5_evaluate.py \
   --ontology_terms ~/MicrobeAtlasProject/ontology_terms.tsv.gz \
@@ -66,6 +80,7 @@ from sklearn.linear_model import Ridge, RidgeClassifier
 from sklearn.preprocessing import normalize
 from sklearn.svm import LinearSVC
 
+import hierarchy
 from common import SLOTS, ancestor_sets, load_npz, load_term_vectors, load_terms, path, select_samples, study_folds
 
 
@@ -223,14 +238,25 @@ def prototype_model(train, train_labels, vocab_vectors, vocab_ids, alpha, beta, 
     return mean, prototypes, beta * np.log((n + 0.5) / (n + 0.5).sum()) + unseen_bonus * (n == 0)
 
 
-def prototype(test, model, vocab_ids):
-    """Rank terms by cosine(centred sample, prototype) + bias (see prototype_model)."""
+def prototype_scores(test, model):
+    """(samples x vocab) cosine(centred sample, prototype) + bias (see prototype_model)."""
     mean, prototypes, bias = model
-    ranked, confidence = [], []
+    return normalize(test - mean) @ prototypes.T + bias
+
+
+def prototype(test, model, vocab_ids, scores_out=None):
+    """Rank terms by prototype_scores. With a list as `scores_out`, the score matrix is appended to
+    it (closed vocabulary only: the back-off needs every score of the sample)."""
+    ranked, confidence, blocks = [], [], []
     for start in range(0, max(test.shape[0], 1), 1000):  # row blocks keep memory low with 18.8k terms
-        r, c = rank(normalize(test[start:start + 1000] - mean) @ prototypes.T + bias, vocab_ids)
+        scores = prototype_scores(test[start:start + 1000], model)
+        r, c = rank(scores, vocab_ids)
         ranked += r
         confidence.append(c)
+        if scores_out is not None:
+            blocks.append(scores)
+    if scores_out is not None:
+        scores_out.append(np.vstack(blocks))
     return ranked, np.concatenate(confidence)
 
 
@@ -309,6 +335,51 @@ def score(g, parents, term_vector_of, ancestors):
     return result
 
 
+# ----------------------------------------------------------------------------- back-off
+def backoff_all(backoff_folds, ancestors, args, n_samples):
+    """Calibrated probabilities + hierarchical back-off for every (slot, method) in --backoff_methods
+    (hierarchy.oof_backoff). -> (report per (slot, method) for metrics.json,
+    calibration.json content for 6_predict_atlas.py, per (row, slot, method): prob = calibrated top-1
+    probability, backoff = the answer at --backoff_target (tau chosen on the other folds; "" =
+    abstain), backoff_q = its summed probability)."""
+    reports, calibration, extra = {}, {}, {}
+    name = f"{args.backoff_metric}_{args.backoff_target}"
+    targets = sorted(set(args.backoff_targets) | {args.backoff_target})
+    for (slot, method), folds in sorted(backoff_folds.items()):
+        report, fitted = hierarchy.oof_backoff(folds, ancestors, targets)
+        reports[(slot, method)] = report
+        p_top1 = []
+        for f, (P, C), tau in zip(folds, fitted, report[name]["tau_per_fold"]):
+            pick, q = C.decode(P, tau)
+            p_top1.append(P.max(1))
+            for r, p, k, qq in zip(f["rows"], P.max(1), pick, q):
+                extra[(r, slot, method)] = {"prob": round(float(p), 4), "backoff": C.nodes[k] if k >= 0 else "",
+                                            "backoff_q": round(float(qq), 4)}
+        p_top1 = np.concatenate(p_top1)
+        calibration.setdefault(slot, {})[method] = {
+            "temperature": report["temperature_all"],
+            "curve": report["curve"],  # pooled out-of-fold outcome shares per tau: pick tau for any target
+            "p_top1_quantiles": {str(qt): round(float(np.quantile(p_top1, qt)), 4) for qt in (0.1, 0.2, 0.3, 0.4, 0.5)},
+            "settings": {"method": method, "features": args.features, "samples": args.samples, "n_samples": n_samples,
+                         "max_per_study": args.max_per_study, "seed": args.seed, "fold_seed": args.fold_seed,
+                         "prototype_alpha": args.prototype_alpha if method == "prototype" else 0,
+                         "prototype_beta": args.prototype_beta}}
+    return reports, calibration, extra
+
+
+def print_backoff(backoff, metrics, targets):
+    if not backoff:
+        return
+    print("\nHierarchical back-off (tau chosen on the other folds; cov = answered share, exact / too specific = "
+          "shares of all samples; strict: gold or a coarser true term, lenient: also too specific)")
+    for (slot, method), r in sorted(backoff.items()):
+        cells = []
+        for t in targets:
+            st, le = r[f"strict_{t}"], r[f"lenient_{t}"]
+            cells.append(f"@{t}: strict cov {st['coverage']:.2f} exact {st['exact']:.2f} | lenient cov {le['coverage']:.2f}")
+        print(f"  {slot:8} {method:15} top1 {metrics[slot][method]['top1']:.3f} T {r['temperature_all']:.3f} | " + " || ".join(cells))
+
+
 # ----------------------------------------------------------------------------- main
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -328,6 +399,15 @@ def main():
                         help="retrieval_prior / prototype: weight of the log label frequency")
     parser.add_argument("--prototype_unseen_bonus", type=float, default=0.0,
                         help="prototype_open: score bonus for terms never seen in training (see prototype_model)")
+    parser.add_argument("--backoff_methods", nargs="*", default=["prototype", "linear"],
+                        help="Methods (prototype, linear, retrieval_prior) that also get calibrated probabilities and "
+                             "hierarchical back-off (metrics.json 'backoff', calibration.json for step 6)")
+    parser.add_argument("--backoff_targets", nargs="+", type=float, default=[0.8, 0.85, 0.9, 0.95],
+                        help="Target accuracies reported for the back-off")
+    parser.add_argument("--backoff_target", type=float, default=0.9,
+                        help="Target accuracy of the backoff column in predictions.tsv.gz")
+    parser.add_argument("--backoff_metric", choices=["strict", "lenient"], default="strict",
+                        help="strict: the answer is gold or a coarser true term; lenient: also a more specific term")
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--fold_seed", type=int, default=0, help="Which study-to-fold assignment (see study_folds)")
     parser.add_argument("--max_per_study", type=int, default=50, help="0 = no cap")
@@ -352,6 +432,7 @@ def main():
     print(f"{len(samples)} labelled samples from {samples['study_code'].nunique()} studies")
 
     records = []  # one per (test sample, slot, method)
+    backoff_folds = defaultdict(list)  # (slot, method) -> per fold: closed-vocabulary scores of the test samples
     folds = study_folds(samples["study_code"], args.folds, args.fold_seed)
     for fold, (train_idx, test_idx) in enumerate(folds, start=1):
         train, test = samples.iloc[train_idx], samples.iloc[test_idx]
@@ -364,6 +445,9 @@ def main():
             y, x_tr, x_te = train[slot].to_numpy()[tr], train_x[tr], test_x[te]
             closed = np.isin(term_ids, y)  # terms used as training labels for this slot
             classes, linear = linear_scores(x_te, x_tr, y)
+            fold_info = {"gold": test[slot].to_numpy()[te], "rows": test.index[te]}
+            if "linear" in args.backoff_methods:
+                backoff_folds[(slot, "linear")].append({"S": dense(linear), "vocab": classes, **fold_info})
             predictions = {
                 "majority": ([[label for label, _ in Counter(y).most_common(5)]] * te.sum(), np.zeros(te.sum())),
                 "knn": knn(x_te, x_tr, y, args.k),
@@ -380,8 +464,12 @@ def main():
             if term_matrix is not None and not sparse.issparse(x_tr):
                 a, b = args.prototype_alpha, args.prototype_beta
                 vocab = term_matrix[closed]
-                predictions["retrieval_prior"] = prototype(x_te, prototype_model(x_tr, y, vocab, term_ids[closed], 0, b), term_ids[closed])
-                predictions["prototype"] = prototype(x_te, prototype_model(x_tr, y, vocab, term_ids[closed], a, b), term_ids[closed])
+                for method, alpha in [("retrieval_prior", 0), ("prototype", a)]:
+                    keep = [] if method in args.backoff_methods else None
+                    predictions[method] = prototype(x_te, prototype_model(x_tr, y, vocab, term_ids[closed], alpha, b),
+                                                    term_ids[closed], keep)
+                    if keep:
+                        backoff_folds[(slot, method)].append({"S": keep[0], "vocab": term_ids[closed], **fold_info})
                 predictions["prototype_open"] = prototype(x_te, prototype_model(x_tr, y, term_matrix, term_ids, a, b,
                                                                              args.prototype_unseen_bonus), term_ids)
             if term_vectors is not None and not sparse.issparse(x_tr):
@@ -394,18 +482,27 @@ def main():
 
     pred = pd.DataFrame(records)
     pred["gold"] = [samples.at[r, s] for r, s in zip(pred["row"], pred["slot"])]
+    ancestors = ancestor_sets(parents)
+    backoff, calibration, extra = backoff_all(backoff_folds, ancestors, args, len(samples))
+    for column in ["prob", "backoff", "backoff_q"]:
+        pred[column] = [extra.get((r, s, m), {}).get(column, "") for r, s, m in zip(pred["row"], pred["slot"], pred["method"])]
     info = samples.loc[pred["row"], ["sample_id", "study_code", "domain"]].reset_index(drop=True)
     pred = pd.concat([info, pred.drop(columns="row")], axis=1)
     term_vector_of = dict(zip(term_ids, term_vectors)) if term_vectors is not None else None
-    ancestors = ancestor_sets(parents)
     metrics = {slot: {method: score(g, parents, term_vector_of, ancestors) for method, g in by_slot.groupby("method")}
                for slot, by_slot in pred.groupby("slot")}
+    for (slot, method), report in backoff.items():
+        metrics[slot][method]["backoff"] = report
     with open(os.path.join(out_dir, "metrics.json"), "w") as handle:
         json.dump(metrics, handle, indent=2)
+    if calibration:
+        with open(os.path.join(out_dir, "calibration.json"), "w") as handle:
+            json.dump(calibration, handle, indent=1)
 
     label_of = dict(zip(term_ids, terms["label"]))
     pred["pred"] = pred["top5"].str[0]
     pred["gold_label"], pred["pred_label"] = pred["gold"].map(label_of), pred["pred"].map(label_of)
+    pred["backoff_label"] = pred["backoff"].map(label_of).fillna("")
     pred["top5"] = pred["top5"].str.join("||")
     pred.to_csv(os.path.join(out_dir, "predictions.tsv.gz"), sep="\t", index=False)
 
@@ -413,6 +510,7 @@ def main():
                           for s, by_method in metrics.items() for m, d in by_method.items()}).T
     pd.set_option("display.width", 250)
     print(table[["n", "top1", "top5", "top1_or_parent_child", "macro_top1", "top1_confident_half"]])
+    print_backoff(backoff, metrics, args.backoff_targets)
 
 
 if __name__ == "__main__":
