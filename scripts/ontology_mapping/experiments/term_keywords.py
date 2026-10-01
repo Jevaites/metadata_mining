@@ -11,7 +11,8 @@ Steps (run the API steps on your Mac; nothing here is sent anywhere by the other
   generate  --dry_run    token and cost estimate, no API call
   generate  --max_terms 50   pilot: real calls for 50 terms, prints the measured cost per term
   generate               all terms, synchronous, resumable (raw responses in --raw)
-  batch_submit / batch_collect   the same through the Batch API (50 % cheaper, up to 24 h)
+  batch_submit [--dry_run]   the same through the Batch API (50 % cheaper, results within 24 h)
+  batch_collect              check the batches, collect the finished ones (rerun until all collected)
   build                  raw responses -> variants TSV for term_text_variants.py:
                            llm_kw                 the imagined keyword lists (average of the examples)
                            llm_kw_sb              keyword block + sub-biome block, like the samples
@@ -33,6 +34,15 @@ python3 experiments/term_keywords.py generate --raw $X/term_keywords_raw.jsonl -
 python3 experiments/term_keywords.py generate --raw $X/term_keywords_raw.jsonl --max_terms 50
 python3 experiments/term_keywords.py generate --raw $X/term_keywords_raw.jsonl
 python3 experiments/term_keywords.py build --raw $X/term_keywords_raw.jsonl --output $X/llm_variants.tsv.gz
+
+Batch API instead of the synchronous `generate` (terms already in --raw are skipped):
+python3 experiments/term_keywords.py batch_submit --raw $X/term_keywords_raw_v2.jsonl --dry_run
+python3 experiments/term_keywords.py batch_submit --raw $X/term_keywords_raw_v2.jsonl
+python3 experiments/term_keywords.py batch_collect --raw $X/term_keywords_raw_v2.jsonl   # rerun until all collected
+  State in <raw>.batch.json (batch ids, which terms each request holds, collected or not). A second
+  batch_submit (or generate) refuses to run while a batch is uncollected, so nothing is paid twice.
+  Failed requests, unparsable responses and batches that fail / expire / are cancelled simply leave
+  their terms missing: another batch_submit (or generate) retries only those.
 """
 import argparse
 import concurrent.futures as cf
@@ -188,16 +198,19 @@ def estimate(reqs, args):
 
 def measured(raw, args):
     rows = [json.loads(line) for line in open(path(raw))] if os.path.exists(path(raw)) else []
-    usage = [r["usage"] for r in rows if r.get("usage")]
-    if not usage:
+    rows = [r for r in rows if r.get("usage")]
+    if not rows:
         return
-    n_terms = sum(len(r["parsed"]) for r in rows)
-    n_in, n_out = sum(u["prompt_tokens"] for u in usage), sum(u["completion_tokens"] for u in usage)
     price_in, price_out = prices(args)
-    cost = n_in / 1e6 * price_in + n_out / 1e6 * price_out
+    n_terms = sum(sum(1 for s in r["parsed"].values() if s) for r in rows)
+    n_in = sum(r["usage"]["prompt_tokens"] for r in rows)
+    n_out = sum(r["usage"]["completion_tokens"] for r in rows)
+    cost = sum((r["usage"]["prompt_tokens"] / 1e6 * price_in + r["usage"]["completion_tokens"] / 1e6 * price_out)
+               * (0.5 if r.get("api") == "batch" else 1.0) for r in rows)
     total = len(load_terms(args.ontology_terms))
-    print(f"measured so far: {n_terms} terms, {n_in:,} in / {n_out:,} out tokens = ${cost:.2f} "
-          f"-> about ${cost / max(n_terms, 1) * total:.2f} for all {total} terms (Batch API about half)")
+    extrapolated = f" -> about ${cost / n_terms * total:.2f} for all {total} terms at this mix" if n_terms else ""
+    print(f"measured so far: {n_terms} terms parsed, {n_in:,} in / {n_out:,} out tokens = ${cost:.2f} "
+          f"(Batch API requests counted at half price){extrapolated}")
 
 
 # ----------------------------------------------------------------------------- steps
@@ -208,6 +221,8 @@ def client_for(args):
 
 def generate(args):
     terms = load_terms(args.ontology_terms)
+    if pending_batches(args) and not args.dry_run:
+        sys.exit("batch(es) still pending for this --raw: run batch_collect first, or their terms are paid twice")
     reqs, n_done = requests_for(terms, args)
     print(f"{len(terms)} terms, {n_done} already done")
     if args.dry_run:
@@ -234,7 +249,7 @@ def generate(args):
                     drop.update(bad)
                 print(f"  model rejected {bad}: retrying without (recorded in the raw file)", flush=True)
         parsed = parse(r.choices[0].message.content, ids, args.n_examples)
-        record = {"request": rid, "term_ids": ids, "model": r.model, "sampling": sampling_for(args),
+        record = {"request": rid, "term_ids": ids, "model": r.model, "api": "sync", "sampling": sampling_for(args),
                   "reasoning_effort": args.reasoning_effort,
                   "dropped_params": sorted(drop),
                   "usage": {"prompt_tokens": r.usage.prompt_tokens, "completion_tokens": r.usage.completion_tokens},
@@ -254,43 +269,118 @@ def generate(args):
         print(f"{n - ok} terms could not be parsed; rerun the same command to retry them")
 
 
+def batch_state(args):
+    """<raw>.batch.json: {"batches": [{"batch_id", "requests": {custom_id: [term_ids]}, "collected"}]}"""
+    f = path(args.raw) + ".batch.json"
+    if not os.path.exists(f):
+        return f, {"batches": []}
+    state = json.load(open(f))
+    if "batch_id" in state:  # single-batch format
+        state = {"batches": [{"batch_id": state["batch_id"], "requests": state["requests"], "collected": False}]}
+    return f, state
+
+
+def pending_batches(args):
+    return [b for b in batch_state(args)[1]["batches"] if not b["collected"]]
+
+
 def batch_submit(args):
     terms = load_terms(args.ontology_terms)
+    pending = pending_batches(args)
+    if pending:
+        sys.exit(f"{len(pending)} batch(es) not collected yet ({', '.join(b['batch_id'] for b in pending)}): run "
+                 f"batch_collect first (a failed / expired / cancelled batch counts as collected once seen)")
     reqs, n_done = requests_for(terms, args)
+    print(f"{len(terms)} terms, {n_done} already done")
+    if not reqs:
+        return
     estimate(reqs, args)
-    lines = [json.dumps({"custom_id": rid, "method": "POST", "url": "/v1/chat/completions", "body": body})
-             for rid, _, body in reqs]
-    batch_input = path(args.raw) + ".batch_input.jsonl"
-    open(batch_input, "w").write("\n".join(lines) + "\n")
-    client = client_for(args)
-    upload = client.files.create(file=open(batch_input, "rb"), purpose="batch")
-    batch = client.batches.create(input_file_id=upload.id, endpoint="/v1/chat/completions", completion_window="24h")
-    json.dump({"batch_id": batch.id, "requests": {rid: ids for rid, ids, _ in reqs}},
-              open(path(args.raw) + ".batch.json", "w"))
-    print(f"submitted batch {batch.id} ({len(reqs)} requests); run batch_collect with the same --raw later")
+    parts = [reqs[i:i + args.batch_requests] for i in range(0, len(reqs), args.batch_requests)]
+    print(f"-> {len(parts)} batch(es) of up to {args.batch_requests} requests")
+    if args.dry_run:
+        return
+    client, (state_file, state) = client_for(args), batch_state(args)
+    os.makedirs(os.path.dirname(path(args.raw)) or ".", exist_ok=True)
+    for k, part in enumerate(parts):
+        batch_input = f"{path(args.raw)}.batch_input_{len(state['batches'])}.jsonl"
+        with open(batch_input, "w") as handle:
+            for rid, _, body in part:
+                handle.write(json.dumps({"custom_id": rid, "method": "POST", "url": "/v1/chat/completions",
+                                         "body": body}) + "\n")
+        upload = client.files.create(file=open(batch_input, "rb"), purpose="batch")
+        batch = client.batches.create(input_file_id=upload.id, endpoint="/v1/chat/completions",
+                                      completion_window="24h", metadata={"job": "term_keywords"})
+        state["batches"].append({"batch_id": batch.id, "requests": {rid: ids for rid, ids, _ in part},
+                                 "sampling": sampling_for(args), "reasoning_effort": args.reasoning_effort,
+                                 "collected": False})
+        json.dump(state, open(state_file, "w"))  # saved after every batch, so an interrupted submit is not lost
+        print(f"submitted batch {batch.id} ({len(part)} requests, {os.path.getsize(batch_input) / 1e6:.1f} MB)")
+    print("run batch_collect with the same --raw to check on them and collect the results")
+
+
+def batch_records(client, file_id, b, args):
+    """Raw-file records from a batch output (or error) file; failed requests get empty `parsed`."""
+    if not file_id:
+        return []
+    records = []
+    for line in client.files.content(file_id).text.splitlines():
+        if not line.strip():
+            continue
+        r = json.loads(line)
+        ids = b["requests"].get(r.get("custom_id"))
+        if ids is None:
+            continue
+        response = r.get("response") or {}
+        body = response.get("body") or {} if response.get("status_code") == 200 else {}
+        choice = (body.get("choices") or [{}])[0]
+        content = (choice.get("message") or {}).get("content") or ""
+        parsed = parse(content, ids, args.n_examples)
+        u = body.get("usage") or {}
+        records.append({"request": r["custom_id"], "term_ids": ids, "model": body.get("model"), "api": "batch",
+                        "batch_id": b["batch_id"], "sampling": b.get("sampling"),
+                        "reasoning_effort": b.get("reasoning_effort"), "finish_reason": choice.get("finish_reason"),
+                        "error": r.get("error") or (None if body else response.get("body")),
+                        "usage": {"prompt_tokens": u.get("prompt_tokens", 0),
+                                  "completion_tokens": u.get("completion_tokens", 0)},
+                        "parsed": {t: parsed.get(t, []) for t in ids}, "content": content})
+    return records
 
 
 def batch_collect(args):
-    info = json.load(open(path(args.raw) + ".batch.json"))
-    client = client_for(args)
-    batch = client.batches.retrieve(info["batch_id"])
-    print(f"batch {batch.id}: {batch.status} {batch.request_counts}")
-    if batch.status != "completed":
-        return
-    with open(path(args.raw), "a") as handle:
-        for line in client.files.content(batch.output_file_id).text.splitlines():
-            r = json.loads(line)
-            ids = info["requests"][r["custom_id"]]
-            body = (r.get("response") or {}).get("body") or {}
-            content = body.get("choices", [{}])[0].get("message", {}).get("content", "") if body else ""
-            parsed = parse(content, ids, args.n_examples)
-            u = body.get("usage", {})
-            handle.write(json.dumps({"request": r["custom_id"], "term_ids": ids, "model": body.get("model"),
-                                     "usage": {"prompt_tokens": u.get("prompt_tokens", 0),
-                                               "completion_tokens": u.get("completion_tokens", 0)},
-                                     "parsed": {t: parsed.get(t, []) for t in ids}, "content": content}) + "\n")
+    state_file, state = batch_state(args)
+    if not state["batches"]:
+        sys.exit(f"no batch recorded for {args.raw}: run batch_submit first")
+    client, waiting = client_for(args), 0
+    for b in state["batches"]:
+        if b["collected"]:
+            continue
+        batch = client.batches.retrieve(b["batch_id"])
+        c = batch.request_counts
+        counts = f"{c.completed} done, {c.failed} failed of {c.total}" if c else ""
+        print(f"batch {batch.id}: {batch.status} {counts}")
+        if batch.status in ("validating", "in_progress", "finalizing", "cancelling"):
+            waiting += 1
+            continue
+        if batch.status == "failed":  # rejected as a whole (e.g. enqueued-token limit): nothing was run
+            for e in (batch.errors.data if batch.errors and batch.errors.data else []):
+                print(f"   error: {e.code}: {e.message}")
+        records = batch_records(client, batch.output_file_id, b, args) + \
+            batch_records(client, batch.error_file_id, b, args)
+        with open(path(args.raw), "a") as handle:
+            for record in records:
+                handle.write(json.dumps(record) + "\n")
+        ok = sum(1 for r in records for s in r["parsed"].values() if s)
+        n = sum(len(ids) for ids in b["requests"].values())
+        print(f"   collected {len(records)} responses: {ok}/{n} terms parsed")
+        b["collected"] = True
+        json.dump(state, open(state_file, "w"))
     measured(args.raw, args)
-    print("terms still missing (failed or unparsed) can be retried with `generate` (synchronous)")
+    if waiting:
+        print(f"{waiting} batch(es) still running: rerun batch_collect later")
+    else:
+        missing = len(load_terms(args.ontology_terms)) - len(done_terms(args.raw))
+        print(f"all batches collected; {missing} terms still missing. Retry them with batch_submit (another "
+              f"batch) or generate (synchronous), same --raw")
 
 
 def build(args):
@@ -360,7 +450,12 @@ def main():
             s.add_argument("--samples", default=DEFAULTS["samples"], help="training set (for --term_set metalog)")
         if name == "generate":
             s.add_argument("--workers", type=int, default=8)
-            s.add_argument("--dry_run", action="store_true")
+        if name in ("generate", "batch_submit"):
+            s.add_argument("--dry_run", action="store_true", help="token and cost estimate only, nothing is sent")
+        if name == "batch_submit":
+            s.add_argument("--batch_requests", type=int, default=2000,
+                           help="requests per batch (default: everything in one). If a batch fails with an "
+                                "enqueued-token limit, collect it and resubmit with e.g. 300")
         if name == "build":
             s.add_argument("--output", required=True)
             s.add_argument("--suffix", default="", help="appended to the variant names, e.g. _mini, to compare models")
