@@ -81,7 +81,7 @@ from sklearn.preprocessing import normalize
 from sklearn.svm import LinearSVC
 
 import hierarchy
-from common import SLOTS, ancestor_sets, load_npz, load_term_vectors, load_terms, path, select_samples, study_folds
+from common import SLOTS, ancestor_sets, load_npz, load_term_vectors, load_terms, path, read_tsv, select_samples, study_folds
 
 
 # ----------------------------------------------------------------------------- features
@@ -290,7 +290,7 @@ def label_regression(test, train, train_gold_vectors, vocab_vectors, vocab_ids, 
 def precision_threshold(confidence, correct, target=0.9):
     """Lowest confidence cut-off whose retained samples reach `target` precision, and the coverage
     at that cut-off (None if no cut-off reaches it). Use it to decide which predictions to keep."""
-    order = np.argsort(-confidence)
+    order = np.argsort(-confidence, kind="stable")  # stable: ties (e.g. majority) rank the same on every machine
     precision = np.cumsum(correct[order]) / np.arange(1, len(order) + 1)
     ok = np.where(precision >= target)[0]
     if not len(ok):
@@ -322,7 +322,7 @@ def score(g, parents, term_vector_of, ancestors):
         "top1_or_parent_child": near.mean(),
         "top1_gold_or_ancestor": np.mean([p == t or p in ancestors.get(t, ()) for p, t in zip(pred, gold)]),
         "macro_top1": pd.Series(hit).groupby(gold).mean().mean(),
-        "top1_confident_half": hit[np.argsort(-confidence)[:len(g) // 2]].mean(),
+        "top1_confident_half": hit[np.argsort(-confidence, kind="stable")[:len(g) // 2]].mean(),
         "n_unseen_label": int(unseen.sum()), "top1_unseen_label": hit[unseen].mean() if unseen.any() else None,
         "margin_for_90pct_precision": threshold, "coverage_at_90pct_precision": coverage,
     }
@@ -410,6 +410,9 @@ def main():
                         help="strict: the answer is gold or a coarser true term; lenient: also a more specific term")
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--fold_seed", type=int, default=0, help="Which study-to-fold assignment (see study_folds)")
+    parser.add_argument("--fold_groups", default=None,
+                        help="TSV with sample_id, project_group (experiments/project_groups.py): keep whole projects, "
+                             "not only study codes, on one side of a fold. Default: study_code")
     parser.add_argument("--max_per_study", type=int, default=50, help="0 = no cap")
     parser.add_argument("--seed", type=int, default=22)
     parser.add_argument("--api_key_path", default=None, help="For embedding-model features")
@@ -433,7 +436,12 @@ def main():
 
     records = []  # one per (test sample, slot, method)
     backoff_folds = defaultdict(list)  # (slot, method) -> per fold: closed-vocabulary scores of the test samples
-    folds = study_folds(samples["study_code"], args.folds, args.fold_seed)
+    groups = samples["study_code"]
+    if args.fold_groups:
+        project = dict(read_tsv(args.fold_groups)[["sample_id", "project_group"]].values)
+        groups = samples["sample_id"].map(project).fillna(samples["study_code"])
+        print(f"fold groups: {groups.nunique()} projects for {samples['study_code'].nunique()} study codes")
+    folds = study_folds(groups, args.folds, args.fold_seed)
     for fold, (train_idx, test_idx) in enumerate(folds, start=1):
         train, test = samples.iloc[train_idx], samples.iloc[test_idx]
         print(f"fold {fold}: {len(train)} train / {len(test)} test samples")

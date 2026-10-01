@@ -324,3 +324,99 @@ python3 experiments/rerank_pilot.py run --pilot $R/pilot.jsonl --model gpt-4.1-m
 python3 experiments/rerank_pilot.py run --pilot $R/pilot.jsonl --model gpt-5.1 --output $R/resp_gpt-5.1.jsonl
 python3 experiments/rerank_pilot.py score --pilot $R/pilot.jsonl --responses $R/resp_gpt-4.1-mini.jsonl
 ```
+
+## 8. Gold-set check of the atlas back-off (`gold_check.py`, 2026-10-01)
+
+Checks `atlas_backoff/` (prototype, 90 % strict target) on the 1,091 hand-labelled gold samples
+(`gold_dict.pkl`), outside Metalog except 24 (excluded). Gold labels are coarse (animal / plant /
+soil / water / other, ~210 each), so each predicted term is turned into coarse biomes
+automatically. For each term, take the GPT coarse biome of the Metalog-linked samples labelled
+with it or a descendant; compatible = every coarse biome with a share ≥ 0.15
+(`term_to_coarse_biome.tsv`). No curator is needed.
+
+```bash
+bash experiments/gold_check_extract.sh            # ~30 s
+P=~/MicrobeAtlasProject
+python3 experiments/gold_check.py --dir $P/ontology_mapping/experiments/gold_check \
+  --ontology_terms $P/ontology_terms.tsv.gz --training_set $P/metalog/clean/training_set.clean.tsv.gz \
+  --cv_predictions $P/ontology_mapping/cv_backoff/predictions.tsv.gz
+```
+
+Back-off answers, 1,021 gold samples with a prediction. *Coarse-consistent* = gold coarse biome
+compatible with the answer:
+
+| slot | answered (gold) | answered (Metalog CV) | coarse-consistent: animal/soil/water | plant | other |
+|---|---|---|---|---|---|
+| biome | 0.64 | 0.79 | 0.97 (81 % answered) | 0.94 (41 %) | 0.64 (38 %) |
+| feature | 0.18 | 0.61 | 0.98 (26 %) | 0.00 (n = 5) | 0.38 (11 %) |
+| material | 0.43 | 0.78 | 0.97 (60 %) | 0.03 (17 %) | 0.22 (20 %) |
+
+**Reading the coarse metric:**
+- It is noisy. On the 24 linked gold samples, Metalog's *own* labels are coarse-consistent only
+  50 / 83 / 74 % of the time under the strict (majority) map. Gold's classes follow the GigaScience
+  paper's conventions, e.g. rhizosphere → plant, wastewater → water, food / bioreactor / lab → other.
+- So the 151 answered-but-inconsistent cases were reviewed by rule (`gold_check_disagreements_reviewed.tsv`,
+  one reviewer, Claude). 66 were defensible (bioreactor → sludge / activated sludge / wastewater
+  treatment plant; rhizosphere / compost / litter → soil; sponge, coral → marine biome), 30
+  arguable, 46 wrong, 9 with uninformative gold.
+- After review, answered back-off terms are coarse-correct 97 / 95 / 92 % (arguable counted half),
+  or 97 / 93 / 91 % (arguable counted wrong).
+
+**Conclusions:**
+1. **The 90 % target holds at the coarse level outside Metalog.** Coarse correctness is necessary
+   but not sufficient for the exact term, so this does not prove 90 % strict.
+2. **On unfamiliar samples the model abstains more than on Metalog:** biome 64 vs 79 % answered,
+   feature 18 vs 61 %, material 43 vs 78 %. Plant and other are answered least. Coverage, not
+   precision, is the cost out of domain.
+3. **Confidence ranks well on gold too.** Top-1 coarse consistency rises with the calibrated p:
+   biome 0.65 → 0.77 → 0.88 → 0.94 for p < 0.5 / 0.5–0.75 / 0.75–0.9 / ≥ 0.9.
+4. **Real gaps:**
+   - plant anatomy: leaf / root / whole plant → material *soil* or *organic material*;
+   - "other" habitats Metalog barely has (laboratory, air, food, urban) get forced into
+     marine / water / intestine terms.
+5. **Re-weighted to the atlas mix** (62 % animal), coarse-strict top-1 is 0.81 / 0.88 / 0.81.
+
+Not used: `atlas_final` (rerank). Only the 2,000-request trial was run, so 6 of the gold samples
+were reranked.
+
+## 9. Project-level folds (`project_groups.py`, `5_evaluate.py --fold_groups`, 2026-10-01)
+
+```bash
+python3 experiments/project_groups.py --sample_info ~/MicrobeAtlasProject/sample.info.gz \
+  --training_set ~/MicrobeAtlasProject/metalog/clean/training_set.clean.tsv.gz \
+  --output ~/MicrobeAtlasProject/metalog/clean/project_groups.tsv        # ~1.5 min
+python3 5_evaluate.py ... --fold_groups ~/MicrobeAtlasProject/metalog/clean/project_groups.tsv
+```
+
+**How groups are formed.** Study codes are merged when their samples share an SRA study or a
+BioProject accession: Stewart 2018/2019 and Alneberg 2018/2020. `--merge 'TARA_*'` adds the four
+TARA codes, because prokaryote and protist size fractions come from the same stations (63 of 64
+shared). Generic shared titles ("human gut metagenome Metagenome") are *not* merged. The result is
+552 → 547 groups; after the per-study cap, 378 evaluated samples are in merged projects.
+
+`training_set.clean`, kw+sb, fold seeds 0–2, top-1:
+
+| slot | method | study folds | project folds | merged-project samples: study → project folds |
+|---|---|---|---|---|
+| biome | linear | 0.680 | 0.650 | 0.99 → 0.64 |
+| biome | label_reg | 0.681 | 0.652 | 0.99 → 0.62 |
+| biome | knn_study | 0.680 | 0.652 | 0.95 → 0.36 |
+| biome | prototype | 0.641 | 0.642 | 0.74 → 0.66 |
+| feature | linear | 0.641 | 0.635 | 0.41 → 0.10 |
+| material | linear | 0.703 | 0.715 | 0.53 → 0.67 |
+
+**Conclusions:**
+- **The leak is real but small.** Merged-project samples (3.8 % of biome rows, 2.2 % of
+  feature / material rows) lose 30–60 points on biome once whole projects are held out. That is
+  worth about −1.3 / −0.7 points of biome / feature top-1 for the supervised methods.
+- **The rest of the gap is fold noise.** The remaining biome difference on other samples
+  (−1.7 for linear) is within the fold-to-fold spread, which is ±1.4 points with the cleaned
+  labels (linear: 0.656–0.683 over 3 study-fold seeds).
+- **prototype is barely affected.** It leans on the term vector and the label prior, not on
+  near-copies of the test study.
+- **Recommendation:** report with `--fold_groups` from now on, and use ≥ 5 fold seeds for biome
+  comparisons.
+- Also fixed: `top1_confident_half` and `margin_for_90pct_precision` now sort confidences
+  stably. Ties (majority, kNN vote shares) used to rank differently on the Mac and on Linux, so
+  those two metrics differed slightly between machines; top-1 never did.
+

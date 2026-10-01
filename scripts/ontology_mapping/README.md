@@ -222,6 +222,11 @@ because samples of one study share most of their text. The balancing is the same
 sklearn's `GroupKFold`, but ties are broken with a fixed seed, so the folds are identical on
 every machine (see *Known issues*). `--fold_seed` picks a different split, which is how the
 noise band in the report was measured.
+`--fold_groups project_groups.tsv` (from `experiments/project_groups.py`) groups by *project*
+instead: study codes that share a sequencing project (TARA ×4, Stewart 2018/2019, Alneberg
+2018/2020) stay on one side. The evaluated samples are unchanged. With it, biome top-1 of the
+supervised methods is about 1–1.5 points lower, because those projects were leaking across folds
+(experiments README, section 9).
 
 **Features.** One or more blocks. Each block is L2-normalised and scaled by
 1/√(number of blocks), then the blocks are concatenated. So the dot product of two samples
