@@ -9,7 +9,7 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # scripts/ontology_mapping
-from common import SLOTS, load_npz, load_term_vectors, load_terms, path, select_samples, study_folds  # noqa: E402
+from common import SLOTS, load_npz, load_term_vectors, load_terms, path, select_samples, study_folds  # noqa: E402,F401
 
 P = "~/MicrobeAtlasProject"
 DEFAULTS = {

@@ -29,7 +29,7 @@ from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import cross_val_predict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common import SLOTS, ancestor_sets, path, read_tsv  # noqa: E402
+from common import SLOTS, path, read_tsv, term_ancestors  # noqa: E402
 
 
 def cv_auc(X, y):
@@ -51,7 +51,7 @@ def main():
 
     # 1. Metalog out-of-fold
     terms = read_tsv(args.ontology_terms)
-    anc = ancestor_sets({t: set(p.split("||")) for t, p in zip(terms["term_id"], terms["parents"]) if p})
+    anc = term_ancestors(terms)
     held = read_tsv(os.path.join(d, "metalog_held_out_sim.tsv.gz"))
     cv = read_tsv(args.cv_predictions)
     cv = cv[cv["method"] == args.cv_method].merge(held[["sample_id", "held_out_sim"]], on="sample_id")

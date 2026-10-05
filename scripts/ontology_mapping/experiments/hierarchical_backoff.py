@@ -36,29 +36,23 @@ import sys
 import time
 
 import numpy as np
-import pandas as pd
-from scipy.optimize import minimize_scalar
 from sklearn.linear_model import RidgeClassifier
 from sklearn.preprocessing import normalize
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
-sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
-import importlib  # noqa: E402
-from common import SLOTS, ancestor_sets, load_npz, load_terms, path, select_samples, study_folds  # noqa: E402
+from common import SLOTS, load_npz, load_terms, path, select_samples, study_folds, term_ancestors  # noqa: E402
+from hierarchy import Closure, fit_temperature, outcome, relation, softmax  # noqa: E402,F401  (same as the pipeline)
+from methods import prototype_model  # noqa: E402
 from _setup import DEFAULTS  # noqa: E402
 
-evaluate = importlib.import_module("5_evaluate")
 TARGETS = (0.80, 0.85, 0.90, 0.95)
-# slot roots / upper classes: true of nearly everything, so never an answer ("this is from a biome")
-NO_ANSWER = {"ENVO_00000428",   # biome
-             "ENVO_00010483",   # environmental material
-             "ENVO_01000254"}   # environmental system
 
 
 # ----------------------------------------------------------------------------- base models
 def term_matrix(terms, vectors_path):
-    """[T, T] / sqrt(2): term vectors in the space of the two-block sample vectors (label_syn text)."""
+    """[T, T] / sqrt(2): the vectors of `terms` (rows in that order; label_syn text) in the space of the
+    two-block sample vectors [kw, sb] / sqrt(2)."""
     import h5py
     with h5py.File(path(vectors_path), "r") as handle:
         row = {t.decode() if isinstance(t, bytes) else t: i for i, t in enumerate(handle["texts"][:])}
@@ -70,7 +64,7 @@ def term_matrix(terms, vectors_path):
 def base_scores(model, x_tr, y_tr, x_te, vocab, TM_vocab, a=0.5, b=0.1):
     """(test x vocab) scores of a base model; vocab = the training labels of the slot."""
     if model == "prototype":
-        mean, P, bias = evaluate.prototype_model(x_tr, y_tr, TM_vocab, vocab, a, b)
+        mean, P, bias = prototype_model(x_tr, y_tr, TM_vocab, vocab, a, b)
         return normalize(x_te - mean) @ P.T + bias
     if model == "linear":
         clf = RidgeClassifier(alpha=1.0).fit(x_tr, y_tr)
@@ -79,82 +73,9 @@ def base_scores(model, x_tr, y_tr, x_te, vocab, TM_vocab, a=0.5, b=0.1):
     raise ValueError(model)
 
 
-def softmax(S, T):
-    Z = S / T
-    Z = Z - Z.max(1, keepdims=True)
-    E = np.exp(Z)
-    return E / E.sum(1, keepdims=True)
-
-
-def fit_temperature(blocks):
-    """Temperature minimising the NLL of the gold label over [(scores, gold column or -1)]."""
-    def nll(logT):
-        T, total, n = np.exp(logT), 0.0, 0
-        for S, g in blocks:
-            m = g >= 0
-            if m.any():
-                Z = S[m] / T
-                Z = Z - Z.max(1, keepdims=True)
-                total -= (Z[np.arange(m.sum()), g[m]] - np.log(np.exp(Z).sum(1))).sum()
-                n += m.sum()
-        return total / max(n, 1)
-    return float(np.exp(minimize_scalar(nll, bounds=(-8, 3), method="bounded").x))
-
-
-# ----------------------------------------------------------------------------- hierarchy
-class Closure:
-    """Label x node ancestor-closure matrix of one fold's vocabulary."""
-
-    def __init__(self, vocab, anc, answers="labels", floor=0.25):
-        self.vocab = list(vocab)
-        nodes = sorted(set(self.vocab).union(*[anc.get(v, set()) for v in self.vocab]))
-        self.nodes = np.array(nodes)
-        col = {n: j for j, n in enumerate(nodes)}
-        self.A = np.zeros((len(self.vocab), len(nodes)), dtype=np.float32)
-        for i, v in enumerate(self.vocab):
-            self.A[i, [col[n] for n in ({v} | anc.get(v, set()))]] = 1
-        self.n_below = self.A.sum(0)  # labels at or below each node
-        self.is_label = np.isin(self.nodes, self.vocab)
-        self.depth = np.array([len(anc.get(n, ())) for n in nodes])  # number of ancestors
-        # allowed answers: "labels" = only terms Metalog uses in this slot (any depth);
-        # "ontology" = also their ENVO/UBERON ancestors, unless above `floor` of the slot's labels
-        # (upper classes such as "environmental system" say nothing)
-        onto = np.array([n.startswith(("ENVO_", "UBERON_")) for n in nodes])
-        not_root = ~np.isin(self.nodes, list(NO_ANSWER))
-        if answers == "labels":
-            self.informative = self.is_label & (self.n_below < 0.5 * len(self.vocab)) & not_root
-        else:
-            self.informative = onto & ((self.n_below < floor * len(self.vocab)) | self.is_label) & not_root
-        # tie-break among equally specific nodes: labels first, then deeper, then higher q
-        self.rank_key = -self.n_below * 1e6 + self.is_label * 1e4 + self.depth * 10
-
-    def decode(self, P, tau):
-        """Climbing: among the top-1 label and its ancestors, the most specific node with q >= tau
-        (so tau -> 0 gives the top-1 label). -> node index per sample, -1 = abstain."""
-        q = P @ self.A
-        ok = (q >= tau - 1e-12) & self.informative & (self.A[P.argmax(1)] > 0)
-        key = np.where(ok, self.rank_key[None, :] + q, -np.inf)
-        pick = key.argmax(1)
-        return np.where(ok.any(1), pick, -1)
-
-
-def relation(nodes, gold, anc):
-    """(samples x nodes) category if that node were the answer: 1 exact, 2 ancestor of gold (true but
-    coarser), 3 too specific (a descendant of gold), 4 other branch."""
-    cache, rows = {}, []
-    for g in gold:
-        if g not in cache:
-            ga = anc.get(g, set())
-            cache[g] = np.array([1 if n == g else 2 if n in ga else 3 if g in anc.get(n, ()) else 4
-                                 for n in nodes], dtype=np.int8)
-        rows.append(cache[g])
-    return np.vstack(rows)
-
-
-def outcome(rel, pick):
-    """Per-sample category (0 = abstain) for the picked node indices."""
-    out = rel[np.arange(len(pick)), np.maximum(pick, 0)].astype(int)
-    return np.where(pick >= 0, out, 0)
+# softmax, fit_temperature, Closure (with --answers labels / ontology), relation and outcome come from
+# hierarchy.py: the same code as 5_evaluate.py / 6_predict_atlas.py (outcome codes 1-4 = EXACT, COARSER,
+# TOO_SPECIFIC, OTHER).
 
 
 def summarise(out, at_label):
@@ -243,8 +164,7 @@ def evaluate_variant(F, decode, anc):
 def run(args):
     terms = load_terms(args.ontology_terms)
     term_ids = terms["term_id"].to_numpy()
-    parents = {t: set(p.split("||")) for t, p in zip(term_ids, terms["parents"]) if p}
-    anc = ancestor_sets(parents)
+    anc = term_ancestors(terms)
     TM = term_matrix(terms, args.term_vectors)
     trow = {t: i for i, t in enumerate(term_ids)}
     (kr, K), (sr, B) = load_npz(args.keywords), load_npz(args.sub_biomes)
@@ -317,7 +237,7 @@ def run(args):
                             res[f"base_top1_given_gold_in_top{args.k}_gate{gate}"] = round(float(np.concatenate(sub).mean()), 4)
                     if extra:
                         res["reranker_acc_on_gated"] = round(float(np.mean(extra["reranker_acc_on_gated"])), 4)
-                    res["hier"] = evaluate_variant(F, lambda C, P, t: C.decode(P, t), anc)
+                    res["hier"] = evaluate_variant(F, lambda C, P, t: C.decode(P, t)[0], anc)
                     res["flat"] = evaluate_variant(F, flat_decode, anc)
                     res["temperature"] = [round(f["T"], 4) for f in F]
                     results.setdefault(f"seed{seed}", {}).setdefault(slot, {}).setdefault(model, {})[name] = res
@@ -345,8 +265,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     for name in ["ontology_terms", "samples", "keywords", "sub_biomes"]:
         p.add_argument(f"--{name}", default=DEFAULTS[name])
-    p.add_argument("--term_vectors", default="~/MicrobeAtlasProject/ontology_mapping/experiments/term_text/term_variants.h5",
-                   help="h5 holding the label_syn term texts (term_text_variants.py embed output or 4_embed_terms.py)")
+    p.add_argument("--term_vectors", default=DEFAULTS["term_vectors"],
+                   help="h5 holding the label_syn term texts of every term (4_embed_terms.py output)")
     p.add_argument("--models", nargs="+", default=["prototype", "linear"])
     p.add_argument("--label_map", default=None, help="TSV slot, from_id, to_id (2b_clean_metalog.py format), "
                    "applied to training and test labels, e.g. draft_biome_label_map.py output")

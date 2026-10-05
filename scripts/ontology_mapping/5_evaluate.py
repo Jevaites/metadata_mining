@@ -1,69 +1,57 @@
 #!/usr/bin/env python3
 """
-Step 5: cross-validated comparison of methods that map a sample to one ENVO/Uberon
-term per slot (biome, feature, material), scored against Metalog's curated labels.
-
-Every method uses the same sample vectors (--features), so rows are comparable.
+Step 5: cross-validated comparison of the mapping methods (methods.py), scored against Metalog's
+curated labels. Every method sees the same sample vectors and the same folds, so rows are comparable.
 
   majority        the most frequent training label (the floor to beat)
-  knn             similarity-weighted vote of the k nearest *training samples*
-  linear          one-vs-rest linear classifier on the sample vectors
-                  (RidgeClassifier on dense vectors, LinearSVC on sparse TF-IDF)
+  knn             similarity-weighted vote of the k = 25 nearest *training samples*
+  knn_study       knn in which each training *study* has one vote (k = --knn_study_k, 50)
+  linear          one-vs-rest linear classifier (RidgeClassifier on dense vectors, LinearSVC on TF-IDF)
 Methods that also need term vectors (text encoders, or .npz features + --term_vectors):
-  retrieval       zero-shot: the term whose vector is closest to the sample, among the
-                  terms used as training labels for this slot ("closed" vocabulary)
-  retrieval_open  same, among all terms of the term table (18.8k ENVO + Uberon; 49k with PO + FOODON)
-  hybrid          linear score + --hybrid_weight x cosine(sample, term), closed vocabulary
-  hybrid_open     same over all terms; terms never seen in training get linear score -1,
-                  so this is the only supervised method that can output an unseen term
-  label_reg       (dense features, --term_vectors) ridge regression from the sample vector
-                  to the embedding of its gold term, then the closest term (closed vocab)
-Upgraded "trivial" methods (added 2026-09-28; see experiments/README.md for how they were chosen):
-  knn_study       knn in which each training *study* has one vote, split over its samples among
-                  the --knn_study_k nearest neighbours (so one big study cannot outvote the rest)
-  retrieval_prior (dense) retrieval after centring both sides + --prototype_beta x log(label
-                  frequency in the training fold), closed vocabulary
-  prototype       (dense) nearest class prototype: each term's (centred) vector is blended with the
-                  centroid of its training samples (--prototype_alpha), + the same log prior
-  prototype_open  same over all terms; terms without training samples keep their term
-                  vector (+ --prototype_unseen_bonus), so this can output an unseen term
+  retrieval       zero-shot: the closest term vector among the slot's training labels ("closed" vocabulary)
+  retrieval_open  the same among all terms of the term table (49k ENVO + Uberon + PO + FOODON)
+  hybrid(_open)   linear score + --hybrid_weight x cosine(sample, term); _open: unseen terms score -1
+  label_reg       (dense) ridge regression to the gold term's vector, then the closest term
+  retrieval_prior (dense) centred retrieval + --prototype_beta x log(label frequency)
+  prototype(_open)(dense) nearest class prototype: centred term vector blended with the centroid of its
+                  training samples (--prototype_alpha) + the log prior; _open: over all terms
+                  (+ --prototype_unseen_bonus for terms never seen in training)
 
-Evaluation: cross-validation over Metalog `study_code` (common.study_folds), so no
-study is in both train and test (samples of a study share most of their text). At most
---max_per_study samples per study are kept (common.select_samples).
+Evaluation: 5-fold cross-validation over Metalog `study_code` (common.study_folds; --fold_groups: whole
+projects), at most --max_per_study samples per study (common.select_samples).
 
---features takes one or more blocks. Each block is L2-normalised and weighted by
-1/sqrt(n_blocks) before concatenation, so a dot product = mean of the block cosines.
+--features takes one or more blocks. Each block is L2-normalised and weighted by 1/sqrt(n_blocks)
+before concatenation, so a dot product = the mean of the block cosines.
   tfidf       TF-IDF of the cleaned MicrobeAtlas text (fitted on the training fold only)
-  <file>.npz  precomputed per-sample vectors (3_extract_sample_embeddings.py);
-              samples without a vector are dropped; term side = --term_vectors
+  <file>.npz  precomputed per-sample vectors (3_extract_sample_embeddings.py); samples without a vector
+              are dropped; term side = --term_vectors (with two blocks the term vector is used twice)
   <model>     any other value: an OpenAI-compatible embedding model applied to the text
-              (--api_key_path, --base_url, --dimensions); every distinct text is cached
+              (--api_key_path, --base_url, --dimensions); every distinct text is embedded once (cached)
 
-Calibrated probabilities and hierarchical back-off (--backoff_methods, default prototype and linear;
-hierarchy.py): the out-of-fold scores become probabilities (softmax, temperature fitted on the other
-folds); the answer climbs from the top-1 to the most specific broader term Metalog uses in the slot
-whose summed probability reaches tau, or abstains. For each target accuracy (--backoff_targets),
-tau is chosen on the other folds and applied to the held-out fold. Accuracy is reported strict (gold
-or a coarser true term) and lenient (also a more specific term than Metalog's).
+Calibrated probabilities and hierarchical back-off (--backoff_methods; hierarchy.py): the out-of-fold
+scores become probabilities (softmax, temperature fitted on the other folds); the answer climbs from the
+top-1 to the most specific broader term Metalog uses in the slot whose summed probability reaches tau,
+or abstains. For each target accuracy (--backoff_targets), tau is chosen on the other folds and applied
+to the held-out fold. Accuracy is strict (gold or a coarser true term) or lenient (also a more specific
+term than Metalog's).
 
 Outputs in --output_dir:
-  metrics.json      per slot and method, see score(); back-off methods also have "backoff":
-                    temperature, the curve (coverage / accuracy / exact / too specific per tau) and,
-                    per target, strict_<t> / lenient_<t> (coverage, accuracies, outcome shares)
-  calibration.json  per slot and back-off method: temperature fitted on all folds, the pooled curve,
-                    the top-1 probability quantiles and the training settings: the input of
-                    6_predict_atlas.py --calibration and 7_rerank_atlas.py fit
-  predictions.tsv   one row per test sample x slot x method: gold, top-1, top-5, confidence; back-off
+  metrics.json      per slot and method, see score(); back-off methods also have "backoff": temperatures,
+                    the curve (coverage / accuracy / exact / too specific per tau) and, per target,
+                    strict_<t> / lenient_<t>
+  calibration.json  per slot and back-off method: temperature fitted on all folds, the pooled curve, the
+                    top-1 probability quantiles and the training settings (input of 6_predict_atlas.py
+                    --calibration and 7_rerank_atlas.py fit)
+  predictions.tsv.gz one row per test sample x slot x method: gold, top-1, top-5, confidence; back-off
                     methods also: prob (calibrated top-1 probability), backoff (answer at
                     --backoff_target, "" = abstain), backoff_q (its summed probability)
 
 python 5_evaluate.py \
   --ontology_terms ~/MicrobeAtlasProject/ontology_terms.tsv.gz \
-  --samples ~/MicrobeAtlasProject/metalog/metalog_training_set.tsv.gz \
+  --samples ~/MicrobeAtlasProject/metalog/clean/training_set.clean.tsv.gz \
   --features ~/MicrobeAtlasProject/metalog/keywords__large1024.npz ~/MicrobeAtlasProject/metalog/sub_biomes__large1024.npz \
   --term_vectors ~/MicrobeAtlasProject/ontology_mapping/ontology_terms_unique_embeddings__text-embedding-3-large__dim1024.h5 \
-  --output_dir ~/MicrobeAtlasProject/ontology_mapping/cv_kw_sb
+  --output_dir ~/MicrobeAtlasProject/ontology_mapping/cv_backoff
 """
 
 import argparse
@@ -76,12 +64,12 @@ import numpy as np
 import pandas as pd
 from scipy import sparse
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.linear_model import Ridge, RidgeClassifier
 from sklearn.preprocessing import normalize
-from sklearn.svm import LinearSVC
 
 import hierarchy
-from common import SLOTS, ancestor_sets, load_npz, load_term_vectors, load_terms, path, read_tsv, select_samples, study_folds
+import methods as M
+from common import SLOTS, load_npz, load_term_vectors, load_terms, path, read_tsv, select_samples, study_folds, \
+    term_ancestors
 
 
 # ----------------------------------------------------------------------------- features
@@ -98,7 +86,7 @@ def text_encoder(name, fit_texts, args, cache_dir):
     cache_path = os.path.join(cache_dir, f"embedding_cache__{name.replace('/', '-')}__dim{args.dimensions}.npz")
 
     def encode(texts):
-        """Embed each distinct text once; the cache (md5(text) -> vector) survives across runs."""
+        """Embed each distinct text once; the cache (md5(text) -> vector) survives across folds and runs."""
         cache = {}
         if os.path.exists(cache_path):
             saved = np.load(cache_path)
@@ -126,7 +114,9 @@ def stack(blocks):
 
 
 def build_features(args, npz, train_texts, term_texts, term_vectors, cache_dir):
-    """-> (encode_samples(df) -> matrix, term matrix in the same space or None)."""
+    """-> (encode_samples(df) -> matrix, term matrix in the same space or None).
+    Example with --features keywords.npz sub_biomes.npz: a sample is [kw, sb] / sqrt(2) (2048 dims) and a
+    term [t, t] / sqrt(2), so sample . term = (cos(kw, t) + cos(sb, t)) / 2."""
     weight = 1 / np.sqrt(len(args.features))
     sample_fns, term_blocks = [], []
     for spec in args.features:
@@ -134,7 +124,7 @@ def build_features(args, npz, train_texts, term_texts, term_vectors, cache_dir):
             row_of, vectors = npz[spec]
             sample_fns.append(lambda df, r=row_of, v=vectors: v[[r[s] for s in df["sample_id"]]])
             term_blocks.append(term_vectors)  # None without --term_vectors
-        else:
+        else:  # a text encoder, fitted on this fold's training texts (and the term texts) only
             encode = text_encoder(spec, train_texts + term_texts, args, cache_dir)
             sample_fns.append(lambda df, e=encode: e(list(df["text"])))
             term_blocks.append(encode(term_texts))
@@ -143,163 +133,11 @@ def build_features(args, npz, train_texts, term_texts, term_vectors, cache_dir):
     return encode_samples, term_matrix
 
 
-def dense(matrix):
-    return matrix.toarray() if sparse.issparse(matrix) else np.asarray(matrix)
-
-
-# ----------------------------------------------------------------------------- methods
-# every method returns (list of top-5 id lists, confidence per sample); confidence only ranks samples
-def rank(scores, ids, n=5, margin=True):
-    """Top-n ids per row of a (samples x ids) score matrix; confidence = best minus second-best
-    score (margin=True) or the best score itself."""
-    # row blocks keep memory low (samples x all terms); argsort is per row, so the result is the same
-    order = np.vstack([np.argsort(-scores[i:i + 1000], axis=1)[:, :n] for i in range(0, max(len(scores), 1), 1000)])
-    top2 = np.take_along_axis(scores, order[:, :2], axis=1)
-    return [ids[row].tolist() for row in order], top2[:, 0] - top2[:, -1] if margin else top2[:, 0]
-
-
-def row_blocks(n, size=1000):
-    """Row slices of at most `size` rows (at least one, possibly empty, slice)."""
-    return [slice(start, start + size) for start in range(0, max(n, 1), size)]
-
-
-def join_ranks(parts):
-    """Concatenate the (top-n lists, confidences) of row blocks."""
-    return [r for ranked, _ in parts for r in ranked], np.concatenate([c for _, c in parts])
-
-
-def knn(test, train, train_labels, k):
-    """Similarity-weighted vote over the labels of the k most similar training samples;
-    confidence = the winner's share of the vote."""
-    ranked, confidence = [], []
-    for start in range(0, test.shape[0], 2000):  # chunks keep the similarity matrix small
-        sim = dense(test[start:start + 2000] @ train.T)
-        idx = np.argpartition(-sim, min(k, sim.shape[1] - 1), axis=1)[:, :k]
-        idx = np.take_along_axis(idx, np.argsort(-np.take_along_axis(sim, idx, axis=1), axis=1), axis=1)
-        for row_idx, row_sim in zip(idx, np.take_along_axis(sim, idx, axis=1)):  # closest first (tie-break)
-            votes = defaultdict(float)
-            for i, s in zip(row_idx, row_sim):
-                votes[train_labels[i]] += s
-            ranked.append(sorted(votes, key=votes.get, reverse=True)[:5])
-            confidence.append(votes[ranked[-1][0]] / max(sum(votes.values()), 1e-9))
-    return ranked, np.array(confidence)
-
-
-TIE_BREAK = 1e-13  # knn_study: equal similarities (identical texts) are ordered by training-sample index
-
-
-def knn_study(test, train, train_labels, train_studies, k):
-    """knn in which every training *study* has one vote. The k most similar training samples are
-    found as in knn(); each neighbour then votes 1 / (number of the k neighbours from its study).
-    Metalog studies contribute up to --max_per_study near-identical samples, so without this one
-    study fills the neighbour list and outvotes every other curator. Votes are not weighted by
-    similarity (nested CV preferred unweighted votes, see experiments/).
-    Many samples share an identical text, so similarities tie exactly; ties are broken by training
-    sample index (the TIE_BREAK offset is far below float32 resolution), which makes the result
-    deterministic and identical to 6_predict_atlas.py --method knn_study.
-    Confidence = the winner's share of the vote."""
-    ranked, confidence = [], []
-    offset = TIE_BREAK * np.arange(train.shape[0])
-    for start in range(0, test.shape[0], 2000):
-        sim = dense(test[start:start + 2000] @ train.T).astype(np.float64) - offset
-        idx = np.argpartition(-sim, min(k, sim.shape[1] - 1), axis=1)[:, :k]
-        idx = np.take_along_axis(idx, np.argsort(-np.take_along_axis(sim, idx, axis=1), axis=1), axis=1)
-        for row_idx in idx:  # closest first, so ties go to the label met first
-            studies = train_studies[row_idx]
-            per_study = Counter(studies)
-            votes = defaultdict(float)
-            for i, study in zip(row_idx, studies):
-                votes[train_labels[i]] += 1 / per_study[study]
-            # rounded, so that float noise in sums like 1/3 + 1/3 + 1/3 cannot break a tie;
-            # sorted() is stable, so equal votes keep the closest-first order
-            ranked.append(sorted(votes, key=lambda label: round(votes[label], 9), reverse=True)[:5])
-            confidence.append(votes[ranked[-1][0]] / sum(votes.values()))
-    return ranked, np.array(confidence)
-
-
-def prototype_model(train, train_labels, vocab_vectors, vocab_ids, alpha, beta, unseen_bonus=0.0):
-    """Class prototypes for prototype() -> (sample mean, prototypes: vocab x dim, bias: vocab).
-
-    1. Centre both sides: samples minus the training mean, terms minus the vocabulary mean. Keyword
-       lists and short term names sit in different regions of the embedding space; centring
-       removes that offset ("modality gap").
-    2. prototype(term) = normalise(alpha * normalise(centroid of its training samples)
-                                   + (1 - alpha) * normalise(centred term vector)).
-       A term without training samples keeps its term vector alone.
-       alpha = 0 is retrieval_prior, alpha = 1 a nearest-centroid classifier.
-    3. bias(term) = beta * log((n_train(term) + 0.5) / sum): the label frequencies. Curators use a
-       few conventional terms far more often than their names suggest (fecal material, not
-       intestine environment); this is where most of the gain over plain retrieval comes from.
-    4. + unseen_bonus for terms without training samples. A bare term vector scores lower than a
-       centroid-blended prototype, so with 0 an unseen term (almost) never wins. Raising it trades
-       accuracy on seen labels for recovering unseen ones (sweep in experiments/README.md).
-    """
-    mean = train.mean(axis=0)
-    prototypes = normalize(vocab_vectors - vocab_vectors.mean(axis=0))
-    column = {t: i for i, t in enumerate(vocab_ids)}
-    labels, inverse, counts = np.unique(train_labels, return_inverse=True, return_counts=True)
-    sums = np.zeros((len(labels), train.shape[1]))
-    np.add.at(sums, inverse, normalize(train - mean))
-    rows = [column[t] for t in labels]
-    if alpha > 0:
-        prototypes[rows] = normalize(alpha * normalize(sums) + (1 - alpha) * prototypes[rows])
-    n = np.zeros(len(vocab_ids))
-    n[rows] = counts
-    return mean, prototypes, beta * np.log((n + 0.5) / (n + 0.5).sum()) + unseen_bonus * (n == 0)
-
-
-def prototype_scores(test, model):
-    """(samples x vocab) cosine(centred sample, prototype) + bias (see prototype_model)."""
-    mean, prototypes, bias = model
-    return normalize(test - mean) @ prototypes.T + bias
-
-
-def prototype(test, model, vocab_ids, scores_out=None):
-    """Rank terms by prototype_scores. With a list as `scores_out`, the score matrix is appended to
-    it (closed vocabulary only: the back-off needs every score of the sample)."""
-    ranked, confidence, blocks = [], [], []
-    for start in range(0, max(test.shape[0], 1), 1000):  # row blocks keep memory low with 49k terms
-        scores = prototype_scores(test[start:start + 1000], model)
-        r, c = rank(scores, vocab_ids)
-        ranked += r
-        confidence.append(c)
-        if scores_out is not None:
-            blocks.append(scores)
-    if scores_out is not None:
-        scores_out.append(np.vstack(blocks))
-    return ranked, np.concatenate(confidence)
-
-
-def linear_scores(test, train, train_labels):
-    """-> (classes, decision scores test x classes) of a one-vs-rest linear classifier."""
-    classes = np.unique(train_labels)
-    if len(classes) < 2:
-        return classes, np.ones((test.shape[0], 1))
-    clf = LinearSVC(C=0.5, random_state=0) if sparse.issparse(train) else RidgeClassifier(alpha=1.0)
-    scores = clf.fit(train, train_labels).decision_function(test)
-    if scores.ndim == 1:  # binary problem: sklearn returns only the score of classes_[1]
-        scores = np.column_stack([-scores, scores])
-    return clf.classes_, scores
-
-
-def hybrid(classes, linear, cosine, vocab_ids, weight):
-    """linear score + weight x cosine over `vocab_ids`; a term the classifier never saw scores -1."""
-    column = {t: i for i, t in enumerate(vocab_ids)}
-    scores = np.full(cosine.shape, -1.0)
-    scores[:, [column[c] for c in classes]] = linear
-    return rank(scores + weight * cosine, vocab_ids)
-
-
-def label_regression(test, train, train_gold_vectors, vocab_vectors, vocab_ids, alpha=10.0):
-    """Ridge regression sample vector -> gold-term embedding, then rank terms by cosine to the prediction."""
-    predicted = normalize(Ridge(alpha=alpha).fit(train, train_gold_vectors).predict(test))
-    return rank(predicted @ vocab_vectors.T, vocab_ids)
-
-
 # ----------------------------------------------------------------------------- scoring
 def precision_threshold(confidence, correct, target=0.9):
-    """Lowest confidence cut-off whose retained samples reach `target` precision, and the coverage
-    at that cut-off (None if no cut-off reaches it). Use it to decide which predictions to keep."""
+    """Lowest confidence cut-off whose retained samples reach `target` precision, and the coverage at that
+    cut-off (None if no cut-off reaches it). Example: sorted confidences with hits [1, 1, 1, 0, 1, 0] reach
+    90 % precision on the first 3 -> (3rd confidence, 0.5)."""
     order = np.argsort(-confidence, kind="stable")  # stable: ties (e.g. majority) rank the same on every machine
     precision = np.cumsum(correct[order]) / np.arange(1, len(order) + 1)
     ok = np.where(precision >= target)[0]
@@ -313,9 +151,9 @@ def score(g, parents, term_vector_of, ancestors):
       top1, top5                accuracy of the first / any of the five predictions
       top1_or_parent_child      top-1 counted as a hit if it is the gold term or one is_a step away
       top1_gold_or_ancestor     top-1 counted as a hit if it is the gold term or any is_a ancestor of it
-                                (true but coarser)
-      top1_near_synonym         top-1 counted as a hit if its term vector has cosine >= 0.8 with the
-                                gold term's (near-synonyms such as "microbial mat" / "microbial mat material")
+                                (true but coarser: 'sediment' for gold 'marine sediment')
+      top1_near_synonym         top-1 counted as a hit if its term vector has cosine >= 0.8 with the gold
+                                term's (near-synonyms such as 'microbial mat' / 'microbial mat material')
       macro_top1                mean of per-label top-1 (weights rare labels like frequent ones)
       top1_confident_half       top-1 on the 50 % most confident samples
       top1_unseen_label         top-1 on samples whose gold term never occurs in the training fold
@@ -353,7 +191,7 @@ def backoff_all(backoff_folds, ancestors, args, n_samples):
     probability, backoff = the answer at --backoff_target (tau chosen on the other folds; "" =
     abstain), backoff_q = its summed probability)."""
     reports, calibration, extra = {}, {}, {}
-    name = f"{args.backoff_metric}_{args.backoff_target}"
+    name = f"{args.backoff_metric}_{args.backoff_target}"  # e.g. "strict_0.9"
     targets = sorted(set(args.backoff_targets) | {args.backoff_target})
     for (slot, method), folds in sorted(backoff_folds.items()):
         report, fitted = hierarchy.oof_backoff(folds, ancestors, targets)
@@ -372,6 +210,7 @@ def backoff_all(backoff_folds, ancestors, args, n_samples):
             "p_top1_quantiles": {str(qt): round(float(np.quantile(p_top1, qt)), 4) for qt in (0.1, 0.2, 0.3, 0.4, 0.5)},
             "settings": {"method": method, "features": args.features, "samples": args.samples, "n_samples": n_samples,
                          "max_per_study": args.max_per_study, "seed": args.seed, "fold_seed": args.fold_seed,
+                         "fold_groups": args.fold_groups,
                          "prototype_alpha": args.prototype_alpha if method == "prototype" else 0,
                          "prototype_beta": args.prototype_beta}}
     return reports, calibration, extra
@@ -380,8 +219,8 @@ def backoff_all(backoff_folds, ancestors, args, n_samples):
 def print_backoff(backoff, metrics, targets):
     if not backoff:
         return
-    print("\nHierarchical back-off (tau chosen on the other folds; cov = answered share, exact / too specific = "
-          "shares of all samples; strict: gold or a coarser true term, lenient: also too specific)")
+    print("\nHierarchical back-off (tau chosen on the other folds; cov = answered share, exact = share of all "
+          "samples; strict: gold or a coarser true term, lenient: also too specific)")
     for (slot, method), r in sorted(backoff.items()):
         cells = []
         for t in targets:
@@ -390,11 +229,68 @@ def print_backoff(backoff, metrics, targets):
         print(f"  {slot:8} {method:15} top1 {metrics[slot][method]['top1']:.3f} T {r['temperature_all']:.3f} | " + " || ".join(cells))
 
 
+# ----------------------------------------------------------------------------- one fold
+def evaluate_fold(args, train, test, train_x, test_x, term_matrix, term_ids, term_vectors, term_row):
+    """All methods on one fold, per slot. -> (records: one per test sample x slot x method,
+    back-off inputs: {(slot, method): closed-vocabulary scores of the test samples})."""
+    records, backoff_inputs = [], {}
+    for slot in SLOTS:
+        tr, te = train[slot].ne("").to_numpy(), test[slot].ne("").to_numpy()  # samples labelled in this slot
+        y, x_tr, x_te = train[slot].to_numpy()[tr], train_x[tr], test_x[te]
+        closed = np.isin(term_ids, y)  # the "closed" vocabulary: terms used as training labels of this slot
+        classes, linear = M.linear_scores(x_te, x_tr, y)
+        fold_info = {"gold": test[slot].to_numpy()[te], "rows": test.index[te]}
+        if "linear" in args.backoff_methods:
+            backoff_inputs[(slot, "linear")] = {"S": M.dense(linear), "vocab": classes, **fold_info}
+        predictions = {
+            "majority": ([[label for label, _ in Counter(y).most_common(5)]] * te.sum(), np.zeros(te.sum())),
+            "knn": M.knn(x_te, x_tr, y, args.k),
+            "knn_study": M.knn_study(x_te, x_tr, y, train["study_code"].to_numpy()[tr], args.knn_study_k),
+            "linear": M.rank(linear, classes),
+        }
+        if term_matrix is not None:
+            # cosine(sample, term) in row blocks: with 49k terms the full (samples x terms) matrix and the
+            # hybrid score copies do not fit in memory; every method ranks each row on its own
+            vocab_cols = closed if args.closed_only else slice(None)
+            ids = term_ids[vocab_cols]
+            blocks = [(r, M.dense(x_te[r] @ term_matrix[vocab_cols].T)) for r in M.row_blocks(x_te.shape[0])]
+            in_block = closed[vocab_cols]  # the closed columns among the computed ones
+            # confidence = best cosine: near-synonym terms make the margin meaningless here
+            predictions["retrieval"] = M.join_ranks([M.rank(c[:, in_block], ids[in_block], margin=False) for _, c in blocks])
+            predictions["hybrid"] = M.join_ranks([M.hybrid(classes, linear[r], c[:, in_block], ids[in_block], args.hybrid_weight)
+                                                  for r, c in blocks])
+            if not args.closed_only:
+                predictions["retrieval_open"] = M.join_ranks([M.rank(c, term_ids, margin=False) for _, c in blocks])
+                predictions["hybrid_open"] = M.join_ranks([M.hybrid(classes, linear[r], c, term_ids, args.hybrid_weight)
+                                                           for r, c in blocks])
+            del blocks
+        if term_matrix is not None and not sparse.issparse(x_tr):
+            a, b = args.prototype_alpha, args.prototype_beta
+            vocab = term_matrix[closed]
+            for method, alpha in [("retrieval_prior", 0), ("prototype", a)]:
+                keep = [] if method in args.backoff_methods else None  # collects the full score matrix
+                predictions[method] = M.prototype(x_te, M.prototype_model(x_tr, y, vocab, term_ids[closed], alpha, b),
+                                                  term_ids[closed], keep)
+                if keep:
+                    backoff_inputs[(slot, method)] = {"S": keep[0], "vocab": term_ids[closed], **fold_info}
+            if not args.closed_only:
+                predictions["prototype_open"] = M.prototype(
+                    x_te, M.prototype_model(x_tr, y, term_matrix, term_ids, a, b, args.prototype_unseen_bonus), term_ids)
+        if term_vectors is not None and not sparse.issparse(x_tr):
+            predictions["label_reg"] = M.label_regression(x_te, x_tr, term_vectors[[term_row[t] for t in y]],
+                                                          term_vectors[closed], term_ids[closed])
+        seen = np.isin(test[slot].to_numpy()[te], y)  # gold label occurs in the training fold
+        for method, (top5, confidence) in predictions.items():
+            records += [{"row": r, "slot": slot, "method": method, "top5": t, "confidence": c,
+                         "gold_seen_in_train": s} for r, t, c, s in zip(test.index[te], top5, confidence, seen)]
+    return records, backoff_inputs
+
+
 # ----------------------------------------------------------------------------- main
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--ontology_terms", required=True, help="1_build_term_index.py output")
-    parser.add_argument("--samples", required=True, help="2_build_training_set.py output")
+    parser.add_argument("--samples", required=True, help="2_build_training_set.py / 2b_clean_metalog.py output")
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--features", nargs="+", default=["tfidf"], help="Feature blocks, see above")
     parser.add_argument("--term_vectors", default=None, help="4_embed_terms.py output (same space as the .npz)")
@@ -411,7 +307,7 @@ def main():
     parser.add_argument("--prototype_beta", type=float, default=0.1,
                         help="retrieval_prior / prototype: weight of the log label frequency")
     parser.add_argument("--prototype_unseen_bonus", type=float, default=0.0,
-                        help="prototype_open: score bonus for terms never seen in training (see prototype_model)")
+                        help="prototype_open: score bonus for terms never seen in training (see methods.prototype_model)")
     parser.add_argument("--backoff_methods", nargs="*", default=["prototype", "linear"],
                         help="Methods (prototype, linear, retrieval_prior) that also get calibrated probabilities and "
                              "hierarchical back-off (metrics.json 'backoff', calibration.json for step 6)")
@@ -427,7 +323,7 @@ def main():
                         help="TSV with sample_id, project_group (experiments/project_groups.py): keep whole projects, "
                              "not only study codes, on one side of a fold. Default: study_code")
     parser.add_argument("--max_per_study", type=int, default=50, help="0 = no cap")
-    parser.add_argument("--seed", type=int, default=22)
+    parser.add_argument("--seed", type=int, default=22, help="Seed of the per-study sample selection")
     parser.add_argument("--api_key_path", default=None, help="For embedding-model features")
     parser.add_argument("--base_url", default=None, help="For embedding-model features (e.g. a local server)")
     parser.add_argument("--dimensions", type=int, default=None, help="For embedding-model features")
@@ -435,85 +331,39 @@ def main():
     out_dir = path(args.output_dir)
     os.makedirs(out_dir, exist_ok=True)
 
+    # 1. terms, term vectors, samples
     terms = load_terms(args.ontology_terms)
     term_ids, term_texts = terms["term_id"].to_numpy(), list(terms["text"])
     term_vectors = load_term_vectors(args.term_vectors, term_texts) if args.term_vectors else None
     term_row = {t: i for i, t in enumerate(term_ids)}
     parents = {t: set(p.split("||")) for t, p in zip(term_ids, terms["parents"]) if p}
-
     npz = {spec: load_npz(spec) for spec in args.features if spec.endswith(".npz")}
     required = [set(row_of) for row_of, _ in npz.values()]
     required += [set(np.load(path(p))["sample_ids"]) for p in args.only_samples_in]
     samples = select_samples(args.samples, required, args.max_per_study, args.seed)
     print(f"{len(samples)} labelled samples from {samples['study_code'].nunique()} studies")
 
-    records = []  # one per (test sample, slot, method)
-    backoff_folds = defaultdict(list)  # (slot, method) -> per fold: closed-vocabulary scores of the test samples
+    # 2. cross-validation: every method on every fold
+    records, backoff_folds = [], defaultdict(list)  # (slot, method) -> per fold: closed-vocabulary scores
     groups = samples["study_code"]
     if args.fold_groups:
         project = dict(read_tsv(args.fold_groups)[["sample_id", "project_group"]].values)
         groups = samples["sample_id"].map(project).fillna(samples["study_code"])
         print(f"fold groups: {groups.nunique()} projects for {samples['study_code'].nunique()} study codes")
-    folds = study_folds(groups, args.folds, args.fold_seed)
-    for fold, (train_idx, test_idx) in enumerate(folds, start=1):
+    for fold, (train_idx, test_idx) in enumerate(study_folds(groups, args.folds, args.fold_seed), start=1):
         train, test = samples.iloc[train_idx], samples.iloc[test_idx]
         print(f"fold {fold}: {len(train)} train / {len(test)} test samples")
         encode_samples, term_matrix = build_features(args, npz, list(train["text"]), term_texts, term_vectors, out_dir)
-        train_x, test_x = encode_samples(train), encode_samples(test)
+        fold_records, fold_backoff = evaluate_fold(args, train, test, encode_samples(train), encode_samples(test),
+                                                   term_matrix, term_ids, term_vectors, term_row)
+        records += fold_records
+        for key, value in fold_backoff.items():
+            backoff_folds[key].append(value)
 
-        for slot in SLOTS:
-            tr, te = train[slot].ne("").to_numpy(), test[slot].ne("").to_numpy()
-            y, x_tr, x_te = train[slot].to_numpy()[tr], train_x[tr], test_x[te]
-            closed = np.isin(term_ids, y)  # terms used as training labels for this slot
-            classes, linear = linear_scores(x_te, x_tr, y)
-            fold_info = {"gold": test[slot].to_numpy()[te], "rows": test.index[te]}
-            if "linear" in args.backoff_methods:
-                backoff_folds[(slot, "linear")].append({"S": dense(linear), "vocab": classes, **fold_info})
-            predictions = {
-                "majority": ([[label for label, _ in Counter(y).most_common(5)]] * te.sum(), np.zeros(te.sum())),
-                "knn": knn(x_te, x_tr, y, args.k),
-                "knn_study": knn_study(x_te, x_tr, y, train["study_code"].to_numpy()[tr], args.knn_study_k),
-                "linear": rank(linear, classes),
-            }
-            if term_matrix is not None:
-                # samples x all terms, in row blocks: with FOODON (49k terms) the full matrix and the
-                # hybrid score copies no longer fit in memory; every method ranks each row on its own
-                vocab_cols = closed if args.closed_only else slice(None)  # closed_only: the closed columns only
-                ids = term_ids[vocab_cols]
-                blocks = [(r, dense(x_te[r] @ term_matrix[vocab_cols].T)) for r in row_blocks(x_te.shape[0])]
-                in_block = closed[vocab_cols]  # closed columns within the computed ones
-                # confidence = best cosine: near-synonym terms make the margin meaningless here
-                predictions["retrieval"] = join_ranks([rank(c[:, in_block], ids[in_block], margin=False) for _, c in blocks])
-                predictions["hybrid"] = join_ranks([hybrid(classes, linear[r], c[:, in_block], ids[in_block], args.hybrid_weight)
-                                                    for r, c in blocks])
-                if not args.closed_only:
-                    predictions["retrieval_open"] = join_ranks([rank(c, term_ids, margin=False) for _, c in blocks])
-                    predictions["hybrid_open"] = join_ranks([hybrid(classes, linear[r], c, term_ids, args.hybrid_weight)
-                                                             for r, c in blocks])
-                del blocks
-            if term_matrix is not None and not sparse.issparse(x_tr):
-                a, b = args.prototype_alpha, args.prototype_beta
-                vocab = term_matrix[closed]
-                for method, alpha in [("retrieval_prior", 0), ("prototype", a)]:
-                    keep = [] if method in args.backoff_methods else None
-                    predictions[method] = prototype(x_te, prototype_model(x_tr, y, vocab, term_ids[closed], alpha, b),
-                                                    term_ids[closed], keep)
-                    if keep:
-                        backoff_folds[(slot, method)].append({"S": keep[0], "vocab": term_ids[closed], **fold_info})
-                if not args.closed_only:
-                    predictions["prototype_open"] = prototype(x_te, prototype_model(x_tr, y, term_matrix, term_ids, a, b,
-                                                                                 args.prototype_unseen_bonus), term_ids)
-            if term_vectors is not None and not sparse.issparse(x_tr):
-                predictions["label_reg"] = label_regression(x_te, x_tr, term_vectors[[term_row[t] for t in y]],
-                                                            term_vectors[closed], term_ids[closed])
-            seen = np.isin(test[slot].to_numpy()[te], y)
-            for method, (top5, confidence) in predictions.items():
-                records += [{"row": r, "slot": slot, "method": method, "top5": t, "confidence": c,
-                             "gold_seen_in_train": s} for r, t, c, s in zip(test.index[te], top5, confidence, seen)]
-
+    # 3. scores, back-off, outputs
     pred = pd.DataFrame(records)
     pred["gold"] = [samples.at[r, s] for r, s in zip(pred["row"], pred["slot"])]
-    ancestors = ancestor_sets(parents)
+    ancestors = term_ancestors(terms)
     backoff, calibration, extra = backoff_all(backoff_folds, ancestors, args, len(samples))
     for column in ["prob", "backoff", "backoff_q"]:
         pred[column] = [extra.get((r, s, m), {}).get(column, "") for r, s, m in zip(pred["row"], pred["slot"], pred["method"])]

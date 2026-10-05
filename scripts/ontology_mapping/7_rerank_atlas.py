@@ -45,24 +45,20 @@ python3 7_rerank_atlas.py collect --work_dir $R                  # rerun until a
 python3 7_rerank_atlas.py apply --params $R/rerank_params.json --atlas_dir $A --work_dir $R
 """
 import argparse
-import gzip
 import hashlib
-import importlib
 import json
 import os
 import sys
-import time
 from collections import Counter, defaultdict
 
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize_scalar
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(HERE, "experiments"))
-import hierarchy  # noqa: E402
-from common import SLOTS, ancestor_sets, load_npz, load_terms, path, read_tsv, select_samples  # noqa: E402
-from rerank_pilot import PRICES, count_tokens, parse, prompt  # noqa: E402  (the pilot's exact prompt)
+import hierarchy
+from common import SLOTS, iter_sample_info, load_npz, load_terms, path, read_tsv, record_to_text, select_samples, \
+    term_ancestors
+from rerank_prompt import PRICES, count_tokens, parse, prompt  # the pilot's exact prompt and parsing
 
 PROMPT_VERSION = "v2"
 W_GRID = (0, 0.05, 0.1, 0.2, 0.35, 0.5, 1.0)
@@ -71,7 +67,11 @@ EXACT, COARSER, TOO_SPECIFIC = hierarchy.EXACT, hierarchy.COARSER, hierarchy.TOO
 
 # ----------------------------------------------------------------------------- fusion
 def fuse(lb, D, w, T, mass):
-    """Fused distribution over the candidates + 1 (base mass outside them)."""
+    """Fused distribution over the k candidates + 1 (the base mass outside them).
+    lb: log base probabilities of the candidates; D: summed log LLM probabilities; w: LLM weight;
+    T: temperature (> 1 damps the over-confident LLM); mass: base probability of all candidates together.
+    Example: lb = log [0.5, 0.2], D = log [0.1, 0.9], w = 1, T = 1, mass 0.7 -> candidate 2 wins
+    (0.2 x 0.9 > 0.5 x 0.1): [0.15, 0.55, 0.3]."""
     z = (lb + w * D) / T
     z = np.exp(z - z.max())
     return np.append(z / z.sum() * mass, max(1 - mass, 0.0))
@@ -89,6 +89,8 @@ def llm_logprob(o, responses):
 
 
 def fit_T(rows, w):
+    """Temperature T2 of the fused distribution that maximises the likelihood of the gold term on the pilot
+    (gold outside the candidates = the last, "outside" entry)."""
     def nll(logT):
         T = np.exp(logT)
         return -np.mean([np.log(fuse(r["lb"], r["D"], w, T, r["mass"])[r["gold_idx"]] + 1e-12) for r in rows])
@@ -124,6 +126,8 @@ def fit_slot(rows, allowed, anc, target, metric, grid=W_GRID):
 
 
 def pilot_rows(pilot_path, response_paths):
+    """Per slot, one row per pilot sample with a usable LLM answer: candidates, log base probabilities, LLM log
+    probabilities (summed over the response files), base mass of the candidates, gold term and study."""
     pilot = [json.loads(l) for l in open(path(pilot_path))]
     responses = [{(r["slot"], r["sample_id"]): r for r in map(json.loads, open(path(f)))} for f in response_paths]
     rows = defaultdict(list)
@@ -141,7 +145,7 @@ def pilot_rows(pilot_path, response_paths):
 
 def fit(args):
     terms = load_terms(args.ontology_terms)
-    anc = ancestor_sets({t: set(p.split("||")) for t, p in zip(terms["term_id"], terms["parents"]) if p})
+    anc = term_ancestors(terms)
     samples = read_tsv(args.samples)
     calibration = json.load(open(path(args.calibration)))
     rows = pilot_rows(args.pilot, args.responses)
@@ -206,7 +210,6 @@ def parse_candidates(s):
 def build(args):
     import h5py
     from sklearn.preprocessing import normalize
-    build_set = importlib.import_module("2_build_training_set")  # the text cleaning of the training samples
     params = json.load(open(path(args.params)))
     slots = [s for s, p in params["slots"].items() if p["use_llm"]]
     if not slots:
@@ -219,7 +222,8 @@ def build(args):
     terms = load_terms(args.ontology_terms)
     info = {t: {"label": l, "synonyms": [s for s in syn.split("||") if s][:3], "definition": d[:220]}
             for t, l, syn, d in zip(terms["term_id"], terms["label"], terms["synonyms"], terms["definition"])}
-    code_to_label = dict(zip(read_tsv(args.ontology_terms)["term_id"], read_tsv(args.ontology_terms)["label"]))
+    all_terms = read_tsv(args.ontology_terms)  # obsolete terms included: their codes are input text
+    code_to_label = dict(zip(all_terms["term_id"], all_terms["label"]))
 
     # 1. gated samples per slot
     cols = ["sample_id"] + [c for s in slots for c in (f"{s}_p", f"{s}_candidates")]
@@ -235,9 +239,9 @@ def build(args):
 
     # 2. metadata texts (as 2_build_training_set.py writes them for the training samples)
     texts = {}
-    for sample_id, lines in build_set.iter_sample_info(path(args.sample_info)):
+    for sample_id, lines in iter_sample_info(path(args.sample_info)):
         if sample_id in needed:
-            texts[sample_id] = build_set.record_to_text(lines, code_to_label, 2000)[:args.text_chars]
+            texts[sample_id] = record_to_text(lines, code_to_label, 2000)[:args.text_chars]
     print(f"texts: {len(texts)} of {len(needed)} gated samples found in {args.sample_info}", flush=True)
 
     # 3. requests: one per distinct (slot, text, candidates); the first sample stands for the others
@@ -296,22 +300,19 @@ def build(args):
                        "option_order": order.tolist()}
                 handle.write(json.dumps(rec) + "\n")
     pd.DataFrame(members, columns=["request_id", "sample_id"]).to_csv(os.path.join(work, "members.tsv.gz"), sep="\t", index=False)
-    estimate(os.path.join(work, "requests.jsonl"), args.model)
+    with open(os.path.join(work, "requests.jsonl")) as handle:
+        n_in, cost = estimate((json.loads(line) for line in handle), args.model)
+    print(f"{len(reqs)} requests, ~{n_in:,} input tokens: ~${cost:,.2f} with {args.model} through the Batch API")
 
 
-def estimate(requests_path, model, limit=None):
-    n_in, n = 0, 0
-    with open(requests_path) as handle:
-        for i, line in enumerate(handle):
-            if limit and i >= limit:
-                break
-            o = json.loads(line)
-            n_in += sum(count_tokens(m["content"]) for m in prompt(o, "logprobs", PROMPT_VERSION))
-            n += 1
+def estimate(requests, model):
+    """(input tokens, Batch API cost) of an iterable of requests: half price, ~4 output tokens per answer."""
+    n, n_in = 0, 0
+    for o in requests:  # an iterable, so the 1 GB requests.jsonl can be streamed
+        n_in += sum(count_tokens(m["content"]) for m in prompt(o, "logprobs", PROMPT_VERSION))
+        n += 1
     pin, pout = PRICES.get(model, (0, 0))
-    cost = (n_in / 1e6 * pin + n * 4 / 1e6 * pout) * 0.5  # Batch API: half price
-    print(f"{n} requests, ~{n_in:,} input tokens: ~${cost:,.2f} with {model} through the Batch API")
-    return cost
+    return n_in, (n_in / 1e6 * pin + n * 4 / 1e6 * pout) * 0.5
 
 
 # ----------------------------------------------------------------------------- batch API
@@ -356,7 +357,7 @@ def submit(args):
     if not parts:
         print("nothing to submit now" + (" (pending batches: run collect)" if pending else ""))
         return
-    cost = sum(estimate_part(p, args.model) for p in parts)
+    cost = sum(estimate(p, args.model)[1] for p in parts)
     print(f"-> {len(parts)} batch(es), {sum(len(p) for p in parts)} requests, ~${cost:,.2f}")
     if args.dry_run:
         return
@@ -375,12 +376,6 @@ def submit(args):
         json.dump(state, open(state_path, "w"))  # after every batch: an interrupted submit is not lost
         print(f"submitted {batch.id}: {len(part)} requests ({os.path.getsize(batch_input) / 1e6:.0f} MB)")
         os.remove(batch_input)
-
-
-def estimate_part(part, model):
-    n_in = sum(count_tokens(m["content"]) for o in part for m in prompt(o, "logprobs", PROMPT_VERSION))
-    pin, pout = PRICES.get(model, (0, 0))
-    return (n_in / 1e6 * pin + len(part) * 4 / 1e6 * pout) * 0.5
 
 
 def collect(args):
@@ -439,7 +434,7 @@ def apply(args):
     work, atlas_dir = path(args.work_dir), path(args.atlas_dir)
     terms = load_terms(args.ontology_terms)
     label_of = dict(zip(terms["term_id"], terms["label"]))
-    anc = ancestor_sets({t: set(p.split("||")) for t, p in zip(terms["term_id"], terms["parents"]) if p})
+    anc = term_ancestors(terms)
     model = np.load(os.path.join(atlas_dir, "model.npz"))
     req_path, resp_path, _ = batch_paths(work)
     responses = {}

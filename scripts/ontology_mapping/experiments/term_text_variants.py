@@ -45,7 +45,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))     # scripts/
 from common import SLOTS, load_npz, load_terms, path, read_tsv, select_samples, study_folds  # noqa: E402
 from _setup import DEFAULTS  # noqa: E402
 
-evaluate = importlib.import_module("5_evaluate")
+from methods import prototype_model  # noqa: E402
 VARIANTS = ["label", "label_exact", "label_syn", "label_syn_def", "label_syn_parents", "label_syn_def_parents"]
 SYNONYM = re.compile(r'^synonym: "((?:[^"\\]|\\.)*)" (EXACT|NARROW|BROAD|RELATED)')
 
@@ -132,7 +132,7 @@ def embed(args):
 
 def evaluate_variants(args):
     """For every fold seed, fold and slot, score every variant on the same split. label_reg's ridge
-    (as 5_evaluate.label_regression: sklearn Ridge, alpha 10, with intercept) is solved in closed
+    (as methods.label_regression: sklearn Ridge, alpha 10, with intercept) is solved in closed
     form once per split and reused for every variant, since only the targets change."""
     import h5py
     terms = load_terms(args.ontology_terms)
@@ -187,7 +187,7 @@ def evaluate_variants(args):
                     TM = TM_of[variant]  # term side, weighted as the two sample blocks
 
                     def proto(vocab_rows, alpha, bonus=0.0):
-                        mean, P, bias = evaluate.prototype_model(X[a], y[a], TM[vocab_rows], term_ids[vocab_rows],
+                        mean, P, bias = prototype_model(X[a], y[a], TM[vocab_rows], term_ids[vocab_rows],
                                                                  alpha, 0.1, bonus)
                         return term_ids[vocab_rows][(normalize(X[b] - mean) @ P.T + bias).argmax(1)]
                     Y = T[[row[v] for v in y[a]]]

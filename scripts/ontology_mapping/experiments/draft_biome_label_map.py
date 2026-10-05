@@ -32,7 +32,7 @@ python3 experiments/draft_biome_label_map.py --output ~/MicrobeAtlasProject/meta
 import argparse
 import os
 import sys
-from collections import Counter, defaultdict
+from collections import Counter
 
 import numpy as np
 import pandas as pd
@@ -40,13 +40,11 @@ from sklearn.preprocessing import normalize
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
-sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
-import importlib  # noqa: E402
-from common import ancestor_sets, load_npz, load_terms, path, select_samples  # noqa: E402
+from common import load_npz, load_terms, path, select_samples, term_ancestors  # noqa: E402
+from hierarchy import fit_temperature, softmax  # noqa: E402
+from methods import prototype_model  # noqa: E402
+from hierarchical_backoff import term_matrix  # noqa: E402
 from _setup import DEFAULTS  # noqa: E402
-
-evaluate = importlib.import_module("5_evaluate")
-hb = importlib.import_module("hierarchical_backoff")
 BIOME_ROOT = "ENVO_00000428"
 KEEP = {"ENVO_01001002": "animal-associated environment", "ENVO_01001001": "plant-associated environment"}
 # best-effort corrections where the automatic evidence is clearly wrong (still to be reviewed)
@@ -71,8 +69,7 @@ def main():
     terms = load_terms(args.ontology_terms)
     ids = terms["term_id"].to_numpy()
     label = dict(zip(ids, terms["label"]))
-    parents = {t: set(x.split("||")) for t, x in zip(ids, terms["parents"]) if x}
-    anc = ancestor_sets(parents)
+    anc = term_ancestors(terms)
     is_biome = lambda t: t != BIOME_ROOT and BIOME_ROOT in anc.get(t, ())
 
     (kr, K), (sr, B) = load_npz(args.keywords), load_npz(args.sub_biomes)
@@ -87,11 +84,10 @@ def main():
 
     # model trained on real biome labels only
     vocab = np.unique(y[good])
-    TM = hb.term_matrix(terms, args.term_vectors)
-    trow = {t: i for i, t in enumerate(ids)}
-    mean, P, bias = evaluate.prototype_model(X[good], y[good], TM[[trow[v] for v in vocab]], vocab, 0.5, 0.1)
+    TM = term_matrix(terms.set_index("term_id").loc[vocab].reset_index(), args.term_vectors)  # vocab order
+    mean, P, bias = prototype_model(X[good], y[good], TM, vocab, 0.5, 0.1)
     Sg = normalize(X[good] - mean) @ P.T + bias
-    T = hb.fit_temperature([(Sg, np.searchsorted(vocab, y[good]))])
+    T = fit_temperature([(Sg, np.searchsorted(vocab, y[good]))])
 
     # plain-label vectors of all ENVO biome terms (also the ones Metalog never uses)
     import h5py
@@ -129,7 +125,7 @@ def main():
                     votes[y[j]] += 1 / per[study[j]] / len(per) / len(m)
         knn = votes.most_common(2)
         # model
-        pr = hb.softmax(normalize(X[m] - mean) @ P.T + bias, T).mean(0)
+        pr = softmax(normalize(X[m] - mean) @ P.T + bias, T).mean(0)
         top = np.argsort(-pr)[:2]
         model = [(vocab[i], float(pr[i])) for i in top]
         # nearest ENVO biome terms by label

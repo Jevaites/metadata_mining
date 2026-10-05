@@ -47,7 +47,7 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import normalize
 
-from common import load_npz, path, read_tsv, select_samples
+from common import file_md5, load_npz, path, read_tsv, select_samples
 
 
 def top_k_mean(sim, k):
@@ -99,9 +99,11 @@ def main():
     train_sb = sb[[sb_row[s] for s in train["sample_id"]]].astype(np.float32)
     train_studies = train["study_code"].to_numpy()
 
-    settings = {"samples": os.path.abspath(path(args.samples)), "fold_groups": args.fold_groups, "k": args.k,
+    # inputs identified by content (md5), so a run can be resumed from another session / mount point
+    md5 = lambda p: file_md5(p) if p else None
+    settings = {"samples": md5(args.samples), "fold_groups": md5(args.fold_groups), "k": args.k,
                 "quantile": args.quantile, "max_per_study": args.max_per_study, "seed": args.seed,
-                "only_ids": args.only_ids, "n_train": len(train)}
+                "only_ids": md5(args.only_ids), "n_train": len(train)}
     calibration_path = os.path.join(out_dir, "coverage_calibration.json")
     if os.path.exists(calibration_path):
         saved = json.load(open(calibration_path))

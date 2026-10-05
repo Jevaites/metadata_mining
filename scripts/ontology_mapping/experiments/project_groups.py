@@ -28,25 +28,10 @@ import sys
 from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common import path, read_tsv  # noqa: E402
+from common import iter_sample_info, path, read_tsv  # noqa: E402
 
 STUDY = re.compile(r"^study=([SED]RP\d+)")
 BIOPROJECT = re.compile(r"\b(PRJ(?:NA|EB|DB|DA|EA)\d+)\b")
-
-
-def iter_records(p):
-    import gzip
-    sid, lines = None, []
-    with gzip.open(p, "rt", errors="replace") if p.endswith(".gz") else open(p) as handle:
-        for line in handle:
-            if line.startswith(">"):
-                if sid:
-                    yield sid, lines
-                sid, lines = line[1:].strip(), []
-            else:
-                lines.append(line)
-    if sid:
-        yield sid, lines
 
 
 def main():
@@ -61,10 +46,10 @@ def main():
     train = read_tsv(args.training_set)
     study_of = dict(zip(train["sample_id"], train["study_code"]))
     accessions = defaultdict(set)  # study_code -> project accessions
-    for sid, lines in iter_records(path(args.sample_info)):
+    for sid, lines in iter_sample_info(path(args.sample_info)):
         if sid not in study_of:
             continue
-        acc = {m[1] for m in (STUDY.match(x) for x in lines) if m} | set(BIOPROJECT.findall("".join(lines)))
+        acc = {m[1] for m in (STUDY.match(x) for x in lines) if m} | set(BIOPROJECT.findall("\n".join(lines)))
         accessions[study_of[sid]] |= acc
 
     # union-find over study codes sharing an accession

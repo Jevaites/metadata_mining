@@ -20,7 +20,7 @@ from openai import OpenAI
 
 from common import load_terms
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # scripts/
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "embeddings"))
 from embed_subbiomes_keywords import MAX_BATCH, PRICE_PER_1M_TOKENS, embed_unique, estimate_tokens
 
 

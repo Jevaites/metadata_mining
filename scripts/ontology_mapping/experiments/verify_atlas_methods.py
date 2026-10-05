@@ -11,7 +11,6 @@ With --calibration (5_evaluate.py's calibration.json), linear and prototype also
 back-off, and the back-off term and probability are checked against hierarchy.py applied directly.
 """
 import argparse
-import importlib
 import os
 import subprocess
 import sys
@@ -21,11 +20,10 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
-from common import SLOTS, ancestor_sets, load_npz, load_term_vectors, load_terms, path, read_tsv, select_samples  # noqa: E402
+from common import SLOTS, load_npz, load_term_vectors, load_terms, path, read_tsv, select_samples, term_ancestors  # noqa: E402
 import hierarchy  # noqa: E402
+import methods as evaluate  # noqa: E402  (the step-5 functions)
 from _setup import DEFAULTS  # noqa: E402
-
-evaluate = importlib.import_module("5_evaluate")
 
 
 def main():
@@ -65,7 +63,7 @@ def main():
     if args.calibration:
         import json
         calibration = json.load(open(path(args.calibration)))
-        anc = ancestor_sets({t: set(p.split("||")) for t, p in zip(term_ids, terms["parents"]) if p})
+        anc = term_ancestors(terms)
     failures = 0
     for method in args.methods:
         out_dir = f"{work}/{method}"

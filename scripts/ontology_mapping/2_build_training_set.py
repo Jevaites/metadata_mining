@@ -24,30 +24,27 @@ python 2_build_training_set.py \
 
 import argparse
 import glob
-import gzip
 import os
 import re
 
 import pandas as pd
 
+from common import iter_sample_info, record_to_text
+
 SLOTS = {"environment_biome": "biome", "environment_feature": "feature", "environment_material": "material"}
-GOLD_VALUE = re.compile(r"\[(ENVO|UBERON):(\d+)\]")  # "soil [ENVO:00001998]"
-CODE_IN_TEXT = re.compile(r"\b(ENVO|UBERON)[:_](\d{7,8})\b")  # ENVO:00001998 or ENVO_00001998
-ACCESSION = re.compile(r"\b(SAM[END][A-Z]?\d+|[SED]RS\d+)\b")
-MISSING = {"", "na", "n/a", "nan", "none", "null", "-", "missing", "unknown", "unspecified",
-           "not applicable", "not collected", "not provided", "not available", "not determined"}
-# keys that are identifiers, dates or coordinates: noise for text matching (and they leak study identity)
-DROP_KEYS = re.compile(r"^(experiment|run)|^study$|^sample name$|alias|xref|link|insdc|accession|center|broker"
-                       r"|submitter|checklist|library|date|time|update|public|latitude|longitude|lat_lon"
-                       r"|taxon_id|_id$| id$|subject|patient|participant|replicate")
+GOLD_VALUE = re.compile(r"\[(ENVO|UBERON):(\d+)\]")  # "soil [ENVO:00001998]" -> ENVO, 00001998
+ACCESSION = re.compile(r"\b(SAM[END][A-Z]?\d+|[SED]RS\d+)\b")  # BioSample (SAMN/SAMEA/SAMD) or SRA sample
 
 
 def load_metalog_labels(metalog_dir, valid_terms):
-    """One row per Metalog sample: spire_sample_name, study_code, domain + one term id per slot."""
+    """One row per Metalog sample: spire_sample_name, study_code, domain + one term id per slot.
+    Example row: SAMEA5617776, Shao_2019_infants, human, biome "", feature ENVO_2100002 (intestine environment),
+    material ENVO_00002003 (fecal material); the human biome is blanked: Metalog's ENVO:00009003 is obsolete."""
     frames = []
     for path in sorted(glob.glob(os.path.join(metalog_dir, "*_all_long_*.tsv.gz"))):
         df = pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False)
         df = df[df["metadata_item"].isin(["spire_sample_name", "study_code", *SLOTS])]
+        # long table (sample_alias, metadata_item, value) -> one row per sample, one column per item
         wide = df.pivot_table(index="sample_alias", columns="metadata_item", values="value", aggfunc="first")
         wide["domain"] = os.path.basename(path).split("_")[0]
         frames.append(wide.reset_index())
@@ -55,7 +52,7 @@ def load_metalog_labels(metalog_dir, valid_terms):
     labels = pd.concat(frames, ignore_index=True).fillna("")
 
     for metalog_field, slot in SLOTS.items():
-        match = labels[metalog_field].str.extract(GOLD_VALUE)
+        match = labels[metalog_field].str.extract(GOLD_VALUE)  # the first ENVO / UBERON code of the value
         labels[slot] = (match[0] + "_" + match[1]).fillna("")
         unusable = labels[slot].ne("") & ~labels[slot].isin(valid_terms)
         print(f"{slot}: {labels[slot].ne('').sum()} ENVO/UBERON labels, "
@@ -63,35 +60,6 @@ def load_metalog_labels(metalog_dir, valid_terms):
         labels.loc[unusable, slot] = ""
     # a few accessions appear under two Metalog aliases (e.g. in two studies): keep the first
     return labels[labels["spire_sample_name"] != ""].drop_duplicates("spire_sample_name")
-
-
-def iter_sample_info(path):
-    """Yield (sample_id, lines) for each '>SAMPLE' record of sample.info(.gz)."""
-    sample_id, lines = None, []
-    with gzip.open(path, "rt", errors="replace") if path.endswith(".gz") else open(path) as handle:
-        for line in handle:
-            if line.startswith(">"):
-                if sample_id:
-                    yield sample_id, lines
-                sample_id, lines = line[1:].strip(), []
-            else:
-                lines.append(line.rstrip("\n"))
-    if sample_id:
-        yield sample_id, lines
-
-
-def record_to_text(lines, code_to_label, max_chars):
-    """Clean one metadata record into 'key: value; key: value; ...'."""
-    kept = []
-    for line in lines:
-        key, _, value = line.partition("=")
-        key = re.sub(r"^(sample|study)_", "", key.strip()).lower()
-        value = value.strip()
-        if not key or DROP_KEYS.search(key) or value.lower().strip(" .") in MISSING:
-            continue
-        value = CODE_IN_TEXT.sub(lambda m: code_to_label.get(f"{m[1]}_{m[2]}", m[0]), value)
-        kept.append(f"{key}: {value}")
-    return "; ".join(dict.fromkeys(kept))[:max_chars]  # dict.fromkeys drops duplicate lines
 
 
 def main():
@@ -113,8 +81,9 @@ def main():
     rows, n_records = [], 0
     for sample_id, lines in iter_sample_info(os.path.expanduser(args.sample_info)):
         n_records += 1
+        # the record's own id, then every BioSample / SRA accession written inside it (e.g. sample_biosample=SAMN...)
         accessions = [sample_id] + ACCESSION.findall(" ".join(lines))
-        spire = next((acc for acc in accessions if acc in by_accession), None)
+        spire = next((acc for acc in accessions if acc in by_accession), None)  # first one Metalog knows
         if spire is None:
             continue
         label = by_accession[spire]

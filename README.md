@@ -25,6 +25,7 @@
     - [3. Convert coordinates to places](#convert-coordinates-to-places)
     - [4. Geographic location: GPT versus metadata](#geographic-location-gpt-versus-metadata)
 - [Ontology Mapping Toolkit](#ontology-mapping-toolkit)
+- [Repository layout](#repository-layout)
 
 
 
@@ -572,11 +573,26 @@ To exit the session just type `exit`
 <a name="ontology-mapping-toolkit"></a>
 ## Ontology Mapping Toolkit
 
-Maps every MicrobeAtlas sample to ENVO/Uberon terms for the three Metalog slots (`biome`,
-`feature`, `material`), learning from the ~58k MicrobeAtlas samples that Metalog curated.
-Six numbered scripts, one per step, in [`scripts/ontology_mapping/`](scripts/ontology_mapping/README.md);
-that README documents the data flow, the methods, the metrics and how to extend them.
+Maps every MicrobeAtlas sample to ENVO / Uberon (and PO / FOODON) terms for the three Metalog slots (`biome`,
+`feature`, `material`), learning from the ~58k MicrobeAtlas samples that Metalog curated, with a calibrated
+probability, a coarser "back-off" answer when the model is unsure, and flags for samples outside Metalog's
+coverage and for controls / mock communities. Numbered scripts, one per step, in
+[`scripts/ontology_mapping/`](scripts/ontology_mapping/README.md); that README documents the data flow, the
+methods, the metrics and how to extend them, and [`experiments/`](scripts/ontology_mapping/experiments/README.md)
+holds the experiment behind every design choice.
 
 `clean_and_envo_translate.py` (Container 1) is independent of this toolkit; it was fixed in 2026-09
 (missing values are now detected on the value, e.g. `China: Hunan` is no longer dropped as "nan" and
 `=NA` lines are dropped; ontology codes are matched exactly so `sludge(ENVO:00002046)` keeps its text).
+
+<a name="repository-layout"></a>
+## Repository layout
+
+| path | content |
+|---|---|
+| `scripts/*.py` | Containers 1–4 above (the published pipeline: splitting, cleaning, LLM annotation, evaluation) and related geography scripts |
+| `scripts/production/` | the production LLM run over all MicrobeAtlas samples (GPT keywords, sub-biomes, biomes) |
+| `scripts/embeddings/` | embeddings of the GPT sub-biomes / keywords, and `analyses/` of them (cluster agreement, study leakage, prompt variants) |
+| `scripts/ontology_mapping/` | the ontology-mapping prototype and its experiments |
+| `source_data/` | LLM system prompts |
+| `archive/` | superseded code (former `scripts/temp/` and `scripts/_before_review/`) |

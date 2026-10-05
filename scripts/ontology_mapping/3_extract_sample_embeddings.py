@@ -25,7 +25,7 @@ import sys
 import h5py
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # scripts/
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "embeddings"))
 from embed_subbiomes_keywords import iter_samples  # same cleaning as when the texts were embedded
 
 

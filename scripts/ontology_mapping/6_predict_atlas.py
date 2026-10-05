@@ -61,11 +61,12 @@ python 6_predict_atlas.py \
 
 import argparse
 import glob
+import gzip
+import json
 import os
+import shutil
 import sys
 import time
-
-import importlib
 
 import h5py
 import numpy as np
@@ -74,13 +75,12 @@ from sklearn.linear_model import RidgeClassifier
 from sklearn.preprocessing import normalize
 
 import hierarchy
-from common import SLOTS, ancestor_sets, load_npz, load_term_vectors, load_terms, path, read_tsv, select_samples
+from common import SLOTS, file_md5, load_npz, load_term_vectors, load_terms, path, read_tsv, select_samples, \
+    term_ancestors
+from methods import TIE_BREAK, prototype_model  # exactly the evaluated model
 
-evaluate = importlib.import_module("5_evaluate")  # prototype_model: exactly the evaluated model
-TIE_BREAK = evaluate.TIE_BREAK
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # scripts/
-from embed_subbiomes_keywords import iter_samples  # same text cleaning as the embedded texts
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "embeddings"))
+from embed_subbiomes_keywords import iter_samples  # noqa: E402  (same text cleaning as the embedded texts)
 
 BLOCK_WEIGHT = np.float32(1 / np.sqrt(2))  # two blocks, weighted exactly as in 5_evaluate.build_features()
 
@@ -88,7 +88,7 @@ BLOCK_WEIGHT = np.float32(1 / np.sqrt(2))  # two blocks, weighted exactly as in 
 def train_models(args, model_path):
     """Per slot, the parameters of --method, trained on [kw, sb] of the evaluated samples:
       linear     coef / intercept / classes of a RidgeClassifier
-      prototype  mean / prototypes / bias / classes of 5_evaluate.prototype_model (closed vocabulary)
+      prototype  mean / prototypes / bias / classes of methods.prototype_model (closed vocabulary)
       knn_study  the training matrix (shared by the slots), its study codes, and the labels per slot
     """
     if os.path.exists(model_path):
@@ -102,7 +102,8 @@ def train_models(args, model_path):
     samples = select_samples(args.samples, [set(kw_row), set(sb_row)], args.max_per_study, args.seed)
     ids = samples["sample_id"]
     X = BLOCK_WEIGHT * np.hstack([kw[[kw_row[s] for s in ids]], sb[[sb_row[s] for s in ids]]])
-    model = {"method": args.method, "kw_dim": kw.shape[1]}  # columns [0, kw_dim) are keywords, the rest sub-biomes
+    model = {"method": args.method, "kw_dim": kw.shape[1],  # columns [0, kw_dim) are keywords, the rest sub-biomes
+             "n_samples": len(samples)}
     if args.method == "prototype":
         if not args.term_vectors:
             raise SystemExit("--method prototype needs --term_vectors")
@@ -123,8 +124,8 @@ def train_models(args, model_path):
                 clf.coef_.astype(np.float32), clf.intercept_.astype(np.float32), clf.classes_.astype(str)
         elif args.method == "prototype":
             classes = np.unique(y)  # closed vocabulary = the training labels, as `prototype` in 5_evaluate
-            mean, prototypes, bias = evaluate.prototype_model(X[has], y, term_matrix[[term_row[t] for t in classes]],
-                                                              classes, args.prototype_alpha, args.prototype_beta)
+            mean, prototypes, bias = prototype_model(X[has], y, term_matrix[[term_row[t] for t in classes]],
+                                                     classes, args.prototype_alpha, args.prototype_beta)
             model[f"{slot}_mean"], model[f"{slot}_prototypes"] = mean.astype(np.float32), prototypes.astype(np.float32)
             model[f"{slot}_bias"], model[f"{slot}_classes"] = bias.astype(np.float32), classes.astype(str)
         else:
@@ -178,8 +179,7 @@ def load_backoff(args, model, terms, out_dir):
     """Per slot: (temperature, tau, Closure over the model's labels), from 5_evaluate's calibration.json.
     The settings must match the model's; run_settings.json in --output_dir stops a resumed run from
     mixing chunks written with other back-off settings."""
-    import json
-    run = {"calibration": [os.path.abspath(path(p)) for p in args.calibration] if args.calibration else None,
+    run = {"calibration": [file_md5(p) for p in args.calibration] if args.calibration else None,  # content, not path
            "target_accuracy": args.target_accuracy, "accuracy": args.accuracy, "topk": args.topk,
            "max_candidates": args.max_candidates}
     settings_path = os.path.join(out_dir, "run_settings.json")
@@ -197,7 +197,7 @@ def load_backoff(args, model, terms, out_dir):
     if args.method == "knn_study":
         raise SystemExit("--calibration needs --method linear or prototype (knn_study has no scores to calibrate)")
     calibrations = [json.load(open(path(p))) for p in args.calibration]
-    anc = ancestor_sets({t: set(p.split("||")) for t, p in zip(terms["term_id"], terms["parents"]) if p})
+    anc = term_ancestors(terms)
     out = {}
     for slot in SLOTS:
         entries = []
@@ -212,9 +212,11 @@ def load_backoff(args, model, terms, out_dir):
                          if args.method == "prototype" else []) if st.get(k) != v]
             if mismatch:
                 raise SystemExit(f"{p} was fitted with other settings: {', '.join(mismatch)}")
-            if st.get("n_samples") != calibrations[0][slot][args.method]["settings"].get("n_samples"):
-                raise SystemExit(f"{p} was fitted on another number of samples than {args.calibration[0]}")
-            if os.path.abspath(path(st["samples"])) != os.path.abspath(path(args.samples)):
+            n_model = int(model["n_samples"]) if "n_samples" in model else None  # absent in older model.npz
+            if st.get("n_samples") != (n_model or calibrations[0][slot][args.method]["settings"].get("n_samples")):
+                raise SystemExit(f"{p} was fitted on {st.get('n_samples')} samples, the model on {n_model}: "
+                                 f"not the same training set")
+            if os.path.basename(st["samples"]) != os.path.basename(args.samples):
                 print(f"warning: calibration fitted on {st['samples']}, training on {args.samples}")
             entries.append(calibration[slot][args.method])
         c = hierarchy.merge_calibrations(entries)  # several fold seeds: pooled curve, one tau
@@ -287,38 +289,19 @@ def main():
     if not args.calibration:
         args.topk = 0
     backoff = load_backoff(args, model, terms, out_dir)
-    kw_dim = int(model["kw_dim"])
     with h5py.File(path(args.sub_biomes_h5), "r") as handle:
-        sb = BLOCK_WEIGHT * normalize(handle["embeddings"][:])
+        sb = BLOCK_WEIGHT * normalize(handle["embeddings"][:])  # all distinct sub-biome texts (32k x 1024)
+    parts = sub_biome_parts(args.method, model, sb)
     sb_rows = np.where(index["sb_rows"] >= 0, index["sb_rows"], len(sb))  # len(sb) = the "no sub-biome" row
     has_sb = (index["sb_rows"] >= 0).astype(np.float32)
 
-    # per-slot parts that depend only on the sub-biome (one row per distinct sub-biome text + 1)
-    if args.method == "linear":  # unchanged from the linear-only version
-        coef = {slot: model[f"{slot}_coef"] for slot in SLOTS}
-        sb_scores = {slot: np.vstack([sb @ coef[slot][:, kw_dim:].T, np.zeros((1, coef[slot].shape[0]))])
-                     + model[f"{slot}_intercept"] for slot in SLOTS}
-    elif args.method == "prototype":
-        sb = np.vstack([sb, np.zeros((1, sb.shape[1]), dtype=sb.dtype)])
-        P = {slot: model[f"{slot}_prototypes"] for slot in SLOTS}
-        mu = {slot: model[f"{slot}_mean"] for slot in SLOTS}
-        sb_dot = {slot: sb @ P[slot][:, kw_dim:].T for slot in SLOTS}            # w sb . P_sb
-        sb_mu = {slot: sb @ mu[slot][kw_dim:] for slot in SLOTS}                 # w sb . mu_sb
-        mu_P = {slot: P[slot] @ mu[slot] for slot in SLOTS}
-        mu_mu = {slot: float(mu[slot] @ mu[slot]) for slot in SLOTS}
-    else:
-        sb = np.vstack([sb, np.zeros((1, sb.shape[1]), dtype=sb.dtype)])
-        train_kw, train_sb = model["train_x"][:, :kw_dim], model["train_x"][:, kw_dim:]
-        _, train_studies = np.unique(model["train_studies"], return_inverse=True)
-        n_classes = {slot: len(model[f"{slot}_classes"]) for slot in SLOTS}
-        unlabelled = {slot: model[f"{slot}_classes"][model[f"{slot}_labels"]] == "" for slot in SLOTS}
-    # knn_study holds (distinct keyword rows x training samples): cap the chunk so it fits in memory
-    chunk_rows = min(args.chunk_rows, 4000) if args.method == "knn_study" else args.chunk_rows
+    # stream the distinct keyword vectors in chunks; each chunk scores the samples whose keyword text is in it
+    chunk_rows = min(args.chunk_rows, 4000) if args.method == "knn_study" else args.chunk_rows  # knn: memory
     with h5py.File(path(args.keywords_h5), "r") as handle:
         n_rows = handle["embeddings"].shape[0]
         for first in range(0, n_rows, chunk_rows):
             part = os.path.join(out_dir, "parts", f"rows_{first:08d}.tsv.gz")
-            if os.path.exists(part):
+            if os.path.exists(part):  # done in an earlier (interrupted) run
                 continue
             if args.max_seconds and time.time() - start > args.max_seconds:
                 print(f"Stopping after {time.time() - start:.0f}s; rerun to continue")
@@ -329,44 +312,16 @@ def main():
             out = pd.DataFrame({"sample_id": index["sample_ids"][in_chunk]})
             best, confidence, extra = {}, {}, {}
             if args.method == "knn_study":
-                kw_sim = kw @ train_kw.T                                  # distinct keyword rows x training
-                sb_ids, sb_inverse = np.unique(sb_local, return_inverse=True)
-                sb_sim = sb[sb_ids] @ train_sb.T                          # distinct sub-biomes x training
-                for slot in SLOTS:
-                    best[slot], confidence[slot] = np.zeros(len(out), int), np.zeros(len(out))
-                for s0 in range(0, len(out), 2000):
-                    sim = kw_sim[kw_local[s0:s0 + 2000]] + sb_sim[sb_inverse[s0:s0 + 2000]]
-                    sim = sim.astype(np.float64) - TIE_BREAK * np.arange(sim.shape[1])  # see knn_study
-                    for slot in SLOTS:
-                        masked = np.where(unlabelled[slot][None, :], -np.inf, sim)
-                        b, c = knn_study_top2(masked, model[f"{slot}_labels"], train_studies, n_classes[slot], args.knn_study_k)
-                        best[slot][s0:s0 + 2000], confidence[slot][s0:s0 + 2000] = b, c
+                best, confidence = knn_study_chunk(model, parts, kw, kw_local, sb_local, args.knn_study_k)
             else:
                 for slot in SLOTS:
-                    if args.method == "linear":
-                        scores = (kw @ coef[slot][:, :kw_dim].T)[kw_local]
-                        scores += sb_scores[slot][sb_local]  # in place (float32), as in the linear-only version
-                    else:
-                        dot = (kw @ P[slot][:, :kw_dim].T)[kw_local] + sb_dot[slot][sb_local] - mu_P[slot]
-                        x_mu = (kw @ mu[slot][:kw_dim])[kw_local] + sb_mu[slot][sb_local]
-                        norm = np.sqrt(BLOCK_WEIGHT ** 2 * (1 + has_sb[in_chunk]) - 2 * x_mu + mu_mu[slot])
-                        scores = dot / norm[:, None] + model[f"{slot}_bias"]
+                    scores = chunk_scores(args.method, slot, model, parts, kw, kw_local, sb_local, has_sb[in_chunk])
                     top2 = np.argpartition(-scores, 1, axis=1)[:, :2]  # best two, unordered
                     top2 = np.take_along_axis(top2, np.argsort(-np.take_along_axis(scores, top2, axis=1), axis=1), axis=1)
                     best[slot] = top2[:, 0]
-                    confidence[slot] = np.take_along_axis(scores, top2, axis=1) @ [1, -1]
+                    confidence[slot] = np.take_along_axis(scores, top2, axis=1) @ [1, -1]  # margin best - second
                     if backoff:
-                        T, tau, closure, broader = backoff[slot]
-                        prob = hierarchy.softmax(scores.astype(np.float64), T)
-                        pick, q = closure.decode(prob, tau)
-                        node = np.where(pick >= 0, closure.nodes[np.maximum(pick, 0)], "")
-                        extra[slot] = {"p": np.round(prob.max(axis=1), 4), "backoff": node,
-                                       "backoff_label": [label_of.get(t, "") for t in node], "backoff_p": np.round(q, 4),
-                                       "backoff_kind": np.where(pick < 0, "abstain", np.where(
-                                           pick == closure.label_col[prob.argmax(axis=1)], "top1", "coarser"))}
-                        if args.topk:
-                            extra[slot]["candidates"] = candidate_strings(prob, model[f"{slot}_classes"], args.topk,
-                                                                          broader, args.max_candidates)
+                        extra[slot] = backoff_columns(scores, backoff[slot], model[f"{slot}_classes"], label_of, args)
             for slot in SLOTS:
                 terms_out = model[f"{slot}_classes"][best[slot]]
                 out[slot], out[f"{slot}_label"] = terms_out, [label_of.get(t, "") for t in terms_out]
@@ -378,16 +333,88 @@ def main():
             print(f"rows {first}-{first + len(kw)}: {in_chunk.sum()} samples ({time.time() - start:.0f}s)")
 
     final = os.path.join(out_dir, "atlas_predictions.tsv.gz")
-    parts = sorted(glob.glob(os.path.join(out_dir, "parts", "rows_*.tsv.gz")))
-    concat_parts(parts, final)
+    concat_parts(sorted(glob.glob(os.path.join(out_dir, "parts", "rows_*.tsv.gz"))), final)
     print(f"Wrote {final}")
+
+
+def sub_biome_parts(method, model, sb):
+    """Per-slot terms that depend only on the sub-biome, computed once per distinct sub-biome text
+    (+ one all-zero row for samples without a sub-biome, index len(sb)). x = [w kw, w sb]."""
+    kw_dim = int(model["kw_dim"])
+    if method == "linear":  # W_sb . (w sb) + b
+        return {slot: np.vstack([sb @ model[f"{slot}_coef"][:, kw_dim:].T, np.zeros((1, model[f"{slot}_coef"].shape[0]))])
+                + model[f"{slot}_intercept"] for slot in SLOTS}
+    sb = np.vstack([sb, np.zeros((1, sb.shape[1]), dtype=sb.dtype)])
+    if method == "prototype":
+        parts = {}
+        for slot in SLOTS:
+            P, mu = model[f"{slot}_prototypes"], model[f"{slot}_mean"]
+            parts[slot] = {"sb_dot": sb @ P[:, kw_dim:].T,      # (w sb) . P_sb
+                           "sb_mu": sb @ mu[kw_dim:],          # (w sb) . mu_sb
+                           "mu_P": P @ mu, "mu_mu": float(mu @ mu)}
+        return parts
+    # knn_study: the training matrix split in its two blocks, and per slot which training samples are unlabelled
+    _, studies = np.unique(model["train_studies"], return_inverse=True)
+    return {"sb": sb, "train_kw": model["train_x"][:, :kw_dim], "train_sb": model["train_x"][:, kw_dim:],
+            "studies": studies,
+            "unlabelled": {slot: model[f"{slot}_classes"][model[f"{slot}_labels"]] == "" for slot in SLOTS}}
+
+
+def chunk_scores(method, slot, model, parts, kw, kw_local, sb_local, has_sb):
+    """(samples of the chunk x labels) scores of linear or prototype, from the keyword chunk and the
+    precomputed sub-biome parts. kw_local / sb_local: each sample's row in kw / in the sub-biome parts."""
+    kw_dim = int(model["kw_dim"])
+    if method == "linear":  # W_kw . (w kw) + [W_sb . (w sb) + b]
+        scores = (kw @ model[f"{slot}_coef"][:, :kw_dim].T)[kw_local]
+        scores += parts[slot][sb_local]  # in place (float32), as in the linear-only version
+        return scores
+    # prototype: cos(x - mu, P) + bias = (x . P - mu . P) / ||x - mu|| + bias, with
+    # ||x - mu||^2 = ||x||^2 - 2 x . mu + ||mu||^2 and ||x||^2 = w^2 (1 + has_sb) (unit-norm blocks)
+    p, P, mu = parts[slot], model[f"{slot}_prototypes"], model[f"{slot}_mean"]
+    dot = (kw @ P[:, :kw_dim].T)[kw_local] + p["sb_dot"][sb_local] - p["mu_P"]
+    x_mu = (kw @ mu[:kw_dim])[kw_local] + p["sb_mu"][sb_local]
+    norm = np.sqrt(BLOCK_WEIGHT ** 2 * (1 + has_sb) - 2 * x_mu + p["mu_mu"])
+    return dot / norm[:, None] + model[f"{slot}_bias"]
+
+
+def knn_study_chunk(model, parts, kw, kw_local, sb_local, k):
+    """knn_study for the samples of one keyword chunk -> ({slot: best class index}, {slot: vote share}).
+    Similarity to every training sample = kw . kw_train + sb . sb_train (both blocks already weighted)."""
+    kw_sim = kw @ parts["train_kw"].T                         # distinct keyword rows x training samples
+    sb_ids, sb_inverse = np.unique(sb_local, return_inverse=True)
+    sb_sim = parts["sb"][sb_ids] @ parts["train_sb"].T         # distinct sub-biomes x training samples
+    best = {slot: np.zeros(len(kw_local), int) for slot in SLOTS}
+    confidence = {slot: np.zeros(len(kw_local)) for slot in SLOTS}
+    for s0 in range(0, len(kw_local), 2000):
+        sim = kw_sim[kw_local[s0:s0 + 2000]] + sb_sim[sb_inverse[s0:s0 + 2000]]
+        sim = sim.astype(np.float64) - TIE_BREAK * np.arange(sim.shape[1])  # see methods.knn_study
+        for slot in SLOTS:
+            masked = np.where(parts["unlabelled"][slot][None, :], -np.inf, sim)  # unlabelled: never a neighbour
+            b, c = knn_study_top2(masked, model[f"{slot}_labels"], parts["studies"], len(model[f"{slot}_classes"]), k)
+            best[slot][s0:s0 + 2000], confidence[slot][s0:s0 + 2000] = b, c
+    return best, confidence
+
+
+def backoff_columns(scores, slot_backoff, classes, label_of, args):
+    """The back-off columns of one slot for a chunk: calibrated top-1 probability, the back-off answer
+    (hierarchy.Closure.decode at the slot's tau), its label, summed probability and kind, and the
+    reranker's candidate list."""
+    T, tau, closure, broader = slot_backoff
+    prob = hierarchy.softmax(scores.astype(np.float64), T)
+    pick, q = closure.decode(prob, tau)
+    node = np.where(pick >= 0, closure.nodes[np.maximum(pick, 0)], "")
+    columns = {"p": np.round(prob.max(axis=1), 4), "backoff": node,
+               "backoff_label": [label_of.get(t, "") for t in node], "backoff_p": np.round(q, 4),
+               "backoff_kind": np.where(pick < 0, "abstain", np.where(
+                   pick == closure.label_col[prob.argmax(axis=1)], "top1", "coarser"))}
+    if args.topk:
+        columns["candidates"] = candidate_strings(prob, classes, args.topk, broader, args.max_candidates)
+    return columns
 
 
 def concat_parts(parts, final):
     """Concatenate the chunk TSVs line by line (header once): the 3.4M-row table does not have to
     fit in memory, and the text is the same as the parts'."""
-    import gzip
-    import shutil
     header = None
     with gzip.open(final + ".tmp", "wt", compresslevel=3) as out:  # level 9 takes minutes for 3.4M rows
         for p in parts:

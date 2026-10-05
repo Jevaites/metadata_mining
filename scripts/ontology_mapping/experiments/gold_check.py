@@ -37,26 +37,13 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common import SLOTS, path, read_tsv  # noqa: E402
+from common import SLOTS, path, read_tsv, term_ancestors  # noqa: E402
 
 COARSE = ["animal", "plant", "soil", "water", "other"]
 BANDS = [(0.9, 1.01), (0.75, 0.9), (0.5, 0.75), (0.0, 0.5)]
 
 
-def ancestors_of(terms):
-    parents = {t: [p for p in ps.split("||") if p] for t, ps in zip(terms["term_id"], terms["parents"])}
-    memo = {}
-
-    def up(t):
-        if t not in memo:
-            memo[t] = set()
-            for p in parents.get(t, []):
-                memo[t] |= {p} | up(p)
-        return memo[t]
-    return up
-
-
-def coarse_map(train, gpt, up, min_share):
+def coarse_map(train, gpt, anc, min_share):
     counts = defaultdict(Counter)
     for row in train.itertuples():
         g = gpt.get(row.sample_id)
@@ -65,7 +52,7 @@ def coarse_map(train, gpt, up, min_share):
         for slot in SLOTS:
             label = getattr(row, slot)
             if label:
-                for t in {label} | up(label):
+                for t in {label} | anc.get(label, set()):
                     counts[t][g] += 1
     majority, compatible = {}, {}
     for t, c in counts.items():
@@ -116,11 +103,11 @@ def main():
     D = path(args.dir)
 
     terms = read_tsv(args.ontology_terms)
-    up = ancestors_of(terms)
+    anc = term_ancestors(terms)
     label_of = dict(zip(terms["term_id"], terms["label"]))
     train = read_tsv(args.training_set)
     gpt = dict(pd.read_csv(f"{D}/gpt_biomes_gold_and_linked.tsv", sep="\t", header=None, dtype=str).values)
-    majority, compatible, counts = coarse_map(train, gpt, up, args.min_share)
+    majority, compatible, counts = coarse_map(train, gpt, anc, args.min_share)
     gold = read_tsv(f"{D}/gold_labels.tsv")
     linked = set(train["sample_id"])
     report = {"gold_samples": len(gold), "gold_linked_to_metalog_excluded": int(gold["sample_id"].isin(linked).sum())}
@@ -173,7 +160,7 @@ def main():
     mp = pd.DataFrame([{"term_id": t, "label": label_of.get(t, ""), "majority": majority[t],
                         "compatible": "|".join(sorted(compatible[t])), "n": sum(counts[t].values()),
                         **{c: round(counts[t][c] / sum(counts[t].values()), 3) for c in COARSE}} for t in majority])
-    mp.sort_values("n", ascending=False).to_csv(f"{D}/term_to_coarse_biome.tsv", sep="\t", index=False)
+    mp.sort_values(["n", "term_id"], ascending=[False, True]).to_csv(f"{D}/term_to_coarse_biome.tsv", sep="\t", index=False)
     print(json.dumps(report, indent=1))
 
 

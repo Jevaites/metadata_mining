@@ -1,20 +1,26 @@
 """
-Calibrated probabilities and hierarchical back-off, shared by 5_evaluate.py, 6_predict_atlas.py
-and 7_rerank_atlas.py (imported, never run directly).
+Calibrated probabilities and hierarchical back-off, shared by 5_evaluate.py, 6_predict_atlas.py and
+7_rerank_atlas.py (imported, never run directly).
 
-  1. calibration: a base model's scores over the slot's training labels -> probabilities P,
-     softmax(scores / T), with the temperature T fitted by log-likelihood (fit_temperature);
+  1. calibration: a base model's scores over the slot's training labels -> probabilities P =
+     softmax(scores / T), the temperature T fitted by log-likelihood on out-of-fold scores;
   2. sum up the ontology: q(node) = sum of P over the labels at or below the node
-     (q = P @ A, A = label x node closure matrix, each label counted once, so q <= 1 and q never
+     (q = P @ A, A = label x node closure matrix; each label counted once, so q <= 1 and q never
      decreases going up, also with several parents);
   3. climbing (Closure.decode): among the top-1 label and its ancestors, the most specific node with
-     q >= tau. Only terms Metalog uses in the slot are answers (and never the slot roots below);
-     nothing allowed -> abstain. tau -> 0 gives the plain top-1;
-  4. tau per slot is chosen for a target accuracy on out-of-fold predictions (choose_tau).
+     q >= tau. Only terms Metalog uses in the slot are answers (never the slot roots); none -> abstain.
+     tau -> 0 gives the plain top-1;
+  4. tau per slot is the lowest one whose out-of-fold accuracy reaches a target (choose_tau).
 
-Accuracy, strict: the answer is the gold term or one of its ancestors (true, maybe coarser).
-Accuracy, lenient: also counts answers *below* gold ("too specific"): Metalog curators often stop at
-a general term, and a manual review found most such answers true (claude/rerank-pilot-results.md).
+Worked example (biome slot, tau = 0.8; ENVO: ocean biome is_a marine biome is_a aquatic biome, freshwater
+biome is_a aquatic biome): P(ocean biome) = 0.55, P(marine biome) = 0.15, P(freshwater biome) = 0.15, the rest
+elsewhere. q(ocean biome) = 0.55 < 0.8; q(marine biome) = 0.55 + 0.15 = 0.70 < 0.8; q(aquatic biome) = 0.85
+>= 0.8 -> the answer is 'aquatic biome' (true, coarser) instead of a 55 %-sure 'ocean biome'.
+
+Outcome of an answer against the gold label: EXACT, COARSER (an ancestor of gold: true but less
+specific), TOO_SPECIFIC (a descendant of gold), OTHER (another branch: wrong), 0 = abstain.
+Accuracy, strict: EXACT or COARSER. Lenient: also TOO_SPECIFIC (Metalog curators often stop at a general
+term, and a manual review found most "too specific" answers true: claude/rerank-pilot-results.md).
 Background: claude/hierarchical-prediction-literature.md, claude/hierarchical-backoff-results.md.
 """
 import numpy as np
@@ -24,11 +30,12 @@ from scipy.optimize import minimize_scalar
 NO_ANSWER = {"ENVO_00000428",   # biome
              "ENVO_00010483",   # environmental material
              "ENVO_01000254"}   # environmental system
-TAUS = np.round(np.arange(0.05, 1.0001, 0.025), 3)
+TAUS = np.round(np.arange(0.05, 1.0001, 0.025), 3)  # the tau grid: 0.05, 0.075, ..., 1.0
 EXACT, COARSER, TOO_SPECIFIC, OTHER = 1, 2, 3, 4  # outcome codes, 0 = abstain
 
 
 def softmax(S, T):
+    """Row-wise softmax of scores S / T (max subtracted first for numerical stability)."""
     Z = S / T
     Z = Z - Z.max(1, keepdims=True)
     E = np.exp(Z)
@@ -36,7 +43,9 @@ def softmax(S, T):
 
 
 def fit_temperature(blocks):
-    """Temperature minimising the NLL of the gold label over [(scores, gold column or -1)]."""
+    """Temperature minimising the mean negative log-likelihood of the gold label.
+    blocks: [(scores n x V, gold column per row or -1 when gold is not in that vocabulary)].
+    Prototype scores are cosines (range ~0.2), so T comes out small (~0.09); ridge scores ~0.2."""
     def nll(logT):
         T, total, n = np.exp(logT), 0.0, 0
         for S, g in blocks:
@@ -44,14 +53,18 @@ def fit_temperature(blocks):
             if m.any():
                 Z = S[m] / T
                 Z = Z - Z.max(1, keepdims=True)
-                total -= (Z[np.arange(m.sum()), g[m]] - np.log(np.exp(Z).sum(1))).sum()
+                total -= (Z[np.arange(m.sum()), g[m]] - np.log(np.exp(Z).sum(1))).sum()  # -log softmax(gold)
                 n += m.sum()
         return total / max(n, 1)
-    return float(np.exp(minimize_scalar(nll, bounds=(-8, 3), method="bounded").x))
+    return float(np.exp(minimize_scalar(nll, bounds=(-8, 3), method="bounded").x))  # T in [3e-4, 20]
 
 
 class Closure:
-    """Label x node ancestor-closure matrix of one vocabulary (the training labels of a slot)."""
+    """Label x node ancestor-closure matrix of one vocabulary (the training labels of a slot).
+
+    nodes = the labels and all their ancestors; A[i, j] = 1 when node j is label i or one of its ancestors.
+    Example: labels [marine biome, ocean biome] -> nodes [aquatic biome, biome, marine biome, ocean biome, ...]
+    and q = P @ A gives q(marine biome) = P(marine biome) + P(ocean biome)."""
 
     def __init__(self, vocab, anc, answers="labels", floor=0.25):
         self.vocab = list(vocab)
@@ -62,25 +75,27 @@ class Closure:
         self.A = np.zeros((len(self.vocab), len(nodes)), dtype=np.float32)
         for i, v in enumerate(self.vocab):
             self.A[i, [col[n] for n in ({v} | anc.get(v, set()))]] = 1
-        self.n_below = self.A.sum(0)  # labels at or below each node
+        self.n_below = self.A.sum(0)  # labels at or below each node: fewer = more specific
         self.is_label = np.isin(self.nodes, self.vocab)
-        self.depth = np.array([len(anc.get(n, ())) for n in nodes])  # number of ancestors
-        # allowed answers: "labels" = only terms Metalog uses in this slot (any depth);
-        # "ontology" = also their ENVO/UBERON ancestors, unless above `floor` of the slot's labels
+        self.depth = np.array([len(anc.get(n, ())) for n in nodes])  # number of ancestors (tie-break only)
+        # allowed answers: "labels" = only terms Metalog uses in this slot (any depth), unless they sit above
+        # half of the slot's labels; "ontology" = also their ENVO/UBERON ancestors, unless above `floor`
         onto = np.array([n.startswith(("ENVO_", "UBERON_")) for n in nodes])
         not_root = ~np.isin(self.nodes, list(NO_ANSWER))
         if answers == "labels":
             self.informative = self.is_label & (self.n_below < 0.5 * len(self.vocab)) & not_root
         else:
             self.informative = onto & ((self.n_below < floor * len(self.vocab)) | self.is_label) & not_root
-        # tie-break among equally specific nodes: labels first, then deeper, then higher q
+        # order among candidate answers: most specific first (fewest labels below), then labels, then
+        # deeper; q (< 1) breaks the remaining ties because the other terms are multiples of 10
         self.rank_key = -self.n_below * 1e6 + self.is_label * 1e4 + self.depth * 10
 
     def decode(self, P, tau):
-        """Climbing: among the top-1 label and its ancestors, the most specific node with q >= tau
+        """Climbing: among the top-1 label and its ancestors, the most specific allowed node with q >= tau
         (so tau -> 0 gives the top-1 label). -> (node index per sample, -1 = abstain; q of that node)."""
-        q = P @ self.A
-        ok = (q >= tau - 1e-12) & self.informative & (self.A[P.argmax(1)] > 0)
+        q = P @ self.A  # summed probability of every node
+        on_path = self.A[P.argmax(1)] > 0  # the top-1 label and its ancestors
+        ok = (q >= tau - 1e-12) & self.informative & on_path
         key = np.where(ok, self.rank_key[None, :] + q, -np.inf)
         pick = np.where(ok.any(1), key.argmax(1), -1)
         return pick, np.where(pick >= 0, q[np.arange(len(q)), np.maximum(pick, 0)], 0.0)
@@ -91,7 +106,7 @@ def relation(nodes, gold, anc):
     gold: true but coarser), TOO_SPECIFIC (a descendant of gold), OTHER (another branch)."""
     cache, rows = {}, []
     for g in gold:
-        if g not in cache:
+        if g not in cache:  # one row per distinct gold label
             ga = anc.get(g, set())
             cache[g] = np.array([EXACT if n == g else COARSER if n in ga else TOO_SPECIFIC if g in anc.get(n, ())
                                  else OTHER for n in nodes], dtype=np.int8)
@@ -106,7 +121,8 @@ def outcome(rel, pick):
 
 
 def summarise(out):
-    """Shares of all samples, plus accuracy among the answered ones (strict and lenient)."""
+    """Shares of all samples, plus accuracy among the answered ones (strict and lenient).
+    Example: outcomes [1, 2, 0, 4] -> coverage 0.75, strict accuracy 2/3, exact 0.25."""
     answered = out > 0
     acc = lambda ok: round(float(np.isin(out[answered], ok).mean()), 4) if answered.any() else None
     share = lambda code: round(float((out == code).mean()), 4)
@@ -132,7 +148,7 @@ def oof_backoff(folds, anc, targets=(0.8, 0.85, 0.9, 0.95)):
     2. the curve: outcome shares at every tau of TAUS, pooled over folds;
     3. per target and metric (strict / lenient), tau chosen on the other folds and applied to the
        held-out fold: an honest estimate of coverage and accuracy at that target.
-    -> (report dict, per-fold list of (P, Closure)) ."""
+    -> (report dict, per-fold list of (P, Closure))."""
     blocks = []
     for f in folds:
         col = {v: i for i, v in enumerate(f["vocab"])}
@@ -157,7 +173,7 @@ def oof_backoff(folds, anc, targets=(0.8, 0.85, 0.9, 0.95)):
                 tau = choose_tau([{"tau": float(t), **summarise(others[i])} for i, t in enumerate(TAUS)], target, metric)
                 chosen.append(tau)
                 outs.append(pf["outs"][list(TAUS).index(tau)])
-            name = f"{metric.split('_')[1]}_{target}"
+            name = f"{metric.split('_')[1]}_{target}"  # e.g. "strict_0.9"
             report[name] = {"tau_per_fold": chosen, **summarise(np.concatenate(outs))}
     return report, [(pf["P"], pf["C"]) for pf in per_fold]
 
@@ -170,7 +186,7 @@ def decode_candidates(cands, p, tau, allowed, anc):
     slightly more cautious than Closure.decode. -> (term or None, its summed probability)."""
     top = cands[int(np.argmax(p))]
     chain = [top] + sorted((a for a in anc.get(top, ()) if a in allowed and a not in NO_ANSWER),
-                           key=lambda a: len(anc.get(a, ())), reverse=True)
+                           key=lambda a: len(anc.get(a, ())), reverse=True)  # deepest ancestor first
     for node in chain:
         if node in NO_ANSWER:
             continue

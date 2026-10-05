@@ -63,7 +63,7 @@ from collections import Counter
 
 import pandas as pd
 
-from common import SLOTS, ancestor_sets, path, read_tsv
+from common import SLOTS, path, read_tsv, term_ancestors
 
 warnings.filterwarnings("ignore", "This pattern is interpreted as a regular expression")
 
@@ -189,8 +189,7 @@ def load_label_map(p):
 def flag_labels(samples, terms, label_map):
     ontology_ok = set(terms.loc[terms["obsolete"] != "True", "term_id"])
     obsolete = set(terms.loc[terms["obsolete"] == "True", "term_id"])
-    parents = {t: set(p.split("||")) - {""} for t, p in zip(terms["term_id"], terms["parents"])}
-    ancestors = ancestor_sets(parents)
+    ancestors = term_ancestors(terms)
     unknown_targets = Counter()
 
     for slot, field in METALOG_SLOT.items():
