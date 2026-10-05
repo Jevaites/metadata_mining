@@ -178,3 +178,23 @@ def decode_candidates(cands, p, tau, allowed, anc):
         if q >= tau - 1e-12:
             return node, float(q)
     return None, 0.0
+
+
+def merge_calibrations(entries):
+    """Pool the calibration of one method over several fold seeds (calibration.json entries of
+    5_evaluate.py runs on the same samples): every run scores each sample once out of fold, so pooling
+    the outcomes = averaging the outcome shares per tau; accuracies are recomputed from the pooled
+    shares and the temperature is the geometric mean. One entry is returned unchanged."""
+    if len(entries) == 1:
+        return entries[0]
+    taus = [[r["tau"] for r in e["curve"]] for e in entries]
+    if any(t != taus[0] for t in taus):
+        raise SystemExit("calibrations to merge have different tau grids")
+    curve = []
+    for rows in zip(*(e["curve"] for e in entries)):
+        mean = {k: float(np.mean([r[k] for r in rows])) for k in ("coverage", "exact", "coarser", "too_specific", "other_branch")}
+        acc = lambda ok: round(sum(mean[k] for k in ok) / mean["coverage"], 4) if mean["coverage"] > 0 else None
+        curve.append({"tau": rows[0]["tau"], **{k: round(v, 4) for k, v in mean.items()},
+                      "accuracy_strict": acc(("exact", "coarser")), "accuracy_lenient": acc(("exact", "coarser", "too_specific"))})
+    return {"temperature": float(np.exp(np.mean([np.log(e["temperature"]) for e in entries]))), "curve": curve,
+            "settings": {**entries[0]["settings"], "fold_seed": [e["settings"].get("fold_seed") for e in entries]}}

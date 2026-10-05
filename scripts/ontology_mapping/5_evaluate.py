@@ -12,7 +12,7 @@ Every method uses the same sample vectors (--features), so rows are comparable.
 Methods that also need term vectors (text encoders, or .npz features + --term_vectors):
   retrieval       zero-shot: the term whose vector is closest to the sample, among the
                   terms used as training labels for this slot ("closed" vocabulary)
-  retrieval_open  same, among all 18.8k ENVO+Uberon terms
+  retrieval_open  same, among all terms of the term table (18.8k ENVO + Uberon; 49k with PO + FOODON)
   hybrid          linear score + --hybrid_weight x cosine(sample, term), closed vocabulary
   hybrid_open     same over all terms; terms never seen in training get linear score -1,
                   so this is the only supervised method that can output an unseen term
@@ -25,7 +25,7 @@ Upgraded "trivial" methods (added 2026-09-28; see experiments/README.md for how 
                   frequency in the training fold), closed vocabulary
   prototype       (dense) nearest class prototype: each term's (centred) vector is blended with the
                   centroid of its training samples (--prototype_alpha), + the same log prior
-  prototype_open  same over all 18.8k terms; terms without training samples keep their term
+  prototype_open  same over all terms; terms without training samples keep their term
                   vector (+ --prototype_unseen_bonus), so this can output an unseen term
 
 Evaluation: cross-validation over Metalog `study_code` (common.study_folds), so no
@@ -152,10 +152,20 @@ def dense(matrix):
 def rank(scores, ids, n=5, margin=True):
     """Top-n ids per row of a (samples x ids) score matrix; confidence = best minus second-best
     score (margin=True) or the best score itself."""
-    # row blocks keep memory low (samples x 18.8k terms); argsort is per row, so the result is the same
+    # row blocks keep memory low (samples x all terms); argsort is per row, so the result is the same
     order = np.vstack([np.argsort(-scores[i:i + 1000], axis=1)[:, :n] for i in range(0, max(len(scores), 1), 1000)])
     top2 = np.take_along_axis(scores, order[:, :2], axis=1)
     return [ids[row].tolist() for row in order], top2[:, 0] - top2[:, -1] if margin else top2[:, 0]
+
+
+def row_blocks(n, size=1000):
+    """Row slices of at most `size` rows (at least one, possibly empty, slice)."""
+    return [slice(start, start + size) for start in range(0, max(n, 1), size)]
+
+
+def join_ranks(parts):
+    """Concatenate the (top-n lists, confidences) of row blocks."""
+    return [r for ranked, _ in parts for r in ranked], np.concatenate([c for _, c in parts])
 
 
 def knn(test, train, train_labels, k):
@@ -248,7 +258,7 @@ def prototype(test, model, vocab_ids, scores_out=None):
     """Rank terms by prototype_scores. With a list as `scores_out`, the score matrix is appended to
     it (closed vocabulary only: the back-off needs every score of the sample)."""
     ranked, confidence, blocks = [], [], []
-    for start in range(0, max(test.shape[0], 1), 1000):  # row blocks keep memory low with 18.8k terms
+    for start in range(0, max(test.shape[0], 1), 1000):  # row blocks keep memory low with 49k terms
         scores = prototype_scores(test[start:start + 1000], model)
         r, c = rank(scores, vocab_ids)
         ranked += r
@@ -390,6 +400,9 @@ def main():
     parser.add_argument("--term_vectors", default=None, help="4_embed_terms.py output (same space as the .npz)")
     parser.add_argument("--only_samples_in", nargs="*", default=[],
                         help=".npz files: also require a vector there (to compare runs on identical samples)")
+    parser.add_argument("--closed_only", action="store_true",
+                        help="Skip the open-vocabulary methods (retrieval_open, hybrid_open, prototype_open): "
+                             "much faster with the 49k-term table, e.g. for calibration runs over several --fold_seed")
     parser.add_argument("--k", type=int, default=25, help="Neighbours for knn")
     parser.add_argument("--hybrid_weight", type=float, default=2.0, help="Weight of the cosine in hybrid")
     parser.add_argument("--knn_study_k", type=int, default=50, help="Neighbours for knn_study")
@@ -463,12 +476,21 @@ def main():
                 "linear": rank(linear, classes),
             }
             if term_matrix is not None:
-                cosine = dense(x_te @ term_matrix.T)  # samples x all terms
+                # samples x all terms, in row blocks: with FOODON (49k terms) the full matrix and the
+                # hybrid score copies no longer fit in memory; every method ranks each row on its own
+                vocab_cols = closed if args.closed_only else slice(None)  # closed_only: the closed columns only
+                ids = term_ids[vocab_cols]
+                blocks = [(r, dense(x_te[r] @ term_matrix[vocab_cols].T)) for r in row_blocks(x_te.shape[0])]
+                in_block = closed[vocab_cols]  # closed columns within the computed ones
                 # confidence = best cosine: near-synonym terms make the margin meaningless here
-                predictions["retrieval"] = rank(cosine[:, closed], term_ids[closed], margin=False)
-                predictions["retrieval_open"] = rank(cosine, term_ids, margin=False)
-                predictions["hybrid"] = hybrid(classes, linear, cosine[:, closed], term_ids[closed], args.hybrid_weight)
-                predictions["hybrid_open"] = hybrid(classes, linear, cosine, term_ids, args.hybrid_weight)
+                predictions["retrieval"] = join_ranks([rank(c[:, in_block], ids[in_block], margin=False) for _, c in blocks])
+                predictions["hybrid"] = join_ranks([hybrid(classes, linear[r], c[:, in_block], ids[in_block], args.hybrid_weight)
+                                                    for r, c in blocks])
+                if not args.closed_only:
+                    predictions["retrieval_open"] = join_ranks([rank(c, term_ids, margin=False) for _, c in blocks])
+                    predictions["hybrid_open"] = join_ranks([hybrid(classes, linear[r], c, term_ids, args.hybrid_weight)
+                                                             for r, c in blocks])
+                del blocks
             if term_matrix is not None and not sparse.issparse(x_tr):
                 a, b = args.prototype_alpha, args.prototype_beta
                 vocab = term_matrix[closed]
@@ -478,8 +500,9 @@ def main():
                                                     term_ids[closed], keep)
                     if keep:
                         backoff_folds[(slot, method)].append({"S": keep[0], "vocab": term_ids[closed], **fold_info})
-                predictions["prototype_open"] = prototype(x_te, prototype_model(x_tr, y, term_matrix, term_ids, a, b,
-                                                                             args.prototype_unseen_bonus), term_ids)
+                if not args.closed_only:
+                    predictions["prototype_open"] = prototype(x_te, prototype_model(x_tr, y, term_matrix, term_ids, a, b,
+                                                                                 args.prototype_unseen_bonus), term_ids)
             if term_vectors is not None and not sparse.issparse(x_tr):
                 predictions["label_reg"] = label_regression(x_te, x_tr, term_vectors[[term_row[t] for t in y]],
                                                             term_vectors[closed], term_ids[closed])

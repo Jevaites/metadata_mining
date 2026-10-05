@@ -71,19 +71,29 @@ def load_npz(p):
     return {s: i for i, s in enumerate(saved["sample_ids"])}, normalize(saved["vectors"])[saved["index"]]
 
 
+def stable_key(seed, values):
+    """A seeded pseudo-random key per value that depends on that value only (md5 of 'seed:value'):
+    ordering or splitting by it does not change for the other values when values are added."""
+    import hashlib
+    return np.array([hashlib.md5(f"{seed}:{v}".encode()).hexdigest() for v in values])
+
+
 def select_samples(samples_path, require_ids=(), max_per_study=50, seed=22):
     """The labelled samples used for training and evaluation.
 
     1. keep samples with at least one slot label;
     2. keep samples whose id is in every set of `require_ids` (e.g. those with an embedding);
-    3. shuffle (seeded) and keep at most `max_per_study` samples per study (0 = no cap), so a few
-       huge cohorts do not dominate training or the scores.
+    3. keep at most `max_per_study` samples per study (0 = no cap), so a few huge cohorts do not
+       dominate training or the scores: the samples with the smallest stable_key(seed, sample_id).
+       The choice of a sample does not depend on the other rows, so adding labels to a training set
+       keeps every previously selected sample, unless its study gains samples with smaller keys
+       (until 2026-10-05 a seeded shuffle of the whole table was used, which redrew every study).
     """
     samples = read_tsv(samples_path)
     samples = samples[samples[SLOTS].ne("").any(axis=1)]
     for ids in require_ids:
         samples = samples[samples["sample_id"].isin(ids)]
-    samples = samples.sample(frac=1, random_state=seed)
+    samples = samples.iloc[np.argsort(stable_key(seed, samples["sample_id"]), kind="stable")]
     if max_per_study:
         samples = samples.groupby("study_code").head(max_per_study)
     return samples.reset_index(drop=True)
@@ -92,19 +102,14 @@ def select_samples(samples_path, require_ids=(), max_per_study=50, seed=22):
 def study_folds(study_codes, n_folds=5, seed=0):
     """Cross-validation split by study: yields (train_idx, test_idx), no study on both sides.
 
-    Same balancing as sklearn's GroupKFold (largest study first, into the lightest fold), but ties
-    between studies of equal size are broken by a seeded shuffle instead of an unstable argsort,
-    whose order differs between numpy builds (many studies have exactly --max_per_study samples),
-    so the folds are identical on every machine. Change `seed` for a different, equally valid split.
+    Each study goes to fold stable_key(seed, study) mod n_folds, so a study keeps its fold when other
+    studies grow, shrink or are added, and the folds are identical on every machine. Folds are not
+    size-balanced (with <= 50 samples per study they differ by up to ~20 %). Until 2026-10-05 studies
+    were balanced greedily as in GroupKFold, so one changed study could move many others.
+    Change `seed` for a different, equally valid split.
     """
     codes = np.asarray(study_codes)
-    studies, sizes = np.unique(codes, return_counts=True)
-    order = np.random.default_rng(seed).permutation(len(studies))
-    order = order[np.argsort(-sizes[order], kind="stable")]
-    load, fold_of = np.zeros(n_folds), {}
-    for i in order:
-        fold_of[studies[i]] = int(np.argmin(load))
-        load[fold_of[studies[i]]] += sizes[i]
-    fold = np.array([fold_of[c] for c in codes])
+    studies, inverse = np.unique(codes, return_inverse=True)
+    fold = np.array([int(k, 16) % n_folds for k in stable_key(seed, studies)])[inverse]
     for f in range(n_folds):
         yield np.where(fold != f)[0], np.where(fold == f)[0]

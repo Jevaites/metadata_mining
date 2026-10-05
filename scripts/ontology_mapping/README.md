@@ -1,7 +1,8 @@
 # Ontology mapping prototype (MicrobeAtlas → ENVO / Uberon)
 
-Gives every MicrobeAtlas sample one ENVO/Uberon term for each of the three Metalog
-slots, plus a confidence score:
+Gives every MicrobeAtlas sample one ontology term for each of the three Metalog slots, plus a
+confidence score. Terms are ENVO / Uberon, and PO (plant anatomy) / FOODON (food) where Metalog
+uses them (leaf, fermented food products, milk):
 
 | slot | Metalog field | example |
 |---|---|---|
@@ -19,7 +20,7 @@ evaluated, and used inside the `hybrid` method.
 ## Pipeline
 
 ```
-ENVO + Uberon .obo ──1──> ontology_terms.tsv.gz ─────────────┬──4──> term embeddings (.h5)
+ENVO/Uberon/PO/FOODON ─1─> ontology_terms.tsv.gz ─────────────┬──4──> term embeddings (.h5)
                                                               │                │
 Metalog *_all_long_*.tsv.gz ─┐                                │                │
 MicrobeAtlas sample.info.gz ─┴──2──> metalog_training_set.tsv.gz              │
@@ -39,13 +40,15 @@ unique GPT embeddings (.h5) ───┴──3──> keywords.npz, sub_biomes.
 
 | step | script | what it does | time |
 |---|---|---|---|
-| 1 | `1_build_term_index.py` | Parses the OBO files into one row per term: label, synonyms, definition, `is_a` parents, obsolete flag. | < 1 min |
+| 1 | `1_build_term_index.py` | Parses the ontology files (OBO; OWL for FOODON) into one row per term: label, synonyms, definition, `is_a` parents, obsolete flag. `--append` adds ontologies to an existing table. | < 1 min |
 | 2 | `2_build_training_set.py` | Links MicrobeAtlas records to Metalog samples by accession, and writes the labels and a cleaned text for each linked sample. | ~5 min |
 | 2b | `2b_clean_metalog.py` | Flags every Metalog sample (controls, perturbed and ancient samples, duplicate accessions, unusable labels) and writes a clean and a gold version of the training set. Nothing is deleted. | < 1 min |
 | 3 | `3_extract_sample_embeddings.py` | Looks up the GPT keyword or sub-biome embedding of each labelled sample (run once per kind). | < 1 min |
-| 4 | `4_embed_terms.py` | Embeds every term text (`label; synonyms`) with the model used for the GPT texts. Costs about $0.01. | ~2 min |
+| 4 | `4_embed_terms.py` | Embeds every term text (`label; synonyms`) with the model used for the GPT texts; resumable (only new texts). ~49k texts with FOODON (783k tokens): about $0.10. | ~12 min (new texts only) |
 | 5 | `5_evaluate.py` | Runs cross-validation grouped by study for every method on the same features. Writes metrics and per-sample predictions. | 5–15 min |
 | 6 | `6_predict_atlas.py` | Trains `linear` (or `--method prototype / knn_study`) on the evaluated samples and labels every atlas sample, streaming the 6.4 GB keyword `.h5`. With `--calibration` (from step 5): calibrated probabilities, the back-off term for a target accuracy, and the reranker's candidates. Resumable. | ~2 min (knn_study: longer; back-off: a few min more) |
+| 6b | `6b_coverage.py` | Flags atlas samples outside what Metalog covers: similarity to the nearest training sample in the model's feature space, against a threshold calibrated on held-out Metalog projects. Method-independent. Resumable. | ~25 min |
+| 6c | `6c_flag_controls.py` | Flags atlas samples that are technical controls (blanks, negative controls) or mock communities, from their GPT sub-biome and keywords: they have no habitat and should not get a label. | < 1 min |
 | 7 | `7_rerank_atlas.py` | Optional. LLM reranking of the least-confident predictions, fused with the base model and backed off again: `fit` on the Metalog pilot, `build` the requests, `submit` / `collect` through the Batch API, `apply`. | API: ≤ 24 h per batch |
 | – | `analyses.py` | Optional. Computes the extra analyses behind the findings report: bootstrap CIs, hierarchy of errors, label ceiling, coarser labels. | ~3 min |
 | – | `common.py` | Shared helpers: term loading, sample selection, study folds. | |
@@ -65,7 +68,12 @@ TV=$P/ontology_mapping/ontology_terms_unique_embeddings__text-embedding-3-large_
 
 python 1_build_term_index.py --output $TERMS \
   --obo ENVO=https://raw.githubusercontent.com/EnvironmentOntology/envo/master/envo.obo \
-        UBERON=https://raw.githubusercontent.com/obophenotype/uberon/master/uberon.obo
+        UBERON=https://raw.githubusercontent.com/obophenotype/uberon/master/uberon.obo \
+        PO=https://raw.githubusercontent.com/Planteome/plant-ontology/master/po.obo \
+        FOODON=https://raw.githubusercontent.com/FoodOntology/foodon/master/foodon.owl
+# the current table = the 2026-09-23 ENVO/Uberon table + PO / FOODON (2026-10-05 copies in $P/ontologies):
+#   python 1_build_term_index.py --append $P/ontology_terms_envo_uberon.tsv.gz \
+#     --obo PO=$P/ontologies/po.obo FOODON=$P/ontologies/foodon.owl.gz --output $TERMS
 python 2_build_training_set.py --metalog_dir $P/metalog --sample_info $P/sample.info.gz \
   --ontology_terms $TERMS --output $TRAIN
 python 2b_clean_metalog.py --metalog_dir $P/metalog --ontology_terms $TERMS --training_set $TRAIN \
@@ -108,12 +116,28 @@ python 2b_clean_metalog.py --metalog_dir $P/metalog --ontology_terms $TERMS --tr
 CLEAN=$P/metalog/clean/training_set.clean.tsv.gz; O=$P/ontology_mapping
 python 5_evaluate.py --ontology_terms $TERMS --samples $CLEAN --features $KW $SB --term_vectors $TV \
   --output_dir $O/cv_backoff                                  # writes calibration.json
+for s in 1 2; do                                              # more fold seeds for a pooled calibration
+  python 5_evaluate.py --ontology_terms $TERMS --samples $CLEAN --features $KW $SB --term_vectors $TV \
+    --fold_seed $s --closed_only --output_dir $O/cv_backoff_s$s
+done
 python 6_predict_atlas.py --ontology_terms $TERMS --samples $CLEAN --train_vectors $KW $SB \
   --keywords_texts $L/GPT_keywords.txt --sub_biomes_texts $L/GPT_sub_biomes.txt \
   --keywords_h5 $E/GPT_keywords_unique_embeddings__text-embedding-3-large__dim1024__full.h5 \
   --sub_biomes_h5 $E/GPT_sub_biomes_unique_embeddings__text-embedding-3-large__dim1024__full.h5 \
-  --method prototype --term_vectors $TV --calibration $O/cv_backoff/calibration.json \
-  --target_accuracy 0.9 --accuracy strict --output_dir $O/atlas_backoff
+  --method prototype --term_vectors $TV \
+  --calibration $O/cv_backoff/calibration.json $O/cv_backoff_s1/calibration.json $O/cv_backoff_s2/calibration.json \
+  --target_accuracy 0.9 --accuracy strict --output_dir $O/atlas_backoff   # 4 GB RAM: add --chunk_rows 2000
+# coverage flag (one run serves every atlas method; merge on sample_id), then its validation
+python 6b_coverage.py --samples $CLEAN --train_vectors $KW $SB --fold_groups $P/metalog/clean/project_groups.tsv \
+  --index $O/atlas_backoff/index.npz \
+  --keywords_h5 $E/GPT_keywords_unique_embeddings__text-embedding-3-large__dim1024__full.h5 \
+  --sub_biomes_h5 $E/GPT_sub_biomes_unique_embeddings__text-embedding-3-large__dim1024__full.h5 \
+  --output_dir $O/atlas_coverage                              # rerun until atlas_coverage.tsv.gz is written
+python experiments/coverage_check.py --coverage_dir $O/atlas_coverage --gold_dir $O/experiments/gold_check \
+  --training_set $CLEAN --ontology_terms $TERMS --cv_predictions $O/cv_backoff/predictions.tsv.gz
+# controls and mock communities (no habitat: leave them unlabelled)
+python 6c_flag_controls.py --keywords_texts $L/GPT_keywords.txt --sub_biomes_texts $L/GPT_sub_biomes.txt \
+  --output $O/atlas_controls.tsv.gz
 # optional LLM reranking (needs the Metalog pilot: experiments/rerank_pilot.py, README 7c)
 X=$O/experiments/rerank; R=$O/rerank_atlas
 python 7_rerank_atlas.py fit --pilot $X/pilot_k5anc.jsonl --responses $X/resp_k5anc_gpt-4.1-mini.jsonl \
@@ -135,6 +159,16 @@ python experiments/verify_atlas_methods.py --methods linear prototype --calibrat
 `parse_obo` is a minimal reader for OBO files. It keeps only `[Term]` stanzas whose ID has
 the right prefix, and reads `id`, `name`, `def`, `synonym` (all scopes), `is_a` and
 `is_obsolete`. IDs are written `ENVO_00001998`. List columns are joined with `||`.
+
+- **FOODON** has no OBO release: `parse_owl` reads its OWL (RDF/XML) file the same way: `rdfs:label`
+  (English), every synonym property, `IAO_0000115` (definition), named `rdfs:subClassOf` parents
+  (restrictions are skipped) and `owl:deprecated`. Only `FOODON_` classes are kept (not the
+  NCBITaxon or other imports); their parents can be in other ontologies.
+- **PO** synonyms that are translations (Spanish, Japanese, German synonym types) are skipped, and
+  the scope PO repeats inside the text ("radix (exact)") is removed, so term texts stay English.
+- **`--append`** keeps the rows of an existing table for the ontologies not rebuilt. The current
+  table is the 2026-09-23 ENVO / Uberon table plus PO (1,793 terms) and FOODON (29,255), so the
+  ENVO / Uberon rows, and every result that depends only on them, are unchanged.
 Obsolete terms are kept but flagged. That lets step 2 report obsolete gold labels, and still
 translate obsolete codes that appear in submitter text.
 
@@ -145,7 +179,8 @@ generic words, such as country names, that match noise in the metadata.
 ### Step 2: labelled samples
 
 - **Labels.** Each Metalog long table is pivoted to one row per sample. The first
-  `[ENVO:…]` or `[UBERON:…]` code of each slot becomes the label. A code that is obsolete
+  `[ENVO:…]` or `[UBERON:…]` code of each slot becomes the label (these step-2 labels become the
+  `*_raw` columns of the clean training set; step 2b also keeps PO and FOODON labels). A code that is obsolete
   or not in the term index is blanked, and the number blanked is printed.
   - This blanks the biome of **every human sample**: Metalog uses the obsolete
     `ENVO:00009003`, which has no replacement.
@@ -185,9 +220,14 @@ the linked ones) with the raw values and these flags:
   aliases with different labels, e.g. `Pascelli_2020_sponge_virus`), `duplicate_alias`,
   `artificial_control`.
 - **Labels.** `<slot>_status` is `ok`, `obsolete` (the human biome `ENVO:00009003`),
-  `other_ontology` (PO, FOODON, CL), `not_in_index`, `no_code`, `control_value` or `empty`.
-  `<slot>_clean` is the usable id. `--label_map` (TSV: slot, from_id, to_id, reason) remaps
-  ids, including obsolete and other-ontology ones; raw ids stay in `<slot>_raw`.
+  `other_ontology` (CL: 34 materials), `not_in_index`, `no_code`, `control_value` or `empty`.
+  ENVO, Uberon, PO and FOODON ids are usable (`KEEP_ONTOLOGIES`; PO / FOODON since 2026-10-05:
+  leaf, bark, fermented and dairy food products, milk, lettuce: 465 feature and 128 material labels
+  of linked samples). `<slot>_clean` is the usable id. `--label_map` (TSV: slot, from_id, to_id,
+  reason) remaps ids, including obsolete and other-ontology ones; raw ids stay in `<slot>_raw`.
+  Besides the biome rows, `biome_label_map.tsv` has two material rules: *rhizosphere* (an ENVO
+  ecosystem) and *rhizoplane* (a surface layer) → *soil*, the material the other half of the
+  rhizosphere studies use (130 linked samples).
   `biome_in_biome_subtree` says whether the biome is under ENVO *biome*.
 
 With `--training_set`, it also writes:
@@ -212,16 +252,21 @@ text, so the `.npz` stores each distinct vector once: `vectors[index[i]]` is the
 
 1. Keep samples with at least one label.
 2. Keep samples that have a vector in every `.npz` block.
-3. Shuffle with a fixed seed, then keep at most 50 samples per study. Without this cap, one
-   cohort (for example 1,679 infant-gut samples) would dominate the scores.
+3. Keep at most 50 samples per study: those with the smallest seeded hash of the sample id
+   (`common.stable_key`). Without this cap, one cohort (for example 1,679 infant-gut samples)
+   would dominate the scores. A sample's place does not depend on the other rows, so adding labels
+   keeps every previously selected sample (before 2026-10-05: a seeded shuffle of the whole table,
+   which redrew every study when rows were added).
 
-The result is 17,723 samples from 539 studies.
+The result is 17,720 samples from 539 studies (training_set.clean, 2026-10-05).
 
 **Folds** (`common.study_folds`): 5 folds, and all samples of a study go to the same fold,
-because samples of one study share most of their text. The balancing is the same as
-sklearn's `GroupKFold`, but ties are broken with a fixed seed, so the folds are identical on
-every machine (see *Known issues*). `--fold_seed` picks a different split, which is how the
-noise band in the report was measured.
+because samples of one study share most of their text. A study's fold is its seeded hash mod 5, so
+it does not move when other studies change, and the folds are identical on every machine. Folds are
+not size-balanced (±20 %). `--fold_seed` picks a different split. The split alone moves the biome
+back-off coverage by up to 6 points (0.73–0.79 over 3 seeds), so the atlas calibration pools
+several seeds (see *Calibration and back-off*). Before 2026-10-05 studies were balanced greedily as
+in `GroupKFold`.
 `--fold_groups project_groups.tsv` (from `experiments/project_groups.py`) groups by *project*
 instead: study codes that share a sequencing project (TARA ×4, Stewart 2018/2019, Alneberg
 2018/2020) stay on one side. The evaluated samples are unchanged. With it, biome top-1 of the
@@ -294,6 +339,45 @@ a similarity to every training sample, so it is slower (chunks are capped at 4k 
 - Samples without a sub-biome get only the keyword part of the score.
 - The output has one row per sample: the term, label and confidence (margin) for each slot.
 
+### Step 6b: coverage flag
+
+The atlas models always answer with a Metalog label, including for habitats Metalog has no samples
+of (food, laboratory, insects, plant tissue). `6b_coverage.py` adds, per atlas sample:
+
+- `coverage_sim`: cosine similarity to the nearest of the model's training samples, in the model's
+  feature space `[kw, sb] / √2` (samples without a sub-biome: keyword cosine);
+- `nearest_study`: that training sample's study;
+- `in_coverage`: `coverage_sim` ≥ threshold.
+
+The threshold is the 5th percentile (`--quantile`) of the similarity of each Metalog training sample
+to the training samples of *other* projects (`--fold_groups`), i.e. of how close a new Metalog study
+is to the rest: 0.611. Both are rounded to 4 decimals, so the flag can be recomputed from the output
+file. The flag depends only on the inputs, not on the method.
+
+Cost: one similarity per distinct (keyword, sub-biome) text pair (1.6M for 3.4M samples) against the
+distinct training vectors. Results (`experiments/README.md` §10): 8.6 % of the atlas is flagged;
+flagged feature / material answers are far less reliable, while within Metalog the calibrated
+probability already carries most of the signal.
+
+### Step 6c: controls and mock communities
+
+Blanks, negative controls and mock communities have no habitat. Metalog drops the ones it knows
+(2b, bucket `control`), but the atlas models label every sample, so `6c_flag_controls.py` flags them
+from the GPT texts:
+
+- **sub-biome** `laboratory control / blank / mock / standard`, `mock community`, `negative control`;
+- **strong keyword**: an extraction / PCR / kit / reagent / buffer blank or control, (DNA) blanks,
+  no-template / empty / technical / processing control, ZymoBIOMICS or another community standard;
+- **weak keyword**: negative / positive control, mock community / sample. These also appear in the
+  study context of real samples (an untreated control group, a study that also sequenced a mock),
+  so they count only with a lab-like sub-biome or a lab keyword (synthetic metagenome, sterile water).
+
+`control` alone never counts (`control soil`, `healthy control`). Output: `sample_id, control,
+control_evidence`; leave flagged samples unlabelled. 13,204 atlas samples (0.4 %) are flagged.
+On the linked samples it finds half of Metalog's 58 controls (the others have nothing in their
+metadata that says control), and every other hit is a control Metalog missed (audit hits, probiotic
+positive controls); 37 of 40 random atlas hits are clear controls or mocks (experiments/README.md §12).
+
 ### Calibration and back-off (steps 5 and 6)
 
 Metalog labels sit at different depths of ENVO/Uberon, and a wrong specific term is worse than a
@@ -312,6 +396,11 @@ correct general one. So instead of always giving the top-1, the answer can climb
    counts the gold term or a coarser true term. Lenient accuracy also counts a more specific term
    than Metalog's (a manual review found most of those true). Step 5 reports both with τ chosen on
    the other folds. Step 6 reads τ from `calibration.json` (`--target_accuracy`, `--accuracy`).
+5. **Several fold seeds.** τ and the temperature depend on the fold split (biome coverage at 90 %:
+   0.73 / 0.79 / 0.79 for fold seeds 1 / 0 / 2). Step 6 accepts several `calibration.json` files of
+   the same method and samples (`5_evaluate.py --fold_seed 1 --closed_only`, ...) and pools them
+   (`hierarchy.merge_calibrations`): mean outcome shares per τ, accuracies recomputed, geometric-mean
+   temperature, then one τ. The atlas uses fold seeds 0–2.
 
 Step 6 refuses a calibration fitted with other training settings, and a resumed run whose chunks
 were written with other back-off options (`run_settings.json`). Its new columns per slot:
@@ -383,7 +472,8 @@ each); for biome, about 30 % of the atlas samples, fewer after deduplication.
   convention before relying on it.
 - **Distribution shift.** Every score comes from Metalog-linked samples, which are shotgun
   metagenomes and 56 % human. Most of the atlas is amplicon data from small studies. The atlas
-  labels have not been checked by hand on unlinked studies.
+  labels have not been checked by hand on unlinked studies. `6b_coverage.py` flags the samples
+  farthest from Metalog (8.6 % of the atlas).
 - **`hybrid` weight.** The weight 2 was chosen on this same cross-validation, so the gain of
   `hybrid` is slightly optimistic.
 - **Linked studies.** A few Metalog study codes describe the same project, for example
@@ -392,7 +482,14 @@ each); for biome, about 30 % of the atlas samples, fewer after deduplication.
 - **Folds before 2026-09-24.** Earlier runs used sklearn's `GroupKFold`. Its unstable tie-break
   assigns studies to folds differently on different machines, and that moved scores by up to
   2.6 points (see the report). `study_folds` removes this.
-- **Resume files.** `6_predict_atlas.py` reuses `model.npz`, `index.npz` and `parts/` from its
+- **Results before 2026-10-05 used another sample selection and other folds** (seeded shuffle,
+  size-balanced folds). Re-running an older experiment with the current `common.py` gives slightly
+  different numbers; the old code is in git history. With the old selection, adding the PO / FOODON
+  labels redrew the subsample and moved the biome back-off coverage by 6 points (experiments/README.md
+  §13–14).
+- **Memory on a 4 GB machine.** Run `6_predict_atlas.py` with `--chunk_rows 2000` (the default 20k
+  rows can map to ~250k samples per chunk). The final file is concatenated line by line from the parts.
+- **Resume files.** `6_predict_atlas.py` (and `6b_coverage.py`) reuses `model.npz`, `index.npz` and `parts/` from its
   output directory. Delete the directory after changing any training option.
 - **Accuracy targets are Metalog's.** τ, the reranker's weights and the gate are fitted on
   Metalog-linked studies. Check the back-off accuracy on a few hundred hand-labelled atlas samples

@@ -420,3 +420,179 @@ shared). Generic shared titles ("human gut metagenome Metagenome") are *not* mer
   stably. Ties (majority, kNN vote shares) used to rank differently on the Mac and on Linux, so
   those two metrics differed slightly between machines; top-1 never did.
 
+
+## 10. Out-of-coverage flag (`6b_coverage.py`, `coverage_check.py`, 2026-10-05)
+
+Threshold 0.611 = 5th percentile of the similarity of Metalog training samples to other projects'
+training samples. Output: `~/MicrobeAtlasProject/ontology_mapping/atlas_coverage/`
+(`coverage_check.json` holds the tables below).
+
+**Metalog, out-of-fold (prototype, `cv_backoff`):**
+
+| slot | flagged | top-1 unflagged / flagged | back-off answers unflagged / flagged | back-off accuracy flagged (n) | AUC prob → prob + coverage |
+|---|---|---|---|---|---|
+| biome | 6.9 % | 0.66 / 0.51 | 81 % / 43 % | 0.99 (297) | 0.831 → 0.826 |
+| feature | 5.0 % | 0.67 / 0.09 | 64 % / 5 % | 0.14 (42) | 0.915 → 0.915 |
+| material | 4.7 % | 0.75 / 0.15 | 82 % / 12 % | 0.74 (99) | 0.882 → 0.888 |
+
+**Gold samples outside Metalog (1,021; coarse consistency, lenient):** 19 % flagged.
+
+| gold class | flagged |
+|---|---|
+| other | 32 % |
+| plant | 31 % |
+| animal | 20 % |
+| soil | 6 % |
+| water | 5 % |
+
+| slot | top-1 unflagged / flagged | back-off answers, flagged | back-off consistent unflagged / flagged |
+|---|---|---|---|
+| biome | 0.80 / 0.67 | 35 % | 0.93 / 0.91 |
+| feature | 0.81 / 0.36 | 1 % | 0.88 / 0.50 (n = 2) |
+| material | 0.70 / 0.30 | 9 % | 0.83 / 0.56 (n = 18) |
+
+**Atlas (3,437,058 samples):** 8.6 % flagged. By GPT coarse biome: animal 6.6 %, water 3.2 %,
+soil 3.0 %, plant 25.5 %, other 29.2 %. Flagged samples get a back-off answer for biome / feature /
+material 48 / 3 / 10 % of the time (unflagged 88 / 56 / 66 %), so they are 4.8 / 0.5 / 1.4 % of
+the atlas's answers. Most common nearest studies of flagged samples: JGI_leaf_various,
+Youngblut_2020_animal, Melkonian_2019_fermentation, JGI_beetle_CostaRica, Zhang_2019_rhizosphere.
+
+**Conclusions:**
+- Coverage separates right from wrong feature / material predictions well, but on Metalog the
+  calibrated probability already holds that information, and back-off abstains on most flagged
+  samples.
+- Outside Metalog it marks the habitats Metalog lacks (food, laboratory, insects and other
+  non-mammal animals, plant tissue), where flagged answers are clearly worse. It catches only 9 of
+  the 46 "wrong" answers of the §8 rule review: many missing habitats look like some Metalog study in
+  text (air, bioreactor → wastewater).
+- Use: publish `in_coverage` with the labels; do not count flagged feature / material answers
+  towards the 90 % target.
+- Checks: the same threshold in the cloud and on the Mac; a resumed run, a gold-only run and an
+  independent re-run of 6 chunks give identical rows. A first version used the unrounded threshold in
+  the first invocation and the rounded one after a resume (6 samples at exactly 0.6111 differed); the
+  flag is now always computed from the rounded values, and the final file recomputes it.
+
+## 11. How Metalog labels plant samples (2026-10-05)
+
+2,236 plant-associated Metalog samples (48 studies), 1,112 linked, ~770 after the cap (~4 % of
+training). Material by compartment: rhizosphere → soil (15 studies) or *rhizosphere* (15 studies,
+an ENVO ecosystem, not a material); rhizoplane → soil (4) or *rhizoplane* (1); leaf → *plant matter*
+(5) or leaf [PO] (4); root → *root matter* (4 studies, 19 linked samples); whole plant / tissue →
+*plant matter*. Step 2 drops PO / FOODON values: 317 linked leaf samples lose their feature label.
+
+On the 198 gold plant samples the model follows these conventions (rhizosphere → soil 40 / 47,
+leaf → plant matter 29 / 38) except for roots (→ soil 32 / 33, *root matter* is too rare), and the
+back-off abstains on 82 %. Candidate fixes (not done): material rhizosphere / rhizoplane → soil in
+`2b_clean_metalog.py`; keep PO / FOODON in step 2. Details: `claude/coverage-flag-and-plant-labels.md`.
+
+## 12. Controls and mock communities in the atlas (`6c_flag_controls.py`, 2026-10-05)
+
+Rules: GPT sub-biome (`laboratory control / blank / mock / standard`, `mock community`, `negative
+control`), strong keywords (extraction / PCR / kit / reagent / buffer blank or control, DNA blanks,
+empty / technical / processing control, ZymoBIOMICS, community standards), weak keywords (negative /
+positive control, mock community / sample) only with a lab-like sub-biome or lab keyword.
+
+- **Atlas:** 13,204 samples flagged (0.4 %): 7,458 by sub-biome, 4,129 by a strong keyword, 1,617 by a
+  weak keyword in a lab context. GPT coarse biome of the flagged: other 66 %, water 20 %, animal 12 %.
+  In the 2026-10-01 atlas, 48 % of them got a biome and 24 % a material back-off answer (mostly
+  *animal-associated environment* and *liquid water*).
+- **Against Metalog** (50,100 linked samples): 29 of Metalog's 58 linked controls are flagged; the
+  others have nothing in their metadata (or GPT texts) that says control (e.g. Hannigan_2015 skin
+  virome blanks described as "human skin"). Of the 27 flags on samples Metalog keeps, 11 are audit
+  hits of 2b (unreviewed controls) and 16 are probiotic positive controls (Gaio_2020_pig): all
+  defensible.
+- **Random check:** 37 of 40 flagged atlas samples are clear controls or mocks; 3 are laboratory
+  microcosms built from real organisms ("mock community" of benthic species).
+- A first version that counted every "mock community" / "negative control" keyword also flagged real
+  samples whose study mentions a mock or a control group (pig faeces, seawater eDNA, microcosm
+  controls), hence the weak / strong split.
+
+## 13. PO / FOODON labels and rhizosphere → soil (2026-10-05)
+
+Changes: term table + PO (1,793 terms) and FOODON (29,255; `1_build_term_index.py --append`), 2b keeps
+PO / FOODON labels, label map material rhizosphere / rhizoplane → soil. Linked samples: +465 feature
+labels (leaf 317, oyster food product 60, fermented product 58, fermented dairy 30), +128 material
+labels (fermented dairy 41, leaf 40, fermented vegetable 26, fermented beverage 19, ...), 130
+materials rhizosphere / rhizoplane → soil. After the 50-per-study cap: 225 PO / FOODON feature and
+120 material labels, 17,720 samples (17,640 before).
+
+**Same samples, same folds** (the 17,640 previously selected samples, 3 fold seeds; only labels and
+the open vocabulary differ). Top-1:
+
+| slot | method | all: old → new | GPT-plant samples: old → new | relabelled samples (new) |
+|---|---|---|---|---|
+| biome | closed methods | identical | identical | – |
+| biome | hybrid_open / prototype_open | 0.680 → 0.678 / 0.634 → 0.632 | | |
+| feature | linear / prototype | 0.641 → 0.641 / 0.643 → 0.643 | 0.113 → 0.222 / 0.193 → 0.291 | 0.63 / 0.66 (n = 145) |
+| material | linear / prototype | 0.703 → 0.711 / 0.717 → 0.722 | 0.665 → 0.801 / 0.542 → 0.635 | 0.76 (n = 164) |
+
+Prototype back-off (90 % strict target): material answers 78.4 → 80.2 %, GPT-plant samples 23 → 49 %
+with strict accuracy 0.64 → 0.93. Feature answers 60 → 59 % (the new leaf / food labels are rarely
+confident enough). "Other" (food) samples barely move: FOODON labels come from 5 small studies.
+The open vocabulary now has 49k terms: retrieval_open loses 0.4 / 1.3 points on feature / material.
+
+**Production run** (default cap on the new training set): the extra labelled rows change which 50
+samples per study are drawn (22 % of the selected samples and every fold differ), which moves the
+CV estimates more than the label change: biome prototype back-off coverage 0.787 → 0.728 at fold
+seed 0 (0.758–0.787 across fold seeds on the old selection), although biome labels did not change.
+The atlas follows: biome answers 84.9 → 80.2 %, feature 51.2 → 48.4 %, material 60.9 → 65.6 %.
+
+| atlas back-off answers | biome old → new | feature | material |
+|---|---|---|---|
+| animal | 94.3 → 90.7 % | 73.6 → 70.8 % | 62.2 → 63.2 % |
+| plant | 50.9 → 42.2 % | 0.0 → 0.4 % | 13.1 → 50.9 % |
+| other | 37.5 → 24.5 % | 5.1 → 3.7 % | 15.1 → 16.0 % |
+| soil | 86.7 → 81.5 % | 24.6 → 21.6 % | 92.4 → 93.4 % |
+| water | 79.6 → 75.6 % | 19.9 → 15.0 % | 78.6 → 80.9 % |
+
+Atlas top-1 feature: 75,838 samples get *leaf* (PO) and 26,069 a FOODON term.
+
+**Gold plant samples** (198): feature top-1 *leaf* for 33 of 38 leaf samples (before: forest soil,
+rhizosphere, intestine); material back-off now answers 45 of 48 rhizosphere samples (*soil*, before 10)
+and 16 of 33 root samples (*soil*: *root matter* is still too rare). The gold coarse metric counts
+*soil* as inconsistent with "plant", so its plant material score falls (3 → 0 %) although the answers
+follow the Metalog convention.
+
+**Fixed in §14:** stable sample selection and folds, calibration pooled over fold seeds.
+
+## 14. Stable sample selection and folds, pooled calibration (2026-10-05)
+
+`common.select_samples` keeps per study the 50 samples with the smallest seeded hash of their id, and
+`common.study_folds` puts each study in fold hash mod 5, so neither depends on the other rows.
+`6_predict_atlas.py --calibration` takes several fold seeds and pools them (`hierarchy.merge_calibrations`);
+`5_evaluate.py --closed_only` skips the open-vocabulary methods for those extra runs (~5 min instead of ~25).
+
+**Stability check** (old labels vs PO / FOODON + rhizosphere labels, prototype, 3 fold seeds):
+
+- **Samples:** all 17,640 previously selected samples are kept; the new set adds the 80 that only
+  gained labels (17,720). Every study keeps its fold.
+- **Biome is identical** under both label sets: top-1 0.653 / 0.655 / 0.634 and 90 % coverage
+  0.794 / 0.728 / 0.790 for fold seeds 0 / 1 / 2 (with the old shuffle the label change alone moved it to 0.728).
+- **Material:** top-1 +0.4 points; pooled 90 % coverage 0.792 → 0.799.
+- **Feature:** top-1 −0.2 to −0.3 points (the 80 added samples, leaf and food products, are harder); coverage 0.594 → 0.589.
+
+**The fold split is the larger noise:** biome coverage at 90 % ranges over 0.73–0.79 between fold
+seeds. Pooled over seeds 0–2: τ = 0.825, coverage 0.76 (biome), 0.75 / 0.59 (feature), 0.675 / 0.80
+(material).
+
+**Atlas back-off answers** (2026-10-01 = ENVO/Uberon labels, old selection, fold seed 0 only;
+shuffle = new labels, old selection; stable = new labels, stable selection, pooled seeds 0–2):
+
+| | biome 10-01 / shuffle / stable | feature | material |
+|---|---|---|---|
+| all | 84.9 / 80.2 / 81.8 % | 51.2 / 48.4 / 48.4 % | 60.9 / 65.6 / 66.0 % |
+| animal | 94.3 / 90.7 / 91.9 | 73.6 / 70.8 / 70.5 | 62.2 / 63.2 / 63.5 |
+| plant | 50.9 / 42.2 / 45.3 | 0.0 / 0.4 / 0.4 | 13.1 / 50.9 / 51.9 |
+| other | 37.5 / 24.5 / 28.2 | 5.1 / 3.7 / 3.9 | 15.1 / 16.0 / 17.2 |
+| soil | 86.7 / 81.5 / 83.6 | 24.6 / 21.6 / 22.0 | 92.4 / 93.4 / 93.8 |
+| water | 79.6 / 75.6 / 77.2 | 19.9 / 15.0 / 16.0 | 78.6 / 80.9 / 81.8 |
+
+The 2026-10-01 biome figure came from a single fold seed whose coverage (0.787) was at the top of the
+range. The pooled calibration is the less optimistic, more reproducible choice; its 90 % target is
+met on average over splits, not on the luckiest one.
+
+**Gold check** (1,021 gold samples outside Metalog, back-off answered / coarse-consistent):
+biome 64.3 / 92.5 % → 57.9 / 93.2 %, feature 18.0 / 87.5 % → 16.4 / 89.2 %, material 43.2 / 82.1 %
+→ 50.0 / 73.8 % (the drop is rhizosphere → *soil*, which the coarse metric counts as not "plant").
+Coverage flag: 8.5 % of the atlas, threshold 0.612. Control flag unchanged (13,204 samples).
+

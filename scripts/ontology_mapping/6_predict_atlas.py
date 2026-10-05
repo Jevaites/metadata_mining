@@ -28,7 +28,8 @@ winner's vote share for knn_study): use that method's margin_for_90pct_precision
 decide which labels to trust.
 
 Calibrated probabilities and hierarchical back-off (--calibration, linear and prototype): with the
-calibration.json that 5_evaluate.py wrote for the same method and training settings, every slot also
+calibration.json that 5_evaluate.py wrote for the same method and training settings (or several, one
+per --fold_seed, pooled so that tau does not depend on one fold assignment), every slot also
 gets (hierarchy.py; claude/hierarchical-backoff-results.md):
   <slot>_p              calibrated probability of the top-1 term (softmax of the scores / temperature)
   <slot>_backoff        the most specific term, among the top-1 and its broader terms that Metalog uses
@@ -106,6 +107,8 @@ def train_models(args, model_path):
         if not args.term_vectors:
             raise SystemExit("--method prototype needs --term_vectors")
         terms = load_terms(args.ontology_terms)
+        used = set(np.concatenate([samples[slot].to_numpy() for slot in SLOTS])) - {""}
+        terms = terms[terms["term_id"].isin(used)].reset_index(drop=True)  # only the labels: 49k terms do not fit
         term_row = {t: i for i, t in enumerate(terms["term_id"])}
         tv = load_term_vectors(args.term_vectors, list(terms["text"]))
         term_matrix = BLOCK_WEIGHT * np.hstack([tv, tv])  # term side, weighted as in 5_evaluate.build_features()
@@ -176,7 +179,7 @@ def load_backoff(args, model, terms, out_dir):
     The settings must match the model's; run_settings.json in --output_dir stops a resumed run from
     mixing chunks written with other back-off settings."""
     import json
-    run = {"calibration": os.path.abspath(path(args.calibration)) if args.calibration else None,
+    run = {"calibration": [os.path.abspath(path(p)) for p in args.calibration] if args.calibration else None,
            "target_accuracy": args.target_accuracy, "accuracy": args.accuracy, "topk": args.topk,
            "max_candidates": args.max_candidates}
     settings_path = os.path.join(out_dir, "run_settings.json")
@@ -193,23 +196,28 @@ def load_backoff(args, model, terms, out_dir):
         return None
     if args.method == "knn_study":
         raise SystemExit("--calibration needs --method linear or prototype (knn_study has no scores to calibrate)")
-    calibration = json.load(open(path(args.calibration)))
+    calibrations = [json.load(open(path(p))) for p in args.calibration]
     anc = ancestor_sets({t: set(p.split("||")) for t, p in zip(terms["term_id"], terms["parents"]) if p})
     out = {}
     for slot in SLOTS:
-        if args.method not in calibration.get(slot, {}):
-            raise SystemExit(f"{args.calibration} has no {args.method} calibration for {slot}: "
-                             f"run 5_evaluate.py with --backoff_methods {args.method}")
-        c = calibration[slot][args.method]
-        st = c["settings"]
-        mismatch = [f"{k}={st[k]} (here {v})" for k, v in
-                    [("max_per_study", args.max_per_study), ("seed", args.seed)] +
-                    ([("prototype_alpha", args.prototype_alpha), ("prototype_beta", args.prototype_beta)]
-                     if args.method == "prototype" else []) if st.get(k) != v]
-        if mismatch:
-            raise SystemExit(f"{args.calibration} was fitted with other settings: {', '.join(mismatch)}")
-        if os.path.abspath(path(st["samples"])) != os.path.abspath(path(args.samples)):
-            print(f"warning: calibration fitted on {st['samples']}, training on {args.samples}")
+        entries = []
+        for p, calibration in zip(args.calibration, calibrations):
+            if args.method not in calibration.get(slot, {}):
+                raise SystemExit(f"{p} has no {args.method} calibration for {slot}: "
+                                 f"run 5_evaluate.py with --backoff_methods {args.method}")
+            st = calibration[slot][args.method]["settings"]
+            mismatch = [f"{k}={st[k]} (here {v})" for k, v in
+                        [("max_per_study", args.max_per_study), ("seed", args.seed)] +
+                        ([("prototype_alpha", args.prototype_alpha), ("prototype_beta", args.prototype_beta)]
+                         if args.method == "prototype" else []) if st.get(k) != v]
+            if mismatch:
+                raise SystemExit(f"{p} was fitted with other settings: {', '.join(mismatch)}")
+            if st.get("n_samples") != calibrations[0][slot][args.method]["settings"].get("n_samples"):
+                raise SystemExit(f"{p} was fitted on another number of samples than {args.calibration[0]}")
+            if os.path.abspath(path(st["samples"])) != os.path.abspath(path(args.samples)):
+                print(f"warning: calibration fitted on {st['samples']}, training on {args.samples}")
+            entries.append(calibration[slot][args.method])
+        c = hierarchy.merge_calibrations(entries)  # several fold seeds: pooled curve, one tau
         tau = hierarchy.choose_tau(c["curve"], args.target_accuracy, f"accuracy_{args.accuracy}")
         row = next(r for r in c["curve"] if r["tau"] == tau)
         print(f"{slot}: temperature {c['temperature']:.4f}, tau {tau} -> out-of-fold coverage {row['coverage']:.2f}, "
@@ -255,9 +263,10 @@ def main():
     parser.add_argument("--knn_study_k", type=int, default=50, help="As in 5_evaluate.py")
     parser.add_argument("--max_per_study", type=int, default=50, help="Same cap as the evaluation (0 = all)")
     parser.add_argument("--seed", type=int, default=22, help="Same seed as the evaluation")
-    parser.add_argument("--calibration", default=None,
+    parser.add_argument("--calibration", nargs="+", default=None,
                         help="calibration.json of 5_evaluate.py (same method and settings): adds probabilities, "
-                             "the back-off term and the top-k columns")
+                             "the back-off term and the top-k columns. Several files (runs with other "
+                             "--fold_seed) are pooled: one tau from the mean curve (hierarchy.merge_calibrations)")
     parser.add_argument("--target_accuracy", type=float, default=0.9, help="Back-off: out-of-fold accuracy to reach")
     parser.add_argument("--accuracy", choices=["strict", "lenient"], default="strict",
                         help="strict: gold or a coarser true term; lenient: also a more specific term")
@@ -370,8 +379,27 @@ def main():
 
     final = os.path.join(out_dir, "atlas_predictions.tsv.gz")
     parts = sorted(glob.glob(os.path.join(out_dir, "parts", "rows_*.tsv.gz")))
-    pd.concat(read_tsv(p) for p in parts).to_csv(final, sep="\t", index=False, compression="gzip")
+    concat_parts(parts, final)
     print(f"Wrote {final}")
+
+
+def concat_parts(parts, final):
+    """Concatenate the chunk TSVs line by line (header once): the 3.4M-row table does not have to
+    fit in memory, and the text is the same as the parts'."""
+    import gzip
+    import shutil
+    header = None
+    with gzip.open(final + ".tmp", "wt", compresslevel=3) as out:  # level 9 takes minutes for 3.4M rows
+        for p in parts:
+            with gzip.open(p, "rt") as part:
+                first = part.readline()
+                if header is None:
+                    header = first
+                    out.write(first)
+                elif first != header:
+                    raise SystemExit(f"{p} has other columns than {parts[0]}: use another --output_dir")
+                shutil.copyfileobj(part, out)
+    os.replace(final + ".tmp", final)
 
 
 if __name__ == "__main__":

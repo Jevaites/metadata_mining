@@ -31,7 +31,7 @@ Main flag columns:
   in_gold_eval       in_train, bucket none, no unreviewed audit hit. Use the same subset for
                      composition / relative-abundance work.
   <slot>_status      ok | obsolete | not_in_index | other_ontology | no_code | control_value | empty
-  <slot>_clean       the usable ENVO/UBERON id after --label_map ("" when unusable)
+  <slot>_clean       the usable ENVO / UBERON / PO / FOODON id after --label_map ("" when unusable)
   biome_in_biome_subtree  True when the clean biome is ENVO 'biome' (ENVO_00000428) or below it
 
 Review loop:
@@ -76,7 +76,7 @@ BUCKET_OF = {
     "paleosample": "degraded", "post-mortem": "degraded", "museum specimen": "degraded",
 }
 DECISIONS = {"control", "perturbed", "degraded", "ok"}
-KEEP_ONTOLOGIES = {"ENVO", "UBERON"}
+KEEP_ONTOLOGIES = {"ENVO", "UBERON", "PO", "FOODON"}  # labels from other ontologies (CL) are unusable
 BIOME_ROOT = "ENVO_00000428"
 CODE = re.compile(r"\[([A-Za-z]+):(\d+)\]")  # "soil [ENVO:00001998]", "leaf [PO:0025034]"
 CONTROL_VALUES = {"negative control", "mock", "blank", "control"}
@@ -354,7 +354,7 @@ def write_summary(p, date, samples, review, n_overrides, ts_info):
              "## Hard drops (drop_reason)", "", "| reason | samples |", "|---|---|", counts(samples["drop_reason"]), "",
              "## Artificial bucket", "", "| bucket | samples |", "|---|---|", counts(samples["artificial_bucket"]), "",
              f"Samples changed by overrides: {n_overrides:,}. "
-             f"Controls that still carry an ENVO/Uberon label (copied from the study default, or 'mock community culture'): {int(samples['control_has_habitat_label'].sum()):,}.", "",
+             f"Controls that still carry a usable label (copied from the study default, or 'mock community culture'): {int(samples['control_has_habitat_label'].sum()):,}.", "",
              "## Audit (unflagged samples that look artificial)", "",
              f"{int(samples['audit_unreviewed'].sum()):,} unreviewed samples, {len(review):,} study x category rows "
              "in audit_review.tsv.", "",
