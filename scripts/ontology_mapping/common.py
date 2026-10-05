@@ -5,6 +5,7 @@ Keeping these in one place guarantees that every script sees the same terms,
 the same term text, and above all the same evaluation samples.
 """
 
+import json
 import os
 
 import numpy as np
@@ -21,6 +22,44 @@ def path(p):
 def read_tsv(p):
     """Read a TSV as strings; empty cells stay "" (never NaN)."""
     return pd.read_csv(path(p), sep="\t", dtype=str, keep_default_na=False)
+
+
+def file_signature(p):
+    """Small provenance record for a pipeline input.
+
+    Hashing a multi-gigabyte embedding file on every resume would be wasteful.  Path, byte size and
+    nanosecond modification time are enough to catch the practical failure mode here: reusing an
+    output directory after replacing an input file or changing machines/paths.
+    """
+    p = os.path.abspath(path(p))
+    stat = os.stat(p)
+    return {"path": p, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
+def ensure_settings(settings_path, settings, cached_artifacts=()):
+    """Write run settings once, or refuse to mix cached artifacts from a different run.
+
+    ``cached_artifacts`` protects output directories created by an older version that did not
+    write a manifest.  Such files cannot be proven compatible, so the caller must use a new output
+    directory instead of silently adopting them.
+    """
+    if os.path.exists(settings_path):
+        with open(settings_path) as handle:
+            previous = json.load(handle)
+        if previous != settings:
+            raise SystemExit(
+                f"{settings_path} belongs to a different run. Use a new output directory, "
+                "or remove that directory only after preserving any results you need."
+            )
+        return
+    existing = [p for p in cached_artifacts if os.path.exists(p)]
+    if existing:
+        raise SystemExit(
+            f"{settings_path} is missing but cached artifacts already exist ({existing[:3]}). "
+            "Use a new output directory."
+        )
+    with open(settings_path, "w") as handle:
+        json.dump(settings, handle, indent=1)
 
 
 # ----------------------------------------------------------------------------- ontology terms

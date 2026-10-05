@@ -1,5 +1,9 @@
 # Ontology mapping prototype (MicrobeAtlas → ENVO / Uberon)
 
+For the reviewed results and recommendations, see the
+[visual prototype report](../../docs/ontology-mapping-review.html) and the
+[future-work roadmap](../../docs/ontology-mapping-future-work.md).
+
 Gives every MicrobeAtlas sample one ontology term for each of the three Metalog slots, plus a
 confidence score. Terms are ENVO / Uberon, and PO (plant anatomy) / FOODON (food) where Metalog
 uses them (leaf, fermented food products, milk):
@@ -188,6 +192,9 @@ generic words, such as country names, that match noise in the metadata.
 - **Linking.** A MicrobeAtlas record is linked when its own ID, or any BioSample/SRA
   accession it contains, equals Metalog's `spire_sample_name`. Result: 58,365 records linked
   to 57,874 Metalog samples in 552 studies.
+- **Snapshot selection.** Step 2 uses the latest complete dated Metalog snapshot by default.
+  Pass `--date YYYY-MM-DD` to reproduce an older snapshot. It never merges snapshots from the
+  same directory.
 - **Text** (`record_to_text`). The text is used only by the `tfidf` features.
   - The `sample_` and `study_` prefixes are removed from the keys.
   - Identifier, date and coordinate keys are dropped (`DROP_KEYS`). They carry no meaning
@@ -403,7 +410,9 @@ correct general one. So instead of always giving the top-1, the answer can climb
    temperature, then one τ. The atlas uses fold seeds 0–2.
 
 Step 6 refuses a calibration fitted with other training settings, and a resumed run whose chunks
-were written with other back-off options (`run_settings.json`). Its new columns per slot:
+were written with other inputs or options (`run_settings.json`). The manifest fingerprints the
+input files and records the model, feature, calibration, chunk, and back-off settings, preventing
+silent mixtures of chunks from different runs. Its new columns per slot:
 `_p` (calibrated top-1 probability), `_backoff`, `_backoff_label`, `_backoff_p` (summed probability),
 `_backoff_kind` (`top1`, `coarser`, `abstain`) and `_candidates` (top-5 + their broader slot labels
 with probabilities, for step 7).

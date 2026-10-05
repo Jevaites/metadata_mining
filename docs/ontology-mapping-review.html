@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MicrobeAtlas ontology mapping — prototype review</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: light-dark(#f5f7f6, #101514);
+      --surface: light-dark(#ffffff, #17201e);
+      --surface-2: light-dark(#eef3f1, #202b28);
+      --text: light-dark(#17211e, #edf5f2);
+      --muted: light-dark(#5b6c66, #a5b6b0);
+      --line: light-dark(#d7e1dd, #33413d);
+      --accent: light-dark(#087f5b, #5fd0a8);
+      --accent-soft: light-dark(#dff5ed, #173d31);
+      --warn: light-dark(#a65f00, #f2bb62);
+      --danger: light-dark(#b23a3a, #ff8b8b);
+      --blue: light-dark(#2d6cdf, #78a8ff);
+      --shadow: 0 14px 40px light-dark(#20352b12, #00000033);
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 15px/1.55 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    a { color: var(--accent); }
+    .shell { width: min(1180px, calc(100% - 32px)); margin: 32px auto 72px; }
+    .hero {
+      padding: 34px;
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      background: linear-gradient(135deg, var(--surface), var(--accent-soft));
+      box-shadow: var(--shadow);
+    }
+    .eyebrow { color: var(--accent); font-weight: 700; letter-spacing: .08em; text-transform: uppercase; font-size: 12px; }
+    h1 { max-width: 820px; margin: 8px 0 10px; font-size: clamp(30px, 5vw, 52px); line-height: 1.04; letter-spacing: -.04em; }
+    h2 { margin: 0 0 16px; font-size: 27px; letter-spacing: -.02em; }
+    h3 { margin: 0 0 10px; font-size: 18px; }
+    p { margin: 0 0 12px; }
+    .lede { max-width: 850px; color: var(--muted); font-size: 18px; }
+    .chips, .tabs { display: flex; flex-wrap: wrap; gap: 8px; }
+    .chips { margin-top: 22px; }
+    .chip { padding: 6px 10px; border-radius: 999px; background: var(--surface); border: 1px solid var(--line); font-size: 13px; }
+    .tabs { position: sticky; top: 0; z-index: 5; margin: 22px 0; padding: 10px; border: 1px solid var(--line); border-radius: 16px; background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: blur(14px); }
+    .tab { border: 0; border-radius: 10px; padding: 9px 13px; background: transparent; color: var(--muted); font: inherit; font-weight: 650; cursor: pointer; }
+    .tab[aria-selected="true"] { background: var(--text); color: var(--bg); }
+    [role="tabpanel"][hidden] { display: none; }
+    .panel { display: grid; gap: 18px; }
+    .grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 16px; }
+    .card { grid-column: span 4; padding: 20px; border: 1px solid var(--line); border-radius: 18px; background: var(--surface); box-shadow: var(--shadow); }
+    .card.wide { grid-column: span 12; }
+    .card.half { grid-column: span 6; }
+    .stat { font-size: 32px; line-height: 1; font-weight: 760; letter-spacing: -.035em; }
+    .label { margin-top: 7px; color: var(--muted); font-size: 13px; }
+    .verdict { border-left: 5px solid var(--accent); }
+    .warning { border-left: 5px solid var(--warn); }
+    .danger { border-left: 5px solid var(--danger); }
+    .callout { padding: 16px 18px; border-radius: 14px; background: var(--accent-soft); }
+    .muted { color: var(--muted); }
+    .small { font-size: 13px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 10px 9px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); }
+    th { color: var(--muted); font-size: 12px; letter-spacing: .04em; text-transform: uppercase; }
+    td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .table-wrap { overflow-x: auto; }
+    .flow { display: grid; grid-template-columns: repeat(7, 1fr); align-items: stretch; gap: 8px; }
+    .step { padding: 14px 11px; border-radius: 13px; background: var(--surface-2); text-align: center; font-size: 13px; }
+    .step strong { display: block; margin-bottom: 4px; color: var(--accent); }
+    .arrow { display: none; }
+    .bars { display: grid; gap: 12px; }
+    .bar-row { display: grid; grid-template-columns: 155px 1fr 52px; gap: 10px; align-items: center; }
+    .track { height: 12px; border-radius: 999px; background: var(--surface-2); overflow: hidden; }
+    .fill { height: 100%; width: calc(var(--v) * 1%); background: var(--accent); border-radius: inherit; }
+    .fill.blue { background: var(--blue); }
+    .bar-value { text-align: right; font-variant-numeric: tabular-nums; }
+    .legend { display: flex; gap: 16px; flex-wrap: wrap; color: var(--muted); font-size: 13px; }
+    .dot { display: inline-block; width: 10px; height: 10px; margin-right: 5px; border-radius: 50%; background: var(--accent); }
+    .dot.blue { background: var(--blue); }
+    .status { display: inline-block; padding: 2px 7px; border-radius: 999px; font-size: 12px; font-weight: 700; }
+    .fixed { background: var(--accent-soft); color: var(--accent); }
+    .open { background: color-mix(in srgb, var(--warn) 16%, transparent); color: var(--warn); }
+    details { border-top: 1px solid var(--line); padding: 11px 0; }
+    details:first-of-type { border-top: 0; }
+    summary { cursor: pointer; font-weight: 680; }
+    details p { margin: 8px 0 2px; color: var(--muted); }
+    code { padding: 1px 5px; border-radius: 5px; background: var(--surface-2); font-size: .92em; }
+    .question-group { padding: 20px; border: 1px solid var(--line); border-radius: 18px; background: var(--surface); }
+    .badge { margin-left: 7px; color: var(--muted); font-size: 11px; font-weight: 600; text-transform: uppercase; }
+    .foot { margin-top: 26px; color: var(--muted); font-size: 12px; }
+    @media (max-width: 820px) {
+      .card, .card.half { grid-column: span 12; }
+      .flow { grid-template-columns: 1fr 1fr; }
+      .bar-row { grid-template-columns: 115px 1fr 46px; }
+      .hero { padding: 24px; }
+    }
+    @media (max-width: 520px) {
+      .shell { width: min(100% - 18px, 1180px); margin-top: 10px; }
+      .flow { grid-template-columns: 1fr; }
+      .tabs { position: static; }
+      .bar-row { grid-template-columns: 1fr 44px; }
+      .bar-row .track { grid-column: 1 / -1; grid-row: 2; }
+    }
+  </style>
+</head>
+<body>
+<main class="shell">
+  <header class="hero">
+    <div class="eyebrow">Prototype review · 5 October 2026</div>
+    <h1>MicrobeAtlas metadata → ontology terms</h1>
+    <p class="lede">The prototype is scientifically useful as a <strong>closed-vocabulary, calibrated label-transfer system</strong>. It is not yet evidence that exact ontology mapping generalises beyond Metalog. The strongest result is reliable ranking and selective prediction; the largest risk is habitat coverage and label convention shift.</p>
+    <div class="chips" aria-label="Key facts">
+      <span class="chip">3,437,058 Atlas samples with keyword text</span>
+      <span class="chip">58,365 Atlas↔Metalog links</span>
+      <span class="chip">17,720 capped training samples</span>
+      <span class="chip">ENVO · Uberon · PO · FOODON</span>
+      <span class="chip">Study-grouped 5-fold CV</span>
+    </div>
+  </header>
+
+  <nav class="tabs" role="tablist" aria-label="Report sections">
+    <button class="tab" id="tab-overview" role="tab" aria-controls="overview" aria-selected="true">Overview</button>
+    <button class="tab" id="tab-system" role="tab" aria-controls="system" aria-selected="false">System</button>
+    <button class="tab" id="tab-results" role="tab" aria-controls="results" aria-selected="false">Results</button>
+    <button class="tab" id="tab-validation" role="tab" aria-controls="validation" aria-selected="false">Validation</button>
+    <button class="tab" id="tab-review" role="tab" aria-controls="review" aria-selected="false">Code review</button>
+    <button class="tab" id="tab-questions" role="tab" aria-controls="questions" aria-selected="false">Critical Q&amp;A</button>
+  </nav>
+
+  <section id="overview" class="panel" role="tabpanel" aria-labelledby="tab-overview">
+    <div class="grid">
+      <article class="card verdict half">
+        <h3>What works</h3>
+        <p>GPT-derived keyword and sub-biome embeddings transfer common Metalog labels substantially better than TF–IDF or zero-shot term retrieval. Calibrated hierarchy back-off trades coverage for accuracy and confidence ranks errors well.</p>
+      </article>
+      <article class="card warning half">
+        <h3>What remains unproven</h3>
+        <p>Exact-term accuracy on new habitat families. The external set has coarse biome labels only; open-vocabulary unseen-label recovery is near zero for the supervised models.</p>
+      </article>
+      <article class="card"><div class="stat">0.653</div><div class="label">Prototype exact biome top-1, Metalog CV</div></article>
+      <article class="card"><div class="stat">0.627</div><div class="label">Prototype exact feature top-1, Metalog CV</div></article>
+      <article class="card"><div class="stat">0.726</div><div class="label">Prototype exact material top-1, Metalog CV</div></article>
+      <article class="card wide">
+        <h2>Recommendation</h2>
+        <p class="callout"><strong>Present the system as calibrated ontology label transfer, not general ontology understanding.</strong> Ship the term, probability, ancestor/back-off decision, coverage flag and control flag together. Do not claim the 90% exact target outside Metalog until an exact-term external benchmark exists.</p>
+      </article>
+      <article class="card wide">
+        <h2>Evidence hierarchy</h2>
+        <div class="flow" aria-label="Evidence progression">
+          <div class="step"><strong>Baseline</strong>Majority / TF–IDF</div>
+          <div class="step"><strong>Embeddings</strong>Keywords + sub-biome</div>
+          <div class="step"><strong>Supervision</strong>Linear / study-kNN</div>
+          <div class="step"><strong>Ontology side</strong>Prototype + prior</div>
+          <div class="step"><strong>Selective</strong>Calibration + back-off</div>
+          <div class="step"><strong>Guardrails</strong>Coverage + controls</div>
+          <div class="step"><strong>Pilot</strong>LLM reranking</div>
+        </div>
+      </article>
+    </div>
+  </section>
+
+  <section id="system" class="panel" role="tabpanel" aria-labelledby="tab-system" hidden>
+    <div class="grid">
+      <article class="card wide">
+        <h2>End-to-end data flow</h2>
+        <div class="flow">
+          <div class="step"><strong>1 · Terms</strong>Flatten pinned ontology releases</div>
+          <div class="step"><strong>2 · Silver data</strong>Join Atlas accessions to Metalog</div>
+          <div class="step"><strong>3 · Features</strong>Lookup keyword + sub-biome vectors</div>
+          <div class="step"><strong>4 · Evaluate</strong>Project/study-held-out folds</div>
+          <div class="step"><strong>5 · Calibrate</strong>Temperature + hierarchy threshold</div>
+          <div class="step"><strong>6 · Predict</strong>Stream 3.44M samples</div>
+          <div class="step"><strong>7 · Guard</strong>Coverage, controls, optional rerank</div>
+        </div>
+      </article>
+      <article class="card half">
+        <h3>One sample, concretely</h3>
+        <p><code>isolation_source: feces; host: Homo sapiens</code></p>
+        <p class="muted">Upstream extraction might yield keywords <code>{feces, gut, human}</code> and sub-biome <code>human gut</code>. Each is embedded and L2-normalised; the two blocks receive equal weight. Three slot-specific models then predict, for example, biome <code>animal-associated environment</code>, feature <code>intestine environment</code>, and material <code>fecal material</code>.</p>
+      </article>
+      <article class="card half">
+        <h3>Recommended model</h3>
+        <p>A class prototype blends the centred term vector with the centroid of training samples carrying that term, then adds a log label-frequency prior. This corrects the sample/term “modality gap” and Metalog’s conventional preference for a few labels.</p>
+        <p class="small muted">Important: the final model is closed-vocabulary. “Open” prototype variants almost never recover a label absent from the training fold.</p>
+      </article>
+      <article class="card wide">
+        <h3>Data contracts</h3>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Artifact</th><th>Required fields</th><th>Invariant</th></tr></thead>
+          <tbody>
+            <tr><td>Term table</td><td>term_id, label, synonyms, definition, parents, obsolete</td><td>Non-obsolete output labels must exist in this version</td></tr>
+            <tr><td>Training set</td><td>sample_id, study_code, domain, biome, feature, material, text</td><td>At least one non-empty slot; one explicit Metalog snapshot</td></tr>
+            <tr><td>Feature NPZ</td><td>sample_ids, vectors, index</td><td><code>vectors[index[i]]</code> belongs to <code>sample_ids[i]</code></td></tr>
+            <tr><td>Calibration</td><td>temperature, risk/coverage curve, settings</td><td>Same samples, cap, seed and model hyperparameters</td></tr>
+            <tr><td>Atlas output</td><td>term, confidence, p, backoff, candidates</td><td>Run manifest matches every cached model/index/chunk input</td></tr>
+          </tbody>
+        </table></div>
+      </article>
+      <article class="card wide small muted">
+        <strong>Ontology fit.</strong> ENVO explicitly covers biomes, environmental features and materials; Uberon supplies multi-species anatomy. Metalog’s publication confirms manual curation and use of ENVO/Uberon, while also warning that evolving ontologies do not always provide exact matches. Sources: <a href="https://academic.oup.com/nar/article/54/D1/D826/8307355">Metalog paper</a>, <a href="https://github.com/EnvironmentOntology/envo">ENVO</a>, <a href="https://obophenotype.github.io/uberon/current_release/">Uberon</a>, <a href="https://microbeatlas.org/download">MicrobeAtlas downloads</a>.
+      </article>
+    </div>
+  </section>
+
+  <section id="results" class="panel" role="tabpanel" aria-labelledby="tab-results" hidden>
+    <div class="grid">
+      <article class="card wide">
+        <h2>Progression: exact top-1</h2>
+        <p class="muted small">Comparable raw-label runs for the first four stages; the cleaned prototype uses remapped/expanded labels and is shown separately below.</p>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Method / features</th><th class="num">Biome</th><th class="num">Feature</th><th class="num">Material</th></tr></thead>
+          <tbody>
+            <tr><td>Majority</td><td class="num">0.274</td><td class="num">0.477</td><td class="num">0.448</td></tr>
+            <tr><td>TF–IDF + linear</td><td class="num">0.455</td><td class="num">0.611</td><td class="num">0.680</td></tr>
+            <tr><td>Keyword embedding + linear</td><td class="num">0.505</td><td class="num">0.625</td><td class="num">0.705</td></tr>
+            <tr><td>Keyword + sub-biome + linear</td><td class="num">0.526</td><td class="num">0.631</td><td class="num">0.707</td></tr>
+          </tbody>
+        </table></div>
+      </article>
+      <article class="card half">
+        <h3>Cleaned prototype: micro vs macro accuracy</h3>
+        <div class="bars">
+          <div class="bar-row"><span>Biome · micro</span><div class="track"><div class="fill" style="--v:65.27"></div></div><span class="bar-value">65.3%</span></div>
+          <div class="bar-row"><span>Biome · macro</span><div class="track"><div class="fill blue" style="--v:26.16"></div></div><span class="bar-value">26.2%</span></div>
+          <div class="bar-row"><span>Feature · micro</span><div class="track"><div class="fill" style="--v:62.67"></div></div><span class="bar-value">62.7%</span></div>
+          <div class="bar-row"><span>Feature · macro</span><div class="track"><div class="fill blue" style="--v:7.90"></div></div><span class="bar-value">7.9%</span></div>
+          <div class="bar-row"><span>Material · micro</span><div class="track"><div class="fill" style="--v:72.59"></div></div><span class="bar-value">72.6%</span></div>
+          <div class="bar-row"><span>Material · macro</span><div class="track"><div class="fill blue" style="--v:7.41"></div></div><span class="bar-value">7.4%</span></div>
+        </div>
+        <div class="legend"><span><i class="dot"></i>micro</span><span><i class="dot blue"></i>mean per label</span></div>
+        <p class="small muted">This is the central scientific caveat: frequent gut/fecal terms dominate the headline number.</p>
+      </article>
+      <article class="card half">
+        <h3>90% strict-target back-off</h3>
+        <div class="bars">
+          <div class="bar-row"><span>Biome answered</span><div class="track"><div class="fill" style="--v:79.25"></div></div><span class="bar-value">79.3%</span></div>
+          <div class="bar-row"><span>Biome accuracy</span><div class="track"><div class="fill blue" style="--v:89.74"></div></div><span class="bar-value">89.7%</span></div>
+          <div class="bar-row"><span>Feature answered</span><div class="track"><div class="fill" style="--v:59.50"></div></div><span class="bar-value">59.5%</span></div>
+          <div class="bar-row"><span>Feature accuracy</span><div class="track"><div class="fill blue" style="--v:90.35"></div></div><span class="bar-value">90.4%</span></div>
+          <div class="bar-row"><span>Material answered</span><div class="track"><div class="fill" style="--v:80.76"></div></div><span class="bar-value">80.8%</span></div>
+          <div class="bar-row"><span>Material accuracy</span><div class="track"><div class="fill blue" style="--v:90.38"></div></div><span class="bar-value">90.4%</span></div>
+        </div>
+        <p class="small muted">Cross-fitted, study-grouped CV. Fold-to-fold biome coverage spans roughly 0.73–0.79; pooled calibration is preferred.</p>
+      </article>
+      <article class="card wide">
+        <h2>External gold check: precision transfers better than coverage</h2>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Slot</th><th class="num">Top-1 strict</th><th class="num">Top-1 lenient</th><th class="num">Back-off answered</th><th class="num">Back-off strict</th><th class="num">Back-off lenient</th></tr></thead>
+          <tbody>
+            <tr><td>Biome</td><td class="num">56.9%</td><td class="num">77.4%</td><td class="num">57.9%</td><td class="num">69.5%</td><td class="num">93.2%</td></tr>
+            <tr><td>Feature</td><td class="num">75.3%</td><td class="num">75.9%</td><td class="num">16.4%</td><td class="num">88.6%</td><td class="num">89.2%</td></tr>
+            <tr><td>Material</td><td class="num">62.5%</td><td class="num">63.0%</td><td class="num">50.0%</td><td class="num">73.8%</td><td class="num">73.8%</td></tr>
+          </tbody>
+        </table></div>
+        <p class="small muted">1,021 samples outside Metalog, evaluated after mapping terms to coarse gold classes. This validates coarse compatibility, not exact-term correctness. Plant and “other” habitats are the main failure modes.</p>
+      </article>
+      <article class="card half">
+        <h3>Coverage detector</h3>
+        <p><strong>8.6%</strong> of the Atlas is flagged outside Metalog-like coverage. On the external gold set, <strong>18.8%</strong> is flagged; rates are ~32% for plant/other versus ~5–6% for soil/water.</p>
+        <p class="muted">The flag is useful provenance, but probability already captures much of the same signal in Metalog. Publish both; do not count flagged feature/material answers toward the 90% claim.</p>
+      </article>
+      <article class="card half">
+        <h3>LLM reranking</h3>
+        <p>The 500-biome pilot increases nested-CV coverage from 43.0% to 51.2%, but strict accuracy falls from 90.2% to 89.1%. Feature gets no gain; material improves in the pilot but is disabled in the saved production parameters.</p>
+        <p class="muted">Conclusion: an interesting targeted experiment, not a demonstrated production improvement.</p>
+      </article>
+    </div>
+  </section>
+
+  <section id="validation" class="panel" role="tabpanel" aria-labelledby="tab-validation" hidden>
+    <div class="grid">
+      <article class="card"><div class="stat">6 / 6</div><div class="label">New regression tests pass</div></article>
+      <article class="card"><div class="stat">100%</div><div class="label">Top-1 equivalence: evaluation ↔ streamed predictor, 50,100 samples</div></article>
+      <article class="card"><div class="stat">3.44M</div><div class="label">Full corrected Atlas predictions rerun</div></article>
+      <article class="card wide">
+        <h2>Reproduction findings</h2>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Check</th><th>Result</th></tr></thead>
+          <tbody>
+            <tr><td>Training-set rebuild</td><td>58,365 rows; decompressed output byte-identical, SHA-256 <code>28461d…eb71</code>.</td></tr>
+            <tr><td>Main 17,720-sample CV</td><td>All numerical calibration curves identical. Full rerun changed 7 of 544,212 row-level top-1 predictions because of exact/near floating ties; only 3 reported confidence-ranking cells moved, by at most 0.0008.</td></tr>
+            <tr><td>Streamed method equivalence</td><td>Linear, prototype and study-kNN: 100% identical top-1 on 50,100 linked samples. Max confidence difference: 0 / 0.0001 / 0.</td></tr>
+            <tr><td>Full Atlas after precision fix</td><td>3,437,058 rows. Biome: no top-1/back-off changes. Feature: 1 top-1 tie changed. Material: 1 top-1 tie and 4 ancestor back-off decisions changed; probability deltas are ≤0.0001 except one ancestor sum at 0.0111.</td></tr>
+            <tr><td>Static checks</td><td>All ontology-mapping modules compile; <code>git diff --check</code> clean.</td></tr>
+          </tbody>
+        </table></div>
+      </article>
+      <article class="card warning wide">
+        <h3>Interpretation</h3>
+        <p>The scientific conclusions and aggregate metrics are unchanged. The two top-1 changes among 3.44M samples have zero rounded margin. Four material answers move to a different allowed ancestor because the corrected probability is at the calibrated threshold. These are desirable corrections, not evidence of model instability at meaningful scale.</p>
+      </article>
+    </div>
+  </section>
+
+  <section id="review" class="panel" role="tabpanel" aria-labelledby="tab-review" hidden>
+    <div class="grid">
+      <article class="card wide">
+        <h2>Corrected in code</h2>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Status</th><th>Finding</th><th>Correction</th></tr></thead>
+          <tbody>
+            <tr><td><span class="status fixed">Fixed</span></td><td>Step 2 globbed every dated Metalog snapshot and silently kept the first duplicate.</td><td>Select the latest complete snapshot by default; add explicit <code>--date</code>.</td></tr>
+            <tr><td><span class="status fixed">Fixed</span></td><td>Atlas caches could be resumed after inputs/method settings changed.</td><td>Persist signatures for inputs and hyperparameters; reject mixed output directories.</td></tr>
+            <tr><td><span class="status fixed">Fixed</span></td><td>Study-kNN could include masked empty labels when <code>k</code> exceeded labelled rows.</td><td>Clamp <code>k</code> to finite neighbours and fail when no labelled neighbour exists.</td></tr>
+            <tr><td><span class="status fixed">Fixed</span></td><td>An invalid label-map target produced labels absent from the term index.</td><td>Fail fast on non-existent or obsolete targets.</td></tr>
+            <tr><td><span class="status fixed">Fixed</span></td><td>Step 6 forced float32 block weighting while step 5 evaluated float64 features.</td><td>Use the identical weighting expression and preserve fitted coefficient precision.</td></tr>
+            <tr><td><span class="status fixed">Fixed</span></td><td>Two legacy prototype trees and a backup shell script obscured the active implementation.</td><td>Remove them; Git history preserves prior versions.</td></tr>
+          </tbody>
+        </table></div>
+      </article>
+      <article class="card wide danger">
+        <h2>Scientific flaws / limitations still open</h2>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Risk</th><th>Evidence</th><th>Consequence</th></tr></thead>
+          <tbody>
+            <tr><td>Silver labels</td><td>Metalog is manually curated, but ontology evolution and curator convention remain; 115,039 biome values use an obsolete human term before remapping.</td><td>Agreement is not biological truth; raw labels/remap provenance must remain visible.</td></tr>
+            <tr><td>Class imbalance</td><td>Prototype micro vs macro: biome 0.653/0.262, feature 0.627/0.079, material 0.726/0.074.</td><td>Headline accuracy hides weak rare-term performance.</td></tr>
+            <tr><td>Closed vocabulary</td><td>Prototype-open unseen-label exact accuracy is 0 in all slots; retrieval-open is only 0.021/0.085/0.181.</td><td>The system cannot reliably discover ontology terms absent from Metalog training.</td></tr>
+            <tr><td>Project leakage</td><td>Merging related studies reduces supervised biome top-1 by about 1.3 points; merged-project samples lose 30–60 points.</td><td>Use project folds for claims and ≥5 seeds for comparisons.</td></tr>
+            <tr><td>External target mismatch</td><td>Gold classes are coarse and conventions differ (e.g. rhizosphere as plant vs Metalog material soil).</td><td>External scores cannot establish exact-term accuracy.</td></tr>
+            <tr><td>Ontology simplification</td><td>The parser keeps labels, synonyms and named <code>is_a</code>; richer OWL axioms/replacements are ignored.</td><td>Some validity, equivalence and migration information is lost.</td></tr>
+            <tr><td>Population mismatch</td><td>Current files contain 3.77M Atlas records and 3.44M with keyword predictions, not the stated 6M.</td><td>Reconcile database/version/sample-count definitions before presentation.</td></tr>
+          </tbody>
+        </table></div>
+      </article>
+      <article class="card wide">
+        <h3>Repository shape after review</h3>
+        <p><code>scripts/ontology_mapping/</code> now contains one numbered seven-step pipeline, two shared modules, analyses, and an isolated <code>experiments/</code> folder. Fast regression tests live in <code>tests/test_ontology_mapping.py</code>. Detailed future work is in <a href="ontology-mapping-future-work.md">ontology-mapping-future-work.md</a>.</p>
+      </article>
+    </div>
+  </section>
+
+  <section id="questions" class="panel" role="tabpanel" aria-labelledby="tab-questions" hidden>
+    <div class="question-group">
+      <h2>Data and labels</h2>
+      <details><summary>Is Metalog gold truth? <span class="badge">Newcomer</span></summary><p>No. It is unusually valuable manually curated silver data. Curators resolve submission errors and map to standard vocabularies, but ontologies change and reasonable curators can choose different granularities.</p></details>
+      <details><summary>Why only 58,365 linked samples if Metalog has ~159k? <span class="badge">Newcomer</span></summary><p>The join requires a shared sample/BioSample/SRA accession in the current Atlas metadata. The 2026-09-20 files contain 159,310 Metalog rows, but only 57,874 distinct Metalog samples link to 58,365 Atlas records.</p></details>
+      <details><summary>Why cap each study at 50 samples? <span class="badge">Engineer</span></summary><p>Large cohorts contain many near-duplicate samples and otherwise dominate both fitting and scoring. The cap reduces this bias, but still weights a 50-sample study more than a five-sample study; study-level metrics should also be reported.</p></details>
+      <details><summary>Are duplicate texts independent observations? <span class="badge">Expert</span></summary><p>No. Gold evaluation keeps the first copy per study, while training retains duplicates because deduplicating slightly hurt performance. Bootstrap units and folds must remain studies/projects, never samples.</p></details>
+      <details><summary>Do label remaps leak test information? <span class="badge">Expert</span></summary><p>The draft biome map uses aggregate model/ontology evidence and then is evaluated on the same research corpus, so it is not a pristine external intervention. It needs curator review and versioning before confirmatory evaluation.</p></details>
+    </div>
+
+    <div class="question-group">
+      <h2>Ontologies and targets</h2>
+      <details><summary>Why three labels per sample? <span class="badge">Newcomer</span></summary><p>They answer different questions: broad biome, local environmental feature/anatomy, and sampled material. For a gut sample those may be animal-associated environment, intestine environment and fecal material.</p></details>
+      <details><summary>Why add PO and FOODON beyond ENVO/Uberon? <span class="badge">Engineer</span></summary><p>Metalog already uses them for leaves and foods. Retaining them restored 465 linked feature labels and 128 material labels, with strong plant-material improvements.</p></details>
+      <details><summary>Why omit definitions from the default term text? <span class="badge">Expert</span></summary><p>In these experiments, sentence-length definitions moved term embeddings away from short keyword lists and hurt zero-shot retrieval. This is empirical, encoder-specific and should be revisited with a term/sample dual encoder.</p></details>
+      <details><summary>Does a parent prediction count as correct? <span class="badge">Expert</span></summary><p>Exact, strict hierarchical and lenient hierarchical outcomes are reported separately. Strict accepts gold or a true ancestor; lenient also accepts a descendant because Metalog may have stopped at a coarser term.</p></details>
+      <details><summary>Are all predicted slot combinations valid? <span class="badge">Expert</span></summary><p>Not guaranteed. Slot models are independent and the current parser does not enforce OWL domain/range or cross-slot constraints. Add explicit validity checks before downstream scientific use.</p></details>
+    </div>
+
+    <div class="question-group">
+      <h2>Embeddings and models</h2>
+      <details><summary>What do embeddings add over TF–IDF? <span class="badge">Newcomer</span></summary><p>They capture semantic similarity when metadata and ontology labels use different words. Keyword+sub-biome linear improves raw biome/feature/material exact top-1 from 0.455/0.611/0.680 to 0.526/0.631/0.707.</p></details>
+      <details><summary>Why embed LLM-extracted keywords instead of raw metadata? <span class="badge">Engineer</span></summary><p>The extraction removes IDs and study boilerplate and compresses heterogeneous fields into a shared style. But it introduces model cost, prompt/version dependence and possible hallucination; the TF–IDF raw-text baseline is therefore essential.</p></details>
+      <details><summary>Why does zero-shot retrieval perform poorly? <span class="badge">Expert</span></summary><p>Sample keyword lists and ontology names occupy different embedding regions, label priors are extreme, and many terms are near synonyms. Centring and priors help, but direct open retrieval remains only 0.028/0.136/0.083 exact top-1.</p></details>
+      <details><summary>Why prefer prototype over linear? <span class="badge">Expert</span></summary><p>It is interpretable, uses term semantics and is less affected by related-study leakage. It improves material and back-off coverage, but linear is better on exact biome top-1; neither dominates every slot.</p></details>
+      <details><summary>Can the same embeddings support other research? <span class="badge">Expert</span></summary><p>Yes—coverage, clustering, retrieval, active learning and study similarity—but validate each use separately. A representation good for frequent-label transfer is not automatically biologically faithful.</p></details>
+    </div>
+
+    <div class="question-group">
+      <h2>Evaluation and calibration</h2>
+      <details><summary>Why group folds by study/project? <span class="badge">Newcomer</span></summary><p>Samples in one study share metadata templates and wording. Random sample splits would reward memorising those templates. Project grouping also merges related studies that share accessions or sampling programmes.</p></details>
+      <details><summary>What does “90% target” mean? <span class="badge">Engineer</span></summary><p>On held-out Metalog folds, among answered predictions after hierarchical back-off, strict accuracy is targeted at 90%. It is not a guarantee for every class or for the external Atlas population.</p></details>
+      <details><summary>Is calibration selection unbiased? <span class="badge">Expert</span></summary><p>Temperature and tau are cross-fitted, which is sound. Model/hyperparameter choices were informed by many experiments on the same corpus, so final claims still need one frozen external exact-term test.</p></details>
+      <details><summary>Why are macro scores so low? <span class="badge">Expert</span></summary><p>Hundreds of rare labels have few studies, while fecal/intestine terms dominate micro accuracy. Macro accuracy exposes this and should be co-primary, alongside per-label support and confidence intervals.</p></details>
+      <details><summary>Does the coverage flag add value beyond probability? <span class="badge">Expert</span></summary><p>On Metalog, little incremental AUC. Outside Metalog, it identifies underrepresented plant/food/lab habitats and is valuable provenance. Treat it as a domain-shift warning, not a calibrated correctness probability.</p></details>
+    </div>
+
+    <div class="question-group">
+      <h2>Deployment and reranking</h2>
+      <details><summary>What should downstream users receive? <span class="badge">Newcomer</span></summary><p>Raw top-1, calibrated probability, selected ancestor or abstention, candidate list, coverage flag, control flag, ontology/model versions and provenance. Never publish a bare term as certain truth.</p></details>
+      <details><summary>What happens to controls and mock communities? <span class="badge">Engineer</span></summary><p>They are flagged before publication because they have no natural habitat. Current rules flag 13,204 Atlas samples; some real laboratory microcosms need manual policy decisions.</p></details>
+      <details><summary>Did LLM reranking help? <span class="badge">Expert</span></summary><p>Not conclusively. The biome pilot trades a modest coverage gain for accuracy just below target; feature is off; material looked promising but remains disabled. A larger project-held-out pilot is required.</p></details>
+      <details><summary>Is the pipeline reproducible across machines? <span class="badge">Expert</span></summary><p>Core predictions are effectively reproducible, and the corrected step 5/6 math now matches. Exact floating ties can still reorder a handful of diagnostic CV predictions; run manifests and pinned package versions should be added to releases.</p></details>
+      <details><summary>What is the next go/no-go test? <span class="badge">Expert</span></summary><p>A 1,000-sample, exact-term, double-curated benchmark from unseen projects and weak habitats. If calibrated precision and rare-label recall hold there, scale active learning; if not, prioritise new labels and constrained retrieval over a larger model.</p></details>
+    </div>
+  </section>
+
+  <p class="foot">Local evidence: pipeline outputs under <code>~/MicrobeAtlasProject/ontology_mapping</code>, Metalog snapshot 2026-09-20, and repository code at this review commit. External descriptions are linked to their primary project/publication pages.</p>
+</main>
+<script>
+  const tabs = [...document.querySelectorAll('[role="tab"]')];
+  const panels = [...document.querySelectorAll('[role="tabpanel"]')];
+  function selectTab(tab) {
+    tabs.forEach(t => t.setAttribute('aria-selected', String(t === tab)));
+    panels.forEach(p => { p.hidden = p.id !== tab.getAttribute('aria-controls'); });
+    history.replaceState(null, '', `#${tab.getAttribute('aria-controls')}`);
+  }
+  tabs.forEach(tab => {
+    tab.addEventListener('click', () => selectTab(tab));
+    tab.addEventListener('keydown', event => {
+      if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
+      event.preventDefault();
+      const direction = event.key === 'ArrowRight' ? 1 : -1;
+      const next = tabs[(tabs.indexOf(tab) + direction + tabs.length) % tabs.length];
+      next.focus(); selectTab(next);
+    });
+  });
+  const initial = tabs.find(t => t.getAttribute('aria-controls') === location.hash.slice(1));
+  if (initial) selectTab(initial);
+</script>
+</body>
+</html>

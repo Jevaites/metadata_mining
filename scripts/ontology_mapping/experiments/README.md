@@ -221,12 +221,16 @@ dominated by the *fecal material* / *intestine environment* decision.
 
 | check | result |
 |---|---|
-| old methods of `5_evaluate.py` (all metrics and every prediction row), new code vs commit b6710e6, fold_seed 0 | identical |
-| new methods, two runs (before / after the memory change in `rank`) | identical |
-| `verify_atlas_methods.py`: step 6 vs step 5 functions on the 50,100 linked samples, 3 methods × 3 slots, cloud and Mac | 100 % identical top-1, confidence within 0.0001 |
-| `6_predict_atlas.py --method linear` on the real 3.44M atlas, new code vs commit b6710e6 | byte-identical output |
-| `--method prototype` / `knn_study` on the real atlas (Mac VM, 4 cores) | 1.5 min / ~30 min (resumable); pairwise agreement with linear 80–83 %, all three agree on 72–74 % |
+| unit tests and bytecode compilation after the 2026-10-05 review | 7/7 tests pass; all ontology-mapping modules compile |
+| step 2 rebuilt from the selected Metalog snapshot | decompressed output is byte-identical (58,365 linked rows) |
+| full `5_evaluate.py` main CV (17,720 samples) | calibration curves are identical; 7 of 544,212 top-1 rows move only at floating-point ties; conclusions and aggregate results are unchanged |
+| `verify_atlas_methods.py`: step 6 vs step 5 functions on 50,100 linked samples, 3 methods × 3 slots | 100 % identical top-1; maximum confidence difference 0.0001 |
+| corrected `--method prototype` on the real 3,437,058-sample atlas | complete output reproduced; 2 top-1 and 4 ancestor answers differ at ties/boundaries, with no change in answered coverage |
 | `coarsen_labels.py`, `trivial_knn.py --rows A,B`: Mac vs cloud | identical output |
+
+The small Atlas differences above are the intended effect of using the same float64 block weighting
+in steps 5 and 6. They affect six samples out of 3,437,058, not the reported population-level
+findings. Exact commands, timings, and affected cases are summarized in the visual review report.
 
 ## Differences from the first version of the note
 
@@ -595,4 +599,3 @@ met on average over splits, not on the luckiest one.
 biome 64.3 / 92.5 % → 57.9 / 93.2 %, feature 18.0 / 87.5 % → 16.4 / 89.2 %, material 43.2 / 82.1 %
 → 50.0 / 73.8 % (the drop is rhizosphere → *soil*, which the coarse metric counts as not "plant").
 Coverage flag: 8.5 % of the atlas, threshold 0.612. Control flag unchanged (13,204 samples).
-

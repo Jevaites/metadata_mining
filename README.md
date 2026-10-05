@@ -574,8 +574,12 @@ To exit the session just type `exit`
 
 Maps every MicrobeAtlas sample to ENVO/Uberon terms for the three Metalog slots (`biome`,
 `feature`, `material`), learning from the ~58k MicrobeAtlas samples that Metalog curated.
-Six numbered scripts, one per step, in [`scripts/ontology_mapping/`](scripts/ontology_mapping/README.md);
+Seven numbered scripts, one per step, in [`scripts/ontology_mapping/`](scripts/ontology_mapping/README.md);
 that README documents the data flow, the methods, the metrics and how to extend them.
+
+- [Prototype review and findings](docs/ontology-mapping-review.html): tabbed visual report covering
+  correctness, experiments, validation, limitations, and critical questions.
+- [Future work](docs/ontology-mapping-future-work.md): prioritized research and engineering roadmap.
 
 `clean_and_envo_translate.py` (Container 1) is independent of this toolkit; it was fixed in 2026-09
 (missing values are now detected on the value, e.g. `China: Hunan` is no longer dropped as "nan" and

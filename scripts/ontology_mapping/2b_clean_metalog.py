@@ -223,7 +223,7 @@ def flag_labels(samples, terms, label_map):
         "" if not b else str(b == BIOME_ROOT or BIOME_ROOT in ancestors.get(b, ()))
         for b in samples["biome_clean"]]
     if unknown_targets:
-        print(f"WARNING: label map targets not valid in the term index: {dict(unknown_targets)}")
+        raise SystemExit(f"label map targets are not valid non-obsolete terms: {dict(unknown_targets)}")
 
 
 def flag_duplicates(samples):

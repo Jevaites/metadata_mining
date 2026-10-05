@@ -61,6 +61,7 @@ python 6_predict_atlas.py \
 
 import argparse
 import glob
+import json
 import os
 import sys
 import time
@@ -74,7 +75,8 @@ from sklearn.linear_model import RidgeClassifier
 from sklearn.preprocessing import normalize
 
 import hierarchy
-from common import SLOTS, ancestor_sets, load_npz, load_term_vectors, load_terms, path, read_tsv, select_samples
+from common import (SLOTS, ancestor_sets, ensure_settings, file_signature, load_npz, load_term_vectors,
+                    load_terms, path, read_tsv, select_samples)
 
 evaluate = importlib.import_module("5_evaluate")  # prototype_model: exactly the evaluated model
 TIE_BREAK = evaluate.TIE_BREAK
@@ -82,7 +84,9 @@ TIE_BREAK = evaluate.TIE_BREAK
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # scripts/
 from embed_subbiomes_keywords import iter_samples  # same text cleaning as the embedded texts
 
-BLOCK_WEIGHT = np.float32(1 / np.sqrt(2))  # two blocks, weighted exactly as in 5_evaluate.build_features()
+# Keep NumPy's float64 scalar here.  Step 5 uses the same expression; forcing this scalar to
+# float32 made the streamed linear predictor differ slightly from the model that was evaluated.
+BLOCK_WEIGHT = 1 / np.sqrt(2)
 
 
 def train_models(args, model_path):
@@ -120,7 +124,7 @@ def train_models(args, model_path):
         if args.method == "linear":
             clf = RidgeClassifier(alpha=1.0).fit(X[has], y)
             model[f"{slot}_coef"], model[f"{slot}_intercept"], model[f"{slot}_classes"] = \
-                clf.coef_.astype(np.float32), clf.intercept_.astype(np.float32), clf.classes_.astype(str)
+                clf.coef_, clf.intercept_, clf.classes_.astype(str)
         elif args.method == "prototype":
             classes = np.unique(y)  # closed vocabulary = the training labels, as `prototype` in 5_evaluate
             mean, prototypes, bias = evaluate.prototype_model(X[has], y, term_matrix[[term_row[t] for t in classes]],
@@ -140,7 +144,15 @@ def knn_study_top2(sim, labels, studies, n_classes, k):
     samples already set to -inf). Each of the k nearest neighbours votes 1 / (number of the k from
     its study); ties go to the label whose nearest neighbour is closest, as in 5_evaluate.knn_study.
     -> (best class, winner's vote share)."""
-    idx = np.argpartition(-sim, k, axis=1)[:, :k]
+    # A slot can have fewer labelled samples than the requested k in a small prototype.  Masked
+    # (-inf) rows must never enter the vote as the synthetic empty-label class.
+    available = np.isfinite(sim).sum(axis=1)
+    if not len(sim):
+        return np.array([], dtype=int), np.array([], dtype=float)
+    if available.min() == 0:
+        raise ValueError("knn_study has no labelled training sample for this slot")
+    k = min(k, int(available.min()))
+    idx = np.argpartition(-sim, k - 1, axis=1)[:, :k]
     idx = np.take_along_axis(idx, np.argsort(-np.take_along_axis(sim, idx, axis=1), axis=1), axis=1)
     g = studies[idx]
     weight = 1 / (g[:, :, None] == g[:, None, :]).sum(axis=2)
@@ -163,7 +175,8 @@ def build_index(args, index_path):
     for kind, texts, h5 in [("keywords", args.keywords_texts, args.keywords_h5),
                             ("sub_biomes", args.sub_biomes_texts, args.sub_biomes_h5)]:
         with h5py.File(path(h5), "r") as handle:
-            row_of = {t.decode(): i for i, t in enumerate(handle["texts"][:])}
+            row_of = {t.decode() if isinstance(t, bytes) else str(t): i
+                      for i, t in enumerate(handle["texts"][:])}
         rows[kind] = {sid: row_of.get(t, -1) for sid, t in iter_samples(path(texts), None, kind == "keywords")}
         print(f"{kind}: {len(rows[kind])} samples with text")
     sample_ids = np.array([s for s, r in rows["keywords"].items() if r >= 0])
@@ -174,24 +187,10 @@ def build_index(args, index_path):
     return index
 
 
-def load_backoff(args, model, terms, out_dir):
+def load_backoff(args, model, terms):
     """Per slot: (temperature, tau, Closure over the model's labels), from 5_evaluate's calibration.json.
-    The settings must match the model's; run_settings.json in --output_dir stops a resumed run from
-    mixing chunks written with other back-off settings."""
-    import json
-    run = {"calibration": [os.path.abspath(path(p)) for p in args.calibration] if args.calibration else None,
-           "target_accuracy": args.target_accuracy, "accuracy": args.accuracy, "topk": args.topk,
-           "max_candidates": args.max_candidates}
-    settings_path = os.path.join(out_dir, "run_settings.json")
-    if os.path.exists(settings_path):
-        previous = json.load(open(settings_path))
-        if previous != run:
-            raise SystemExit(f"{out_dir} has chunks written with {previous}, not {run}: use another --output_dir")
-    elif glob.glob(os.path.join(out_dir, "parts", "rows_*.tsv.gz")):
-        if args.calibration or args.topk:
-            raise SystemExit(f"{out_dir} has chunks from a run without back-off: use another --output_dir")
-    else:
-        json.dump(run, open(settings_path, "w"), indent=1)
+    The settings must match the model; the run manifest written in main() prevents stale cached
+    models, indexes or prediction chunks from being mixed with changed inputs."""
     if not args.calibration:
         return None
     if args.method == "knn_study":
@@ -280,13 +279,46 @@ def main():
     out_dir = path(args.output_dir)
     os.makedirs(os.path.join(out_dir, "parts"), exist_ok=True)
 
+    index_path = os.path.join(out_dir, "index.npz")
+    inputs = [args.ontology_terms, args.samples, *args.train_vectors, args.keywords_h5, args.sub_biomes_h5]
+    # Tests and advanced users may provide a prebuilt index without the original GPT text files.
+    # Normal runs record the source texts, which lets resume safety catch a regenerated index.
+    if all(os.path.exists(path(p)) for p in (args.keywords_texts, args.sub_biomes_texts)):
+        inputs.extend([args.keywords_texts, args.sub_biomes_texts])
+    elif os.path.exists(index_path):
+        inputs.append(index_path)
+    else:
+        raise SystemExit("keyword/sub-biome text files are missing and no prebuilt index.npz was supplied")
+    if args.term_vectors:
+        inputs.append(args.term_vectors)
+    if args.calibration:
+        inputs.extend(args.calibration)
+    run = {
+        "inputs": [file_signature(p) for p in inputs],
+        "method": args.method,
+        "prototype_alpha": args.prototype_alpha,
+        "prototype_beta": args.prototype_beta,
+        "knn_study_k": args.knn_study_k,
+        "max_per_study": args.max_per_study,
+        "seed": args.seed,
+        "target_accuracy": args.target_accuracy,
+        "accuracy": args.accuracy,
+        "topk": args.topk if args.calibration else 0,
+        "max_candidates": args.max_candidates,
+    }
+    source_texts_exist = all(os.path.exists(path(p)) for p in (args.keywords_texts, args.sub_biomes_texts))
+    cached = [os.path.join(out_dir, "model.npz"), *glob.glob(os.path.join(out_dir, "parts", "rows_*.tsv.gz"))]
+    if source_texts_exist:  # without source texts, index.npz is an explicitly supplied input
+        cached.append(index_path)
+    ensure_settings(os.path.join(out_dir, "run_settings.json"), run, cached)
+
     model = train_models(args, os.path.join(out_dir, "model.npz"))
-    index = build_index(args, os.path.join(out_dir, "index.npz"))
+    index = build_index(args, index_path)
     terms = read_tsv(args.ontology_terms)
     label_of = dict(zip(terms["term_id"], terms["label"]))
     if not args.calibration:
         args.topk = 0
-    backoff = load_backoff(args, model, terms, out_dir)
+    backoff = load_backoff(args, model, terms)
     kw_dim = int(model["kw_dim"])
     with h5py.File(path(args.sub_biomes_h5), "r") as handle:
         sb = BLOCK_WEIGHT * normalize(handle["embeddings"][:])

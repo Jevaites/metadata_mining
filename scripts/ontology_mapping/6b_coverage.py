@@ -47,11 +47,13 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import normalize
 
-from common import load_npz, path, read_tsv, select_samples
+from common import file_signature, load_npz, path, read_tsv, select_samples
 
 
 def top_k_mean(sim, k):
     """-> (mean of the k largest values per row, column of the largest)."""
+    if not 1 <= k <= sim.shape[1]:
+        raise ValueError(f"k must be between 1 and {sim.shape[1]}, got {k}")
     best = sim.argmax(axis=1)
     if k == 1:
         return sim[np.arange(len(sim)), best], best
@@ -62,6 +64,10 @@ def top_k_mean(sim, k):
 def calibrate(kw, sb, groups, k, quantile, block=2000):
     """Similarity of every training sample to the training samples of the other groups."""
     _, g = np.unique(groups, return_inverse=True)
+    if len(np.unique(g)) < 2:
+        raise ValueError("coverage calibration needs at least two study/project groups")
+    if len(g) - np.bincount(g).max() < k:
+        raise ValueError(f"fewer than k={k} samples remain after holding out the largest group")
     held_out = np.zeros(len(kw))
     for s0 in range(0, len(kw), block):
         sim = 0.5 * (kw[s0:s0 + block] @ kw.T + sb[s0:s0 + block] @ sb.T)
@@ -88,6 +94,10 @@ def main():
     ap.add_argument("--chunk_rows", type=int, default=5000, help="Keyword .h5 rows per chunk (memory)")
     ap.add_argument("--max_seconds", type=float, default=None, help="Stop after this long (resume later)")
     args = ap.parse_args()
+    if not 0 < args.quantile < 1:
+        ap.error("--quantile must be strictly between 0 and 1")
+    if args.k < 1:
+        ap.error("--k must be at least 1")
     start = time.time()
     out_dir = path(args.output_dir)
     os.makedirs(os.path.join(out_dir, "parts"), exist_ok=True)
@@ -99,16 +109,26 @@ def main():
     train_sb = sb[[sb_row[s] for s in train["sample_id"]]].astype(np.float32)
     train_studies = train["study_code"].to_numpy()
 
-    settings = {"samples": os.path.abspath(path(args.samples)), "fold_groups": args.fold_groups, "k": args.k,
+    inputs = [args.samples, *args.train_vectors, args.index, args.keywords_h5, args.sub_biomes_h5]
+    if args.fold_groups:
+        inputs.append(args.fold_groups)
+    if args.only_ids:
+        inputs.append(args.only_ids)
+    settings = {"inputs": [file_signature(p) for p in inputs], "k": args.k,
                 "quantile": args.quantile, "max_per_study": args.max_per_study, "seed": args.seed,
                 "only_ids": args.only_ids, "n_train": len(train)}
     calibration_path = os.path.join(out_dir, "coverage_calibration.json")
     if os.path.exists(calibration_path):
         saved = json.load(open(calibration_path))
         if saved["settings"] != settings:
-            raise SystemExit(f"{out_dir} was written with {saved['settings']}, not {settings}: use another --output_dir")
+            raise SystemExit(f"{out_dir} contains coverage results from different inputs or settings; "
+                             "use another --output_dir")
         threshold = saved["threshold"]
     else:
+        orphaned = glob.glob(os.path.join(out_dir, "parts", "rows_*.tsv.gz"))
+        if orphaned:
+            raise SystemExit(f"{out_dir} has prediction chunks but no coverage calibration; "
+                             "use another --output_dir")
         groups = train["study_code"]
         if args.fold_groups:
             project = dict(read_tsv(args.fold_groups)[["sample_id", "project_group"]].values)

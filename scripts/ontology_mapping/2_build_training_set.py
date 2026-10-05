@@ -42,16 +42,35 @@ DROP_KEYS = re.compile(r"^(experiment|run)|^study$|^sample name$|alias|xref|link
                        r"|taxon_id|_id$| id$|subject|patient|participant|replicate")
 
 
-def load_metalog_labels(metalog_dir, valid_terms):
-    """One row per Metalog sample: spire_sample_name, study_code, domain + one term id per slot."""
+def snapshot_files(metalog_dir, date=None):
+    """The four Metalog long tables from one snapshot (latest by default).
+
+    Selecting a snapshot matters when old and new downloads share a directory: concatenating both
+    would silently let the alphabetically first version win for duplicate sample accessions.
+    """
+    found = glob.glob(os.path.join(metalog_dir, "*_all_long_*.tsv.gz"))
+    dates = sorted({m.group(1) for p in found if (m := re.search(r"_(\d{4}-\d{2}-\d{2})\.tsv\.gz$", p))})
+    if not dates:
+        raise SystemExit(f"no *_all_long_<date>.tsv.gz files in {metalog_dir}")
+    date = date or dates[-1]
+    files = [os.path.join(metalog_dir, f"{domain}_all_long_{date}.tsv.gz")
+             for domain in ("animal", "environmental", "human", "ocean")]
+    missing = [p for p in files if not os.path.exists(p)]
+    if missing:
+        raise SystemExit(f"incomplete Metalog snapshot {date}; missing {missing}")
+    return date, files
+
+
+def load_metalog_labels(files, valid_terms):
+    """One row per Metalog sample: accession, study, domain and one term id per slot."""
     frames = []
-    for path in sorted(glob.glob(os.path.join(metalog_dir, "*_all_long_*.tsv.gz"))):
-        df = pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False)
+    for file_path in files:
+        df = pd.read_csv(file_path, sep="\t", dtype=str, keep_default_na=False)
         df = df[df["metadata_item"].isin(["spire_sample_name", "study_code", *SLOTS])]
         wide = df.pivot_table(index="sample_alias", columns="metadata_item", values="value", aggfunc="first")
-        wide["domain"] = os.path.basename(path).split("_")[0]
+        wide["domain"] = os.path.basename(file_path).split("_")[0]
         frames.append(wide.reset_index())
-        print(f"{os.path.basename(path)}: {len(wide)} samples")
+        print(f"{os.path.basename(file_path)}: {len(wide)} samples")
     labels = pd.concat(frames, ignore_index=True).fillna("")
 
     for metalog_field, slot in SLOTS.items():
@@ -100,6 +119,7 @@ def main():
     parser.add_argument("--sample_info", required=True, help="MicrobeAtlas sample.info(.gz)")
     parser.add_argument("--ontology_terms", required=True, help="TSV from 1_build_term_index.py")
     parser.add_argument("--output", required=True)
+    parser.add_argument("--date", help="Metalog snapshot date YYYY-MM-DD (default: latest complete snapshot)")
     parser.add_argument("--max_chars", type=int, default=2000, help="Truncate each sample text")
     args = parser.parse_args()
 
@@ -107,7 +127,9 @@ def main():
     code_to_label = dict(zip(terms["term_id"], terms["label"]))  # obsolete included: it is input text
     valid_terms = set(terms.loc[terms["obsolete"].astype(str) != "True", "term_id"])
 
-    labels = load_metalog_labels(os.path.expanduser(args.metalog_dir), valid_terms)
+    snapshot_date, files = snapshot_files(os.path.expanduser(args.metalog_dir), args.date)
+    print(f"Metalog snapshot {snapshot_date}")
+    labels = load_metalog_labels(files, valid_terms)
     by_accession = labels.set_index("spire_sample_name")[["study_code", "domain", *SLOTS.values()]].to_dict("index")
 
     rows, n_records = [], 0
