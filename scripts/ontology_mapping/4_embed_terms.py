@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Step 4: embed every (non-obsolete) ENVO / Uberon term with the same code, model and
+Step 4: embed every (non-obsolete) ENVO / Uberon / PO / FOODON term with the same code, model and
 dimension as the GPT keyword / sub-biome embeddings, so terms and samples live
 in one vector space (needed for zero-shot retrieval on those embeddings).
 
@@ -9,7 +9,7 @@ Output has the same layout as the GPT_*_unique_embeddings files (texts, embeddin
 and is resumable: rerunning only embeds texts that are not in the file yet.
 
 python 4_embed_terms.py --dry_run      # count tokens / cost, no API call
-python 4_embed_terms.py                # ~19k texts, text-embedding-3-large @ 1024
+python 4_embed_terms.py                # ~49k texts, text-embedding-3-large @ 1024
 """
 
 import argparse
