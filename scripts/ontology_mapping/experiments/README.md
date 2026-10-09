@@ -28,6 +28,8 @@ folds, ≤ 50 samples per study (17.7k samples, 539 studies). Biome excludes hum
 | 12 | Can we flag blanks and mock communities? | `6c_flag_controls.py` | 13,204 atlas samples; 37 / 40 checked hits are real |
 | 14 | Is the sample selection stable? | `common.select_samples` / `study_folds` | Now yes; fold choice still moves biome back-off coverage by ±3 points |
 | 15 | How many top-1 “errors” are defensible alternative terms, and how should they be scored? | `acceptable_answers.py` (+ `label_pair_kinds_draft.tsv`) | Many: all rules together +23 / +8 / +6 points micro, +40 / +18 / +16 macro on learnable labels; broader answers need partial credit |
+| 16 | Why is macro low, and does class balancing help? | `macro_and_balance.py` | 65 % of feature / material labels come from one study (unlearnable under study folds). Balanced weights: biome +10 macro on learnable labels at no accuracy cost; feature 1/√n weights +6, accuracy unchanged; material: a trade |
+| 17 | Is one probability threshold enough? Can zero-shot take over when the model abstains? | `confidence_checks.py` | Yes: margin, runner-up, entropy add ≤ 0.004 AUC. Abstention catches 67–86 % of unseen-label feature / material samples; zero-shot alone gets 11–25 % of them (plain label), so it needs a reranker |
 | – | Is step 6 the model of step 5? | `verify_atlas_methods.py` | Identical top-1 for every method and slot |
 
 `run_all.sh` reproduces §1–4 (≈ 1.5–3 h). `_setup.py` holds the shared loading code.
@@ -279,6 +281,95 @@ the rules. Hierarchical F is too generous (generic upper classes are shared by e
 Limits: automatic synonyms are candidates (siblings and narrower terms pass the filter); facets use every ENVO relation
 type in both directions, direct links only, and no Uberon / PO relations; co-labels mean "the text cannot tell them
 apart", not "equivalent"; one fold seed.
+
+## 16. Macro by label support and class balancing (`macro_and_balance.py`)
+
+```bash
+python experiments/macro_and_balance.py \
+  --samples ~/MicrobeAtlasProject/metalog/clean/training_set.clean.tsv.gz \
+  --predictions ~/MicrobeAtlasProject/ontology_mapping/cv_backoff/predictions.tsv.gz \
+  --fold_seeds 0 1 2 \
+  --output_dir ~/MicrobeAtlasProject/ontology_mapping/experiments/macro_and_balance   # ~4 min on the Mac; resumable
+```
+
+**Why macro is low** (`support_summary.tsv`, `support_buckets.tsv`; prototype, fold seed 0). A label used by one study
+is never in training when that study is tested, so it scores 0 by construction:
+
+| slot | labels | from 1 study | their samples | macro all | macro ≥ 2 / ≥ 5 / ≥ 10 studies | drop 10 % rarest |
+|---|---|---|---|---|---|---|
+| biome | 42 | 40 % | 3 % | 0.262 | 0.439 / 0.583 / 0.616 | 0.297 |
+| feature | 208 | 65 % | 16 % | 0.079 | 0.228 / 0.547 / 0.731 | 0.088 |
+| material | 185 | 65 % | 12 % | 0.074 | 0.214 / 0.549 / 0.852 | 0.083 |
+
+Feature accuracy per label by number of studies: 1: 0.00 (136 labels), 2: 0.07, 3–4: 0.11, 5–9: 0.46, 10–19: 0.69,
+20+: 0.99. Report macro over learnable labels (≥ 2 studies) next to the share of samples they cover.
+
+**Class balancing** (`balance_summary.tsv`; linear unless stated, mean over fold seeds 0–2, micro / macro over learnable
+labels):
+
+| variant | biome | feature | material |
+|---|---|---|---|
+| plain (pipeline `linear`) | 0.663 / 0.424 | 0.630 / 0.264 | 0.715 / 0.210 |
+| balanced (n / K n_c) | 0.666 / **0.523** | 0.591 / 0.348 | 0.639 / 0.253 |
+| tempered, weights ∝ n_c^-0.5 | 0.664 / 0.472 | **0.631 / 0.320** | 0.693 / 0.227 |
+| tempered, n_c^-0.25 | 0.662 / 0.437 | 0.632 / 0.293 | 0.705 / 0.221 |
+| balanced, dominant class weight 1 | 0.664 / 0.525 | 0.618 / 0.341 | 0.644 / 0.253 |
+| plain answer when it is the dominant class | 0.667 / 0.523 | 0.621 / 0.340 | 0.650 / 0.243 |
+| logit adjustment 0.05 | 0.663 / 0.434 | 0.632 / 0.286 | 0.711 / 0.225 |
+| prototype β 0.1 (production) | 0.647 / 0.428 | 0.633 / 0.243 | 0.725 / 0.204 |
+| prototype β 0.05 | 0.643 / 0.460 | 0.622 / 0.303 | 0.681 / 0.266 |
+| prototype β 0 (no prior) | 0.603 / 0.585 | 0.486 / 0.367 | 0.485 / 0.343 |
+
+- Biome: balancing is free on all three seeds (macro on learnable labels +10 points, worst seed 0.494 vs best plain 0.435).
+- Feature: 1/√n weights keep accuracy and add +6 points of macro on learnable labels. Full balancing loses 1,163
+  answers vs 458 gained (fold seed 0), 60 % of the losses on *intestine environment*; a dominant-class rule recovers
+  only part of it (`balance_lost_gained.tsv`).
+- Material: every variant trades accuracy for macro; losses spread over *soil*, *fecal material*, *fresh water* ….
+- Not yet tested: the effect on calibration and back-off coverage, and a balanced variant of the prototype itself.
+
+## 17. Confidence checks: one threshold, zero-shot fallback (`confidence_checks.py`)
+
+```bash
+python experiments/confidence_checks.py \
+  --samples ~/MicrobeAtlasProject/metalog/clean/training_set.clean.tsv.gz \
+  --predictions ~/MicrobeAtlasProject/ontology_mapping/cv_backoff/predictions.tsv.gz \
+  --calibration ~/MicrobeAtlasProject/ontology_mapping/cv_backoff/calibration.json \
+  --plain_label_vectors ~/MicrobeAtlasProject/ontology_mapping/experiments/term_text/term_variants.h5 \
+  --output_dir ~/MicrobeAtlasProject/ontology_mapping/experiments/confidence_checks   # ~1 min
+```
+
+**One probability threshold is enough** (`reliability.tsv`, `shape_auc.tsv`, `shape_band.tsv`; prototype, fold seed 0).
+Probabilities are roughly calibrated, a little overconfident mid-range (feature top-1 with p in (0.3, 0.4]: 20 %
+right). Study-grouped CV AUC for "the top-1 is right":
+
+| features | biome | feature | material |
+|---|---|---|---|
+| p1 | 0.808 | 0.920 | 0.884 |
+| p1 + runner-up p2 | 0.807 | 0.919 | 0.885 |
+| p1 + entropy | 0.805 | 0.920 | 0.888 |
+| p1 + mass outside the top 5 | 0.806 | 0.920 | 0.885 |
+
+(the score margin added to the CV probability: −0.001 / −0.001 / 0.000). At p1 ≈ 0.30, material top-1s are right 35 %
+of the time when the alternatives sit in the top 5 and 7 % when they are spread out; biome and feature show no pattern.
+The shape matters for what to answer instead (back-off, a candidate list), not for trusting the top-1.
+
+**Zero-shot fallback** (`zero_shot_fallback.tsv`): abstention as a detector of labels never seen in training, and
+zero-shot retrieval on those samples.
+
+| | biome | feature | material |
+|---|---|---|---|
+| samples whose gold is unseen in training | 3.3 % | 16.8 % | 13.6 % |
+| of those, abstained on | 11 % | 86 % | 67 % |
+| of the abstained, gold unseen | 2 % | 36 % | 47 % |
+| zero-shot on unseen gold, label; synonyms, all 49k terms: exact / in top 5 | 0.02 / 0.19 | 0.09 / 0.27 | 0.18 / 0.32 |
+| zero-shot on unseen gold, plain label, 18.9k ENVO / Uberon terms: exact / in top 5 | 0.02 / 0.06 | 0.11 / 0.31 | 0.25 / 0.39 |
+
+Abstention detects the impossible cases for feature and material; zero-shot alone is too weak to answer them, but its
+top 5 (plain label) holds the curator's term for a third of them: a candidate list for a reranker.
+
+Reproducibility note: the AUC cross-validation uses `common.study_folds`, not sklearn's `GroupKFold`, whose
+tie-breaking between equal-size studies gave different folds (and AUCs differing in the 3rd decimal) on the Mac and in
+the cloud.
 
 ## Verification (2026-10-05 review)
 
