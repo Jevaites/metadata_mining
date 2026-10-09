@@ -27,6 +27,7 @@ folds, ≤ 50 samples per study (17.7k samples, 539 studies). Biome excludes hum
 | 11–13 | How are plant / food samples labelled; does keeping PO / FOODON help? | `5_evaluate.py` on old vs new labels | Plant feature +10 points, plant material back-off answers 23 → 49 % |
 | 12 | Can we flag blanks and mock communities? | `6c_flag_controls.py` | 13,204 atlas samples; 37 / 40 checked hits are real |
 | 14 | Is the sample selection stable? | `common.select_samples` / `study_folds` | Now yes; fold choice still moves biome back-off coverage by ±3 points |
+| 15 | How many top-1 “errors” are defensible alternative terms, and how should they be scored? | `acceptable_answers.py` (+ `label_pair_kinds_draft.tsv`) | Many: all rules together +23 / +8 / +6 points micro, +40 / +18 / +16 macro on learnable labels; broader answers need partial credit |
 | – | Is step 6 the model of step 5? | `verify_atlas_methods.py` | Identical top-1 for every method and slot |
 
 `run_all.sh` reproduces §1–4 (≈ 1.5–3 h). `_setup.py` holds the shared loading code.
@@ -215,6 +216,69 @@ every previously selected sample (all 17,640 kept, +80) and every study's fold. 
 redrew 22 % of the samples and moved biome back-off coverage by 6 points with no label change. The fold split
 itself still moves biome coverage at 90 % between 0.73 and 0.79 (fold seeds 1 / 0 / 2), so the atlas pools the
 calibration of seeds 0–2 (τ = 0.825, coverage 0.76).
+
+## 15. Acceptable answers: synonyms, hierarchy, facets, curator co-labels (`acceptable_answers.py`)
+
+Prototype top-1 of the production CV run (cleaned labels + biome map, fold seed 0). Inputs beyond the pipeline's:
+ENVO's OBO file (for the non-is_a relations; release 2026-06-26, the one the term table was built from) and
+`label_pair_kinds_draft.tsv`, a one-pass classification of the 122 disagreeing label pairs (Claude, **not reviewed**).
+
+```bash
+# once: ENVO OBO of the term table's release (the GitHub copy is the same file, data-version releases/2026-06-26)
+curl -L -o ~/MicrobeAtlasProject/ontologies/envo.obo http://purl.obolibrary.org/obo/envo/releases/2026-06-26/envo.obo
+#   (or https://raw.githubusercontent.com/EnvironmentOntology/envo/master/envo.obo while its header says data-version: releases/2026-06-26;
+#    the file used here has md5 b568c065f8bb96af5075ed57cf981875)
+python experiments/acceptable_answers.py \
+  --samples ~/MicrobeAtlasProject/metalog/clean/training_set.clean.tsv.gz \
+  --predictions ~/MicrobeAtlasProject/ontology_mapping/cv_backoff/predictions.tsv.gz \
+  --envo_obo ~/MicrobeAtlasProject/ontologies/envo.obo \
+  --pair_kinds experiments/label_pair_kinds_draft.tsv \
+  --output_dir ~/MicrobeAtlasProject/ontology_mapping/experiments/acceptable_answers   # ~1-2 min
+```
+
+**Curator disagreement.** 39,975 pairs of samples from different studies have near-identical vectors (cosine ≥ 0.9);
+they share the label 76 / 85 / 94 % of the time. Disagreeing label pairs 23 / 70 / 29, by kind (share of the
+disagreeing sample pairs; `composition.tsv`):
+
+| slot | equivalent | broader / narrower | two facets | different facts |
+|---|---|---|---|---|
+| biome | 0 % | 93 % | 0.1 % | 7 % |
+| feature | 8 % | 9 % | 61 % | 22 % |
+| material | 18 % | 36 % | 44 % | 2 % |
+
+**Acceptance rules** (`rule_scores.tsv`), each alone vs exact, in points: micro / macro / macro over learnable labels
+(used by ≥ 2 studies). Combined rows are per-sample ORs.
+
+| rule | biome | feature | material |
+|---|---|---|---|
+| exact (level) | 0.653 / 0.262 / 0.439 | 0.627 / 0.079 / 0.228 | 0.726 / 0.074 / 0.214 |
+| broader (any depth) | +10.4 / +45.5 / +32.4 | +1.3 / +3.7 / +2.3 | +3.2 / +6.6 / +11.5 |
+| narrower (any depth) | +11.4 / +4.3 / +7.2 | +1.5 / +2.5 / +3.1 | +1.8 / +2.8 / +3.6 |
+| automatic synonyms | +0.6 / +4.8 / +8.0 | +0.7 / +1.2 / +2.2 | +0.4 / +1.1 / +0.2 |
+| curator co-labels (out of fold, ≥ 2 study pairs) | +7.4 / +5.2 / +8.8 | +2.1 / +1.4 / +4.0 | +1.9 / +1.5 / +4.3 |
+| synonyms + co-labels | +8.0 / +10.0 / +16.8 | +2.7 / +2.6 / +6.1 | +2.3 / +2.6 / +4.4 |
+| facets (direct ENVO relation) | 0 / 0 / 0 | +3.7 / +4.6 / +9.3 | +0.6 / +2.2 / +0.2 |
+| all | +22.9 / +50.3 / +40.4 | +8.0 / +12.0 / +18.1 | +5.7 / +11.8 / +15.5 |
+
+Synonyms and co-labels rescue disjoint samples (0 / 0 / 3 shared), so they add up; the sum of all single rules
+overstates "all" (micro +29.8 / +9.2 / +8.0 vs +22.9 / +8.0 / +5.7; `overlap.tsv`).
+
+**Graded credit for broader answers** (`graded_credit.tsv`), micro / macro:
+
+| scheme | biome | feature | material |
+|---|---|---|---|
+| exact | 0.653 / 0.262 | 0.627 / 0.079 | 0.726 / 0.074 |
+| depth (0.5 per step) | 0.696 / 0.423 | 0.633 / 0.096 | 0.741 / 0.105 |
+| IC(answer) / IC(gold) | 0.704 / 0.445 | 0.637 / 0.104 | 0.743 / 0.105 |
+| full credit | 0.756 / 0.717 | 0.639 / 0.116 | 0.758 / 0.140 |
+| hierarchical F (ancestor sets) | 0.910 / 0.842 | 0.734 / 0.321 | 0.842 / 0.387 |
+
+Recommended: report exact Metalog, the IC-weighted acceptable score, and the share of broader answers, always naming
+the rules. Hierarchical F is too generous (generic upper classes are shared by every pair).
+
+Limits: automatic synonyms are candidates (siblings and narrower terms pass the filter); facets use every ENVO relation
+type in both directions, direct links only, and no Uberon / PO relations; co-labels mean "the text cannot tell them
+apart", not "equivalent"; one fold seed.
 
 ## Verification (2026-10-05 review)
 

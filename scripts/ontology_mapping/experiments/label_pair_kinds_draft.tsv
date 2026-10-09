@@ -1,0 +1,123 @@
+slot	term_a	label_a	term_b	label_b	kind	reviewed	note
+biome	ENVO_00000447	marine biome	ENVO_01000048	ocean biome	broader	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+biome	ENVO_00002030	aquatic biome	ENVO_01000023	marine pelagic biome	broader	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+biome	ENVO_00000873	freshwater biome	ENVO_00002030	aquatic biome	broader	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+biome	ENVO_00002030	aquatic biome	ENVO_01000219	anthropogenic terrestrial biome	different	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+biome	ENVO_00000873	freshwater biome	ENVO_01000252	freshwater lake biome	broader	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+biome	ENVO_01000174	forest biome	ENVO_01000196	coniferous forest biome	broader	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+biome	ENVO_00002030	aquatic biome	ENVO_01000253	freshwater river biome	broader	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+biome	ENVO_00002030	aquatic biome	ENVO_01000048	ocean biome	broader	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+biome	ENVO_00000447	marine biome	ENVO_00002030	aquatic biome	broader	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+biome	ENVO_01000046	marginal sea biome	ENVO_01000048	ocean biome	different	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+biome	ENVO_00000891	large freshwater lake biome	ENVO_00002030	aquatic biome	broader	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+biome	ENVO_01000177	grassland biome	ENVO_01000245	cropland biome	different	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+biome	ENVO_01000174	forest biome	ENVO_01000211	temperate coniferous forest biome	broader	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+biome	ENVO_01000252	freshwater lake biome	ENVO_01000253	freshwater river biome	different	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+biome	ENVO_00000446	terrestrial biome	ENVO_01000245	cropland biome	broader	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+biome	ENVO_00000446	terrestrial biome	ENVO_01000249	urban biome	broader	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+biome	ENVO_01000177	grassland biome	ENVO_01000193	temperate grassland biome	broader	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+biome	ENVO_01000219	anthropogenic terrestrial biome	ENVO_01000249	urban biome	broader	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+biome	ENVO_00000447	marine biome	ENVO_01000030	marine hydrothermal vent biome	broader	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+biome	ENVO_01000174	forest biome	ENVO_01000180	tundra biome	different	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+biome	ENVO_01000174	forest biome	ENVO_01001830	tropical biome	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+biome	ENVO_00000447	marine biome	ENVO_01000046	marginal sea biome	broader	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+biome	ENVO_00000873	freshwater biome	ENVO_01000179	desert biome	different	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000015	ocean	ENVO_00000209	marine photic zone	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00002042	surface water	ENVO_01000326	deep chlorophyll maximum layer	different	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00002019	brackish water	ENVO_01000023	marine pelagic biome	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00002019	brackish water	ENVO_01000322	brackish water environment	equivalent	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000213	marine mesopelagic zone	ENVO_00002042	surface water	different	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000137	coastal inlet	ENVO_00000475	inlet	broader	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000051	hot spring	ENVO_01000008	microbial mat	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00002018	sewage	ENVO_00002043	wastewater treatment plant	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_01000023	marine pelagic biome	ENVO_01000322	brackish water environment	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000213	marine mesopelagic zone	ENVO_01000326	deep chlorophyll maximum layer	different	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_01000627	feedlot	ENVO_2100002	intestine environment	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00002259	agricultural soil	ENVO_00005801	rhizosphere	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00002018	sewage	ENVO_00003043	sewage plant	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_01001385	Bathymodiolus-dominated oceanic mussel reef	ENVO_01001393	Bathymodiolus gill tissue material	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_2100002	intestine environment	UBERON_0007365	rumen	broader	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00002043	wastewater treatment plant	ENVO_00003043	sewage plant	equivalent	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00002042	surface water	ENVO_01000061	marine wind mixed layer	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000015	ocean	ENVO_00000137	coastal inlet	different	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00002150	coastal sea water	ENVO_01000322	brackish water environment	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000015	ocean	ENVO_00002042	surface water	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000051	hot spring	ENVO_00002011	fresh water	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000025	reservoir	ENVO_00000291	drainage basin	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000015	ocean	ENVO_00000475	inlet	different	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_01000061	marine wind mixed layer	ENVO_01000326	deep chlorophyll maximum layer	different	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000016	sea	ENVO_01000321	sea water environment	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000283	ridge	ENVO_00002261	forest soil	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000015	ocean	ENVO_01000326	deep chlorophyll maximum layer	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000020	lake	ENVO_00000021	freshwater lake	broader	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000015	ocean	ENVO_00000016	sea	different	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00002018	sewage	ENVO_01000687	coast	different	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_01000076	marine chemocline	ENVO_01000322	brackish water environment	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	UBERON_0000996	vagina	UBERON_0013523	lateral vaginal canal	broader	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00002019	brackish water	ENVO_01000076	marine chemocline	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000020	lake	ENVO_00002042	surface water	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000021	freshwater lake	ENVO_00002042	surface water	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000015	ocean	ENVO_01000065	marine oxygen minimum zone	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000016	sea	ENVO_00002113	deep marine sediment	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000016	sea	ENVO_00002150	coastal sea water	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000019	saline lake	ENVO_01000357	alkaline water	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000050	geyser	ENVO_00012408	aquifer	different	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_2100002	intestine environment	UBERON_0001155	colon	broader	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00002261	forest soil	ENVO_01001582	forest floor	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00005750	grassland soil	ENVO_02000059	surface soil	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000213	marine mesopelagic zone	ENVO_01000061	marine wind mixed layer	different	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000137	coastal inlet	ENVO_01000065	marine oxygen minimum zone	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000015	ocean	ENVO_00000213	marine mesopelagic zone	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00003041	cow shed	ENVO_2100002	intestine environment	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00002011	fresh water	ENVO_01000008	microbial mat	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00005801	rhizosphere	ENVO_01001181	rhizoplane	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000475	inlet	ENVO_01000065	marine oxygen minimum zone	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000032	bay	ENVO_00002113	deep marine sediment	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000020	lake	ENVO_00000291	drainage basin	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_01000002	water well	ENVO_01001004	groundwater	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00012408	aquifer	ENVO_01001004	groundwater	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000015	ocean	ENVO_01000061	marine wind mixed layer	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00002123	bioreactor	ENVO_01001433	terrestrial mining	different	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_01000999	rhizosphere environment	ENVO_01001181	rhizoplane	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00005750	grassland soil	ENVO_01000352	field	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00002113	deep marine sediment	ENVO_01000321	sea water environment	different	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000482	sea floor	ENVO_01000122	marine hydrothermal vent	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000015	ocean	ENVO_00002450	ocean basin	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00002261	forest soil	ENVO_01001803	tropical forest	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000054	saline marsh	ENVO_00000485	sea shore	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000215	hydrothermal vent	ENVO_00000482	sea floor	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000215	hydrothermal vent	ENVO_01000122	marine hydrothermal vent	broader	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000051	hot spring	ENVO_01000357	alkaline water	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000114	agricultural field	ENVO_01000892	area of cropland	equivalent	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000063	water body	ENVO_00012408	aquifer	broader	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000051	hot spring	ENVO_01001043	hypersaline water environment	different	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+feature	ENVO_00000019	saline lake	ENVO_01001043	hypersaline water environment	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+material	ENVO_00002019	brackish water	ENVO_00002149	sea water	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+material	ENVO_00002001	waste water	ENVO_00002018	sewage	broader	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+material	ENVO_01000008	microbial mat	ENVO_01000157	microbial mat material	equivalent	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+material	ENVO_00002011	fresh water	ENVO_01000008	microbial mat	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+material	ENVO_01001391	gill tissue material	ENVO_01001393	Bathymodiolus gill tissue material	broader	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+material	UBERON_0007365	rumen	UBERON_0010228	ruminal fluid	equivalent	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+material	ENVO_00002007	sediment	ENVO_03000033	marine sediment	broader	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+material	ENVO_00002011	fresh water	ENVO_01000157	microbial mat material	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+material	ENVO_00002003	fecal material	UBERON_0010228	ruminal fluid	different	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+material	ENVO_00002006	liquid water	ENVO_01000008	microbial mat	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+material	ENVO_00001998	soil	ENVO_00002259	agricultural soil	broader	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+material	ENVO_00002006	liquid water	ENVO_00002011	fresh water	broader	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+material	ENVO_00002010	saline water	ENVO_04000007	lake water	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+material	UBERON_0008798	rugal fold of vagina	UBERON_0022293	reproductive gland secretion	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+material	ENVO_00002006	liquid water	ENVO_00002007	sediment	different	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+material	ENVO_00001998	soil	ENVO_00002261	forest soil	broader	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+material	UBERON_0004983	mucosa of vagina	UBERON_0022293	reproductive gland secretion	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+material	ENVO_00002011	fresh water	ENVO_01001004	groundwater	broader	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+material	ENVO_01000063	planktonic material	ENVO_02000140	fluid environmental material	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+material	ENVO_00002011	fresh water	ENVO_04000007	lake water	broader	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+material	ENVO_2100002	intestine environment	UBERON_0000314	cecum mucosa	broader	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+material	ENVO_00002007	sediment	ENVO_00002011	fresh water	different	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+material	ENVO_00000232	fen	ENVO_00001998	soil	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+material	ENVO_00002006	liquid water	ENVO_01000157	microbial mat material	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+material	ENVO_00001998	soil	ENVO_00005778	tropical soil	broader	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+material	UBERON_0001691	external ear	UBERON_3000786	fossa cubitalis ventralis	different	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+material	ENVO_00000511	blanket bog	ENVO_00001998	soil	facet	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+material	ENVO_00002018	sewage	ENVO_00002042	surface water	different	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
+material	ENVO_00000546	lake sediment	ENVO_00002011	fresh water	different	no	draft by Claude 2026-10-06 from the label pairs of near-duplicates; to be reviewed
