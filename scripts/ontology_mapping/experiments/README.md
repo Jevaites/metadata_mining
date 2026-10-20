@@ -30,6 +30,7 @@ folds, ≤ 50 samples per study (17.7k samples, 539 studies). Biome excludes hum
 | 15 | How many top-1 “errors” are defensible alternative terms, and how should they be scored? | `acceptable_answers.py` (+ `label_pair_kinds_draft.tsv`) | Many: all rules together +23 / +8 / +6 points micro, +40 / +18 / +16 macro on learnable labels; broader answers need partial credit |
 | 16 | Why is macro low, and does class balancing help? | `macro_and_balance.py` | 65 % of feature / material labels come from one study (unlearnable under study folds). Balanced weights: biome +10 macro on learnable labels at no accuracy cost; feature 1/√n weights +6, accuracy unchanged; material: a trade |
 | 17 | Is one probability threshold enough? Can zero-shot take over when the model abstains? | `confidence_checks.py` | Yes: margin, runner-up, entropy add ≤ 0.004 AUC. Abstention catches 67–86 % of unseen-label feature / material samples; zero-shot alone gets 11–25 % of them (plain label), so it needs a reranker |
+| 18 | Should human samples get a biome label (the obsolete human biome mapped to animal-associated environment)? | `human_biome.py` | No: they are all right (+14 points micro, nothing learned), the prototype loses 9 points on animal samples, and the 90 % back-off threshold gives 82 % on non-human samples. Keep blank, report separately |
 | – | Is step 6 the model of step 5? | `verify_atlas_methods.py` | Identical top-1 for every method and slot |
 
 `run_all.sh` reproduces §1–4 (≈ 1.5–3 h). `_setup.py` holds the shared loading code.
@@ -371,6 +372,69 @@ Reproducibility note: the AUC cross-validation uses `common.study_folds`, not sk
 tie-breaking between equal-size studies gave different folds (and AUCs differing in the 3rd decimal) on the Mac and in
 the cloud.
 
+## 18. Human biome labels: map the obsolete term or leave it blank? (`human_biome.py`)
+
+Every human sample in Metalog has the biome `obsolete human-associated habitat [ENVO:00009003]`; ENVO has no
+replacement, so step 2 / 2b blank it and the human domain (32,449 of 58,077 clean samples, 188 studies) has no biome
+label. The variant maps it to `animal-associated environment [ENVO:01001002]` (one label-map row; the animal domain
+already uses this term) and re-runs step 5 unchanged. Only biome labels change: the clean training set differs in
+the 32,449 human biome cells, and feature / material predictions are identical (`check.tsv`).
+
+```bash
+P=~/MicrobeAtlasProject; O=$P/ontology_mapping; X=$O/experiments/human_biome; TERMS=$P/ontology_terms.tsv.gz
+KW=$P/metalog/keywords__large1024.npz; SB=$P/metalog/sub_biomes__large1024.npz
+TV=$O/ontology_terms_unique_embeddings__text-embedding-3-large__dim1024.h5
+python experiments/human_biome.py prepare --label_map $P/metalog/clean/biome_label_map.tsv --output $X/biome_label_map.human.tsv
+python 2b_clean_metalog.py --metalog_dir $P/metalog --ontology_terms $TERMS --training_set $P/metalog/metalog_training_set.tsv.gz \
+  --label_map $X/biome_label_map.human.tsv --output_dir $X/clean                                          # < 1 min
+python 5_evaluate.py --ontology_terms $TERMS --samples $X/clean/training_set.clean.tsv.gz --features $KW $SB \
+  --term_vectors $TV --output_dir $X/cv_backoff                                                           # ~20 min, needs > 4 GB RAM
+for s in 1 2; do
+  python 5_evaluate.py --ontology_terms $TERMS --samples $X/clean/training_set.clean.tsv.gz --features $KW $SB \
+    --term_vectors $TV --fold_seed $s --closed_only --output_dir $X/cv_backoff_s$s                        # ~5 min each
+done
+python experiments/human_biome.py compare --before $O/cv_backoff --after $X/cv_backoff \
+  --before_seeds $O/cv_backoff_s1 $O/cv_backoff_s2 --after_seeds $X/cv_backoff_s1 $X/cv_backoff_s2 --output_dir $X
+```
+
+Results (fold seed 0; the 9,946 non-human biome rows are the same samples in both runs; `biome_scores.tsv`):
+
+| biome top-1 / macro | current (non-human) | variant, non-human | variant, human | variant, all |
+|---|---|---|---|---|
+| prototype (production) | 0.653 / 0.262 | 0.649 / 0.256 | 1.000 / 1.000 | 0.800 / 0.258 |
+| linear | 0.671 / 0.259 | 0.669 / 0.257 | 1.000 / 1.000 | 0.812 / 0.257 |
+| knn_study | 0.682 / 0.267 | 0.685 / 0.268 | 1.000 / 1.000 | 0.821 / 0.268 |
+| majority | 0.285 / 0.024 | 0.285 / 0.024 | 1.000 / 1.000 | 0.593 / 0.024 |
+
+- **The human samples are trivial.** 7,541 of 7,541 are right, for every method including majority. Mixed into the
+  score they lift micro top-1 by ~14 points for the trained methods and 31 for majority (0.29 → 0.59) without any
+  better biome mapping; macro moves by < 0.01 (one more label). The current model already gives these samples this term: 29,298 of the 29,300 Metalog human
+  samples in the atlas run get `animal-associated environment`.
+- **Training on them moves the prototype.** The class centroid of `animal-associated environment` becomes ~73 %
+  human (7,541 human vs 2,786 animal training samples after the 50-per-study cap). Animal samples lose 9 points
+  (0.949 → 0.860; 191 of the 247 lost go to marine biome: oysters, shrimp, sponges, crabs, mussels; farm animals
+  go to cropland), environmental (+3.0) and
+  ocean (+2.6) gain, because the old animal centroid also caught soil and water samples (566 non-human top-1s leave
+  `animal-associated environment`, 3 join it; `changed.tsv`). Net −0.4 points. linear / knn_study: within ±0.4.
+- **The back-off threshold no longer means 90 % for non-human samples.** tau is chosen on the other folds, where the
+  easy human samples now make up ~43 % of the biome rows (`backoff.tsv`, prototype, target 0.9 strict):
+
+| | tau per fold | coverage | strict accuracy |
+|---|---|---|---|
+| current, non-human | 0.725–0.825 | 0.79 | **0.897** |
+| variant, all | 0.45–0.65 | 0.96 | 0.899 |
+| variant, non-human | 0.45–0.65 | 0.93 | **0.816** |
+
+  The production tau (pooled over fold seeds 0–2, `tau_pooled.tsv`) drops from 0.825 to 0.575 for prototype and
+  from 0.775 to 0.45 for linear.
+
+**Decision: keep the human biome blank for training and calibration.** Mapping it gains nothing the model does not
+already do and silently loosens the biome threshold for everyone else. Report it separately: biome scores exclude
+human samples (as now); human samples get `animal-associated environment`, from the model or by a domain rule, and
+that is 100 % against the mapped label. If the label is wanted in training later: choose tau on non-human samples
+only, and give the class one prototype per domain (or a study-balanced centroid) so human-gut text does not
+redefine "animal".
+
 ## Verification (2026-10-05 review)
 
 Every pipeline step was re-run with the reviewed code and compared with the production outputs:
@@ -385,6 +449,9 @@ Every pipeline step was re-run with the reviewed code and compared with the prod
 | step 6b on 50,000 random atlas samples + the held-out calibration | identical |
 | step 7 `fit`; `rerank_pilot.py score` / `vote` | identical to the stored `rerank_params.json` / original code |
 | `verify_atlas_methods.py` (step 6 streaming == step 5 functions, 50,100-sample mini atlas) | OK for linear / prototype / knn_study on all slots: identical top-1 and back-off, differences ≤ 1e-4 (4-decimal rounding of the outputs) |
+| step 2b `audit_review.tsv` (2026-10-12) | same rows; tied rows came out in another order in a run on the Mac (the sort was not stable across pandas versions); now sorted by n_hit, id, category |
+| step 1 `parse_owl` keeps regional `en-*` synonyms (2026-10-12) | +32 synonyms on 23 FOODON terms (e.g. `yoghurt`, `cornflour`, `courgette flower`, `pak choi`); no Metalog label is among them. Steps 2 / 2b with the new table: byte-identical (training set, clean and gold sets, flags). After embedding the 23 new texts (`4_embed_terms.py`, appended to the term-vector file; cosine old vs new text 0.71 for cracker to 0.99 for yogurt) and re-running step 5 (seed 0, all methods): `metrics.json` and `calibration.json` byte-identical; every closed-vocabulary method (production `prototype`, `linear`, knn, back-off) identical row by row; open-vocabulary methods: 21 of 544,212 rows reorder near-tied candidates (2 top-1s swap between the ENVO and Uberon terms both named `trophosome`), prototype_open confidences move by ≤ 7e-6 (the all-term mean shifts); none of the 23 terms enters any top 5. `confidence_checks.py` zero-shot over all terms: identical. Outputs: `experiments/en_synonyms/` |
+| §18 `human_biome.py compare`, run twice | byte-identical outputs; variant step 5 vs the current one on the same machine: feature / material predictions identical |
 | experiments, reviewed vs original code: `gold_check`, `coverage_check`, `coarsen_labels`, `project_groups`, `hierarchical_backoff` | identical (`term_to_coarse_biome.tsv`: same rows, tie order differed; the sort is now deterministic) |
 | `analyses.py` | identical except `granularity` for feature / material at min_support 300 (and material at 100): the bug fix keeps coarsening inside ENVO / Uberon, e.g. material @300: 42 labels, top-1 0.779 (was 31 labels, 0.782) |
 | `draft_biome_label_map.py` | not comparable: needs plain-label term vectors (`term_text/term_variants.h5`), which were not re-staged; the map itself is a reviewed, versioned input |

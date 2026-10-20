@@ -62,7 +62,7 @@ from rerank_prompt import PRICES, count_tokens, parse, prompt  # the pilot's exa
 
 PROMPT_VERSION = "v2"
 W_GRID = (0, 0.05, 0.1, 0.2, 0.35, 0.5, 1.0)
-EXACT, COARSER, TOO_SPECIFIC = hierarchy.EXACT, hierarchy.COARSER, hierarchy.TOO_SPECIFIC
+EXACT, TOO_SPECIFIC = hierarchy.EXACT, hierarchy.TOO_SPECIFIC
 
 
 # ----------------------------------------------------------------------------- fusion
@@ -98,15 +98,16 @@ def fit_T(rows, w):
 
 
 def outcomes(rows, w, T, tau, allowed, anc):
-    """Outcome code per row (0 abstain, then hierarchy.EXACT / COARSER / TOO_SPECIFIC / OTHER)."""
-    out = []
-    for r in rows:
-        p = fuse(r["lb"], r["D"], w, T, r["mass"])[:-1]
-        node, _ = hierarchy.decode_candidates(r["cands"], p, tau, allowed, anc)
-        g = r["gold"]
-        out.append(0 if node is None else EXACT if node == g else COARSER if node in anc.get(g, ())
-                   else TOO_SPECIFIC if g in anc.get(node, ()) else hierarchy.OTHER)
-    return np.array(out, dtype=int)
+    """Outcome code per row (0 abstain, then hierarchy.EXACT / COARSER / TOO_SPECIFIC / OTHER), graded by
+    hierarchy.relation as in steps 5 and 6."""
+    picks = [hierarchy.decode_candidates(r["cands"], fuse(r["lb"], r["D"], w, T, r["mass"])[:-1], tau, allowed, anc)[0]
+             for r in rows]
+    nodes = sorted({n for n in picks if n is not None})
+    if not nodes:  # every row abstains (or no rows)
+        return np.zeros(len(rows), dtype=int)
+    rel = hierarchy.relation(nodes, [r["gold"] for r in rows], anc)
+    col = {n: i for i, n in enumerate(nodes)}
+    return hierarchy.outcome(rel, np.array([col.get(n, -1) for n in picks], dtype=int))
 
 
 def fit_slot(rows, allowed, anc, target, metric, grid=W_GRID):
@@ -256,6 +257,11 @@ def build(args):
                 requests[rid] = {"slot": slot, "request_id": rid, "first_sample": sid, "text": texts[sid], "cand": cand}
             members.append((rid, sid))
     print(f"{len(members)} gated (sample, slot) pairs -> {len(requests)} distinct requests", flush=True)
+    if not requests:  # nothing gated, or no gated sample in --sample_info: empty outputs, so submit / apply still run
+        open(os.path.join(work, "requests.jsonl"), "w").close()
+        pd.DataFrame(members, columns=["request_id", "sample_id"]).to_csv(os.path.join(work, "members.tsv.gz"), sep="\t", index=False)
+        print("no request to build: wrote an empty requests.jsonl")
+        return
 
     # 4. the example per candidate: the most similar training sample curators labelled with it
     (kw_row, kw), (sb_row, sb) = (load_npz(p) for p in args.train_vectors)
@@ -270,8 +276,8 @@ def build(args):
     index = dict(np.load(os.path.join(atlas_dir, "index.npz")))
     pos = {s: i for i, s in enumerate(index["sample_ids"])}
     reqs = list(requests.values())
-    kw_rows = np.array([index["kw_rows"][pos[r["first_sample"]]] for r in reqs])
-    sb_rows = np.array([index["sb_rows"][pos[r["first_sample"]]] for r in reqs])
+    kw_rows = np.array([index["kw_rows"][pos[r["first_sample"]]] for r in reqs], dtype=int)  # row indices: int even if empty
+    sb_rows = np.array([index["sb_rows"][pos[r["first_sample"]]] for r in reqs], dtype=int)
     with h5py.File(path(args.sub_biomes_h5), "r") as h:
         SB = normalize(h["embeddings"][:])
     V = np.zeros((len(reqs), Xtr.shape[1]), dtype=np.float32)

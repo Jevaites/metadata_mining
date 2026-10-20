@@ -15,9 +15,12 @@ A sample is flagged when its GPT sub-biome or its GPT keywords say so:
                    ('laboratory ...', 'sterile ...', '... control', '... blank') or a lab keyword
                    (synthetic metagenome, sterile / nuclease-free water, laboratory)
 'control' alone is never enough: 'control soil', 'healthy control' or 'control group' are real samples
-of a habitat (an untreated plot, a healthy subject).
+of a habitat (an untreated plot, a healthy subject); so is a '<step> control group' ('buffer control group':
+horses given a buffer). '_' counts as a space ('reagent_control').
 
-Output TSV: sample_id, control (True/False), control_evidence (the sub-biome or keyword that matched).
+Output TSV: sample_id, control (True/False), control_evidence (the sub-biome or keyword that matched),
+one row per sample of either GPT file (a sample without keywords is judged on its sub-biome, and the
+other way round); gzipped when the output name ends in .gz.
 Checked against Metalog's own control flags on the linked samples: experiments/README.md §12.
 
 python 6c_flag_controls.py \
@@ -36,8 +39,8 @@ from common import path
 SUB_BIOME = re.compile(r"^(laboratory|synthetic|sterile)[ -](control|blank|mock|standard)\b|\bmock[ -]?(community|dna)\b"
                        r"|^mock$|\bnegative[ -]control\b|\b(blank|kit|reagent|extraction)[ -](control|blank)\b", re.I)
 STRONG = re.compile(
-    r"^((dna[ -])?extraction|pcr|kit|reagent|buffer|air|library|sequencing|isolation)[ -](negative[ -]control|negative|blanks?|controls?)"
-    r"|^negative[ -]extraction[ -]control|^(dna[ -])?blanks?([ -](sample|control|well|swab))?$|^ntc$|^no[ -]template[ -]controls?$"
+    r"^((dna[ -])?extraction|pcr|kit|reagent|buffer|air|library|sequencing|isolation)[ -](negative[ -]controls?|negatives?|blanks?|controls?)\b(?![ -]groups?\b)"
+    r"|^negative[ -]extraction[ -]controls?\b|^(dna[ -])?blanks?([ -](sample|control|well|swab))?$|^ntc$|^no[ -]template[ -]controls?$"
     r"|^(empty|technical|processing)[ -]controls?$|^zymobiomics\b|^(microbial[ -])?community[ -]standards?$"
     r"|^whole[ -]cell[ -]standards?$|^microbial[ -]dna[ -]standard$|^control[ -]blank$", re.I)
 WEAK = re.compile(r"^(negative|positive)[ -]controls?$|^mock[ -](community|communities|sample|dna)$", re.I)
@@ -46,16 +49,24 @@ LAB_KEYWORD = re.compile(r"^(synthetic metagenome|sterile water( blank)?|nucleas
 
 
 def evidence(sub_biome, keywords):
-    """'' when the sample looks like a real habitat sample, else what makes it a control or mock."""
-    if SUB_BIOME.search(sub_biome):
+    """'' when the sample looks like a real habitat sample, else what makes it a control or mock (the text as
+    GPT wrote it). '_' counts as a space: GPT sometimes writes snake_case keywords ('reagent_control')."""
+    sb = sub_biome.replace("_", " ")
+    if SUB_BIOME.search(sb):
         return f"sub-biome: {sub_biome}"
-    strong = next((k for k in keywords if STRONG.search(k)), "")
+    kws = [(k, k.replace("_", " ")) for k in keywords]  # (as written, as matched)
+    strong = next((k for k, text in kws if STRONG.search(text)), "")
     if strong:
         return f"keyword: {strong}"
-    weak = next((k for k in keywords if WEAK.match(k)), "")
-    if weak and (LAB_SUB_BIOME.search(sub_biome) or any(LAB_KEYWORD.match(k) for k in keywords)):
+    weak = next((k for k, text in kws if WEAK.match(text)), "")
+    if weak and (LAB_SUB_BIOME.search(sb) or any(LAB_KEYWORD.match(text) for _, text in kws)):
         return f"keyword + lab context: {weak}"
     return ""
+
+
+def split_keywords(text):
+    """GPT keyword set '{a, b , c}' -> ['a', 'b', 'c'] (stripped; '' for an empty set or a trailing comma)."""
+    return [k.strip() for k in text.strip("{} ").split(",")]
 
 
 def read_texts(p):
@@ -75,15 +86,14 @@ def main():
     ap.add_argument("--output", required=True)
     args = ap.parse_args()
 
+    keywords = read_texts(args.keywords_texts)
     sub = read_texts(args.sub_biomes_texts)
     rows = []
-    with open(path(args.keywords_texts), errors="replace") as handle:
-        for line in handle:
-            sid, _, text = line.rstrip("\n").partition("\t")
-            found = evidence(sub.get(sid, "").strip(), [k.strip() for k in text.strip("{} ").split(",")])
-            rows.append((sid, bool(found), found))
+    for sid in list(keywords) + [s for s in sub if s not in keywords]:  # every sample of either file, once
+        found = evidence(sub.get(sid, "").strip(), split_keywords(keywords.get(sid, "")))
+        rows.append((sid, bool(found), found))
     out = pd.DataFrame(rows, columns=["sample_id", "control", "control_evidence"])
-    out.to_csv(path(args.output), sep="\t", index=False, compression="gzip")
+    out.to_csv(path(args.output), sep="\t", index=False)  # compression from the name: .gz -> gzip
     hits = out.loc[out["control"], "control_evidence"].str.split(":").str[0].value_counts().to_dict()
     print(f"Wrote {path(args.output)}: {len(out)} samples, {out['control'].sum()} controls / mocks ({hits})")
 

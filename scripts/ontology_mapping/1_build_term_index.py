@@ -11,6 +11,8 @@ Output columns: ontology, term_id, label, synonyms, definition, parents, obsolet
 Sources are OBO files, or OWL (RDF/XML) files for ontologies without an OBO release (FOODON),
 as paths (.gz allowed) or URLs. Only the ontology's own terms (id prefix) are kept; their
 parents can be in another ontology. Synonyms: every synonym scope; parents: named is_a only.
+Language: OWL labels and synonyms are kept when untagged, 'en' or a regional 'en-*' tag (FOODON tags
+32 English synonyms en-gb / en-us / en-au ..., e.g. 'yoghurt', 'cornflour'); other languages are skipped.
 
 python 1_build_term_index.py \
   --obo ENVO=https://raw.githubusercontent.com/EnvironmentOntology/envo/master/envo.obo \
@@ -35,12 +37,13 @@ import xml.etree.ElementTree as ET
 import pandas as pd
 
 QUOTED = re.compile(r'"((?:[^"\\]|\\.)*)"')  # first "..." on a line, allowing \" inside
+COLUMNS = ["ontology", "term_id", "label", "synonyms", "definition", "parents", "obsolete"]
 SCOPE_SUFFIX = re.compile(r" \((exact|narrow|broad|related)(, [^)]*)?\)$")  # PO repeats the scope in the text
 
 
 def read_bytes(source):
     """The file's bytes, from a local path or a URL (gunzipped when it ends with .gz)."""
-    if source.startswith("http"):
+    if source.startswith(("http://", "https://")):  # not just "http": a local folder may be named http_mirror/
         with urllib.request.urlopen(source) as response:
             data = response.read()
     else:
@@ -63,6 +66,13 @@ SYNONYM_TAGS = {OIO + t for t in ["hasExactSynonym", "hasSynonym", "hasNarrowSyn
                                   "hasRelatedSynonym"]} | {OBO + "IAO_0000118"}  # IAO_0000118: alternative term
 
 
+def is_english(lang):
+    """No language tag, 'en' or a regional variant ('en-gb', 'en-us', 'en-scotland'; FOODON uses these for
+    'yoghurt', 'cornflour', 'courgette flower')."""
+    lang = (lang or "").lower()
+    return lang == "en" or lang == "" or lang.startswith("en-")
+
+
 def parse_owl(data, prefix):
     """Minimal OWL (RDF/XML) reader: the owl:Class elements whose IRI is .../obo/PREFIX_...,
     with the same fields as parse_obo (definition = IAO_0000115, obsolete = owl:deprecated)."""
@@ -74,20 +84,25 @@ def parse_owl(data, prefix):
         if not term_id.startswith(prefix + "_"):
             continue
         labels = [(e.get(XML_LANG) or "", (e.text or "").strip()) for e in cls.findall(RDFS + "label")]
-        label = next((t for lang, t in labels if lang in ("", "en") and t), "")
+        label = next((t for lang, t in labels if is_english(lang) and t), "")
         if not label:
             continue
         definition = cls.find(OBO + "IAO_0000115")
         terms.append({
             "ontology": prefix, "term_id": term_id, "label": label,
             "synonyms": [(e.text or "").strip() for e in cls if e.tag in SYNONYM_TAGS and (e.text or "").strip()
-                         and e.get(XML_LANG, "en") == "en"],
+                         and is_english(e.get(XML_LANG))],
             "definition": (definition.text or "").strip() if definition is not None else "",
             "parents": [e.get(RDF + "resource").rsplit("/", 1)[-1] for e in cls.findall(RDFS + "subClassOf")
                         if e.get(RDF + "resource")],  # named parents; restrictions are skipped
             "obsolete": any((e.text or "").strip() == "true" for e in cls.findall("{http://www.w3.org/2002/07/owl#}deprecated")),
         })
     return terms
+
+
+def unescape(quoted):
+    """Text of an OBO quoted string: '5\\" end' -> '5" end' (definitions and synonyms alike)."""
+    return quoted.replace('\\"', '"')
 
 
 def parse_obo(lines, prefix):
@@ -112,12 +127,12 @@ def parse_obo(lines, prefix):
             term["label"] = value.strip()
         elif tag == "def":
             match = QUOTED.match(value)
-            term["definition"] = match.group(1).replace('\\"', '"') if match else ""
+            term["definition"] = unescape(match.group(1)) if match else ""
         elif tag == "synonym":
             match = QUOTED.match(value)
             scope_and_type = value[match.end():].split() if match else []
             if match and not (len(scope_and_type) > 1 and scope_and_type[1] in language_types):
-                term["synonyms"].append(SCOPE_SUFFIX.sub("", match.group(1)))
+                term["synonyms"].append(SCOPE_SUFFIX.sub("", unescape(match.group(1))))
         elif tag == "is_a":
             term["parents"].append(value.split()[0].replace(":", "_"))
         elif tag == "is_obsolete" and value.strip() == "true":
@@ -142,7 +157,7 @@ def main():
         print(f"{prefix}: {len(terms)} terms ({sum(t['obsolete'] for t in terms)} obsolete) from {source}")
         rows.extend(terms)
 
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(rows, columns=COLUMNS)  # columns given: with 0 terms the table is a header, not a crash
     for column in ["synonyms", "parents"]:
         df[column] = df[column].apply(lambda values: "||".join(dict.fromkeys(values)))  # dedupe, keep order
     if args.append:

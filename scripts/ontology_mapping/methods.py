@@ -24,7 +24,7 @@ from sklearn.linear_model import Ridge, RidgeClassifier
 from sklearn.preprocessing import normalize
 from sklearn.svm import LinearSVC
 
-TIE_BREAK = 1e-13  # knn_study: equal similarities (identical texts) are ordered by training-sample index
+TIE_BREAK = 1e-13  # knn, knn_study: equal similarities (identical texts) are ordered by training-sample index
 
 
 def dense(matrix):
@@ -37,10 +37,13 @@ def rank(scores, ids, n=5, margin=True):
     best minus second-best score (margin=True) or the best score itself.
 
     Example: scores [[0.1, 0.9, 0.5]], ids ['a', 'b', 'c'] -> ([['b', 'c', 'a']], [0.4])."""
-    # row blocks keep memory low (samples x 49k terms); argsort is per row, so the result is the same
-    order = np.vstack([np.argsort(-scores[i:i + 1000], axis=1)[:, :n] for i in range(0, max(len(scores), 1), 1000)])
-    top2 = np.take_along_axis(scores, order[:, :2], axis=1)
-    return [ids[row].tolist() for row in order], top2[:, 0] - top2[:, -1] if margin else top2[:, 0]
+    ids = np.asarray(ids)  # a plain list works too
+    # row blocks keep memory low (samples x 49k terms); argsort is per row, so the result is the same.
+    # At least 2 columns are kept so that the margin has a second-best score even when n = 1.
+    order = np.vstack([np.argsort(-scores[i:i + 1000], axis=1)[:, :max(n, 2)]
+                       for i in range(0, max(len(scores), 1), 1000)])
+    top2 = np.take_along_axis(scores, order[:, :2], axis=1)  # one column if there is only one term: margin 0
+    return [ids[row[:n]].tolist() for row in order], top2[:, 0] - top2[:, -1] if margin else top2[:, 0]
 
 
 def row_blocks(n, size=1000):
@@ -54,19 +57,34 @@ def join_ranks(parts):
 
 
 # ----------------------------------------------------------------------------- neighbour methods
+def neighbours(test, train, k, rows=2000):
+    """For each block of at most `rows` test samples: (indices, similarities) of its k most similar
+    training samples, closest first. Similarity = dot product (cosine for L2-normalised rows).
+
+    Exact ties (identical texts) are ordered by training-sample index: TIE_BREAK x index is subtracted
+    for the ordering only (it is far below float32 resolution), so the result is deterministic and
+    identical to 6_predict_atlas.py --method knn_study. The returned similarities are the untouched ones."""
+    offset = TIE_BREAK * np.arange(train.shape[0])
+    for start in range(0, test.shape[0], rows):  # chunks keep the (rows x m) similarity matrix small
+        sim = dense(test[start:start + rows] @ train.T).astype(np.float64)
+        ordering = sim - offset
+        idx = np.argpartition(-ordering, min(k, sim.shape[1] - 1), axis=1)[:, :k]  # the k best, unordered
+        idx = np.take_along_axis(idx, np.argsort(-np.take_along_axis(ordering, idx, axis=1), axis=1), axis=1)
+        yield idx, np.take_along_axis(sim, idx, axis=1)
+
+
 def knn(test, train, train_labels, k):
     """Similarity-weighted vote over the labels of the k most similar training samples;
     confidence = the winner's share of the vote.
-    Example (k=3): neighbours (sim 0.9 'soil'), (0.8 'soil'), (0.7 'sediment') -> soil, 1.7 / 2.4 = 0.71."""
+    Example (k=3): neighbours (sim 0.9 'soil'), (0.8 'soil'), (0.7 'sediment') -> soil, 1.7 / 2.4 = 0.71.
+    A neighbour with a negative similarity votes 0 (no support, not a vote against), so the confidence
+    stays a share in [0, 1]. Equal votes keep the closest-first order (ties: see neighbours())."""
     ranked, confidence = [], []
-    for start in range(0, test.shape[0], 2000):  # chunks keep the (2000 x m) similarity matrix small
-        sim = dense(test[start:start + 2000] @ train.T)
-        idx = np.argpartition(-sim, min(k, sim.shape[1] - 1), axis=1)[:, :k]  # the k best, unordered
-        idx = np.take_along_axis(idx, np.argsort(-np.take_along_axis(sim, idx, axis=1), axis=1), axis=1)
-        for row_idx, row_sim in zip(idx, np.take_along_axis(sim, idx, axis=1)):  # closest first (tie-break)
+    for idx, sims in neighbours(test, train, k):
+        for row_idx, row_sim in zip(idx, sims):  # closest first
             votes = defaultdict(float)
             for i, s in zip(row_idx, row_sim):
-                votes[train_labels[i]] += s
+                votes[train_labels[i]] += max(s, 0.0)
             ranked.append(sorted(votes, key=votes.get, reverse=True)[:5])
             confidence.append(votes[ranked[-1][0]] / max(sum(votes.values()), 1e-9))
     return ranked, np.array(confidence)
@@ -83,13 +101,10 @@ def knn_study(test, train, train_labels, train_studies, k):
     Votes are not weighted by similarity (nested CV preferred unweighted votes, experiments README §3).
     Many samples share an identical text, so similarities tie exactly; ties are broken by training-sample
     index (TIE_BREAK is far below float32 resolution), which makes the result deterministic and identical
-    to 6_predict_atlas.py --method knn_study. Confidence = the winner's share of the vote."""
+    to 6_predict_atlas.py --method knn_study (see neighbours()). Confidence = the winner's share of the vote."""
     ranked, confidence = [], []
-    offset = TIE_BREAK * np.arange(train.shape[0])
-    for start in range(0, test.shape[0], 2000):
-        sim = dense(test[start:start + 2000] @ train.T).astype(np.float64) - offset
-        idx = np.argpartition(-sim, min(k, sim.shape[1] - 1), axis=1)[:, :k]
-        idx = np.take_along_axis(idx, np.argsort(-np.take_along_axis(sim, idx, axis=1), axis=1), axis=1)
+    train_studies = np.asarray(train_studies)  # a plain list works too
+    for idx, _ in neighbours(test, train, k):
         for row_idx in idx:  # closest first, so ties go to the label met first
             studies = train_studies[row_idx]
             per_study = Counter(studies)  # how many of the k neighbours each study has
@@ -140,6 +155,8 @@ def prototype_model(train, train_labels, vocab_vectors, vocab_ids, alpha, beta, 
 def prototype_scores(test, model):
     """(n x V) cosine(centred sample, prototype) + bias (see prototype_model)."""
     mean, prototypes, bias = model
+    if test.shape[0] == 0:  # sklearn's normalize refuses 0 rows
+        return np.zeros((0, len(bias)))
     return normalize(test - mean) @ prototypes.T + bias
 
 
@@ -167,6 +184,8 @@ def linear_scores(test, train, train_labels):
     classes = np.unique(train_labels)
     if len(classes) < 2:
         return classes, np.ones((test.shape[0], 1))
+    if test.shape[0] == 0:  # nothing to score (sklearn refuses 0 rows); classes_ would equal np.unique
+        return classes, np.zeros((0, len(classes)))
     clf = LinearSVC(C=0.5, random_state=0) if sparse.issparse(train) else RidgeClassifier(alpha=1.0)
     scores = clf.fit(train, train_labels).decision_function(test)
     if scores.ndim == 1:  # binary problem: sklearn returns only the score of classes_[1]
@@ -187,5 +206,7 @@ def label_regression(test, train, train_gold_vectors, vocab_vectors, vocab_ids, 
     """Ridge regression sample vector -> embedding of its gold term, then rank terms by cosine to the
     predicted vector. Labels with similar meaning share signal instead of being unrelated classes
     (e.g. 'marine biome' and 'ocean biome' sit close in term space)."""
+    if test.shape[0] == 0:  # sklearn refuses 0 rows
+        return [], np.zeros(0)
     predicted = normalize(Ridge(alpha=alpha).fit(train, train_gold_vectors).predict(test))
     return rank(predicted @ vocab_vectors.T, vocab_ids)

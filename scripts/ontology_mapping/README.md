@@ -121,7 +121,10 @@ Join the outputs of 6, 6b, 6c and 7 on `sample_id`.
 ### 1. Terms
 A minimal OBO reader keeps `[Term]` stanzas with the ontology's prefix (`ENVO_00001998` style ids, list
 columns joined with `||`); FOODON is read from OWL (`rdfs:label`, synonym properties, `IAO_0000115`
-definition, named `rdfs:subClassOf` parents). PO's translated synonyms are skipped so term texts stay English.
+definition, named `rdfs:subClassOf` parents). PO's translated synonyms are skipped so term texts stay English;
+FOODON's are kept only when untagged, `en` or a regional `en-*` tag (`yoghurt` is tagged `en-br`; before
+2026-10-12 the 32 regional synonyms of 23 terms were dropped: no Metalog label and no evaluated top-5 is
+among those terms, see `experiments/README.md`, Verification).
 Obsolete terms are kept and flagged: they are not valid labels but their codes appear in metadata.
 **Term text** (`common.term_text`) = `label; synonym; ...`, e.g. `fecal material; droppings; frass; pellet`.
 Definitions are left out: they embed far from keyword lists and add noise words (country names).
@@ -129,7 +132,10 @@ Definitions are left out: they embed far from keyword lists and add noise words 
 ### 2. Labelled samples
 - Each Metalog long table is pivoted to one row per sample; the first `[ENVO:…]` / `[UBERON:…]` code of each
   slot is the label. Obsolete codes are blanked: this removes the biome of **every human sample** (Metalog's
-  `ENVO:00009003` is obsolete with no replacement).
+  `ENVO:00009003` is obsolete with no replacement): 32,449 of the 58,077 clean samples have no biome, so biome is
+  trained and scored on non-human samples only. Mapping it to *animal-associated environment* was tested and
+  rejected (`experiments/README.md` §18): every human sample is then trivially right, the prototype shifts, and the
+  90 % back-off threshold gives 82 % on non-human samples.
 - A MicrobeAtlas record is linked when its id, or any BioSample / SRA accession written inside it, equals
   Metalog's `spire_sample_name`: 58,365 records → 57,874 Metalog samples in 552 studies.
 - `text` (`common.record_to_text`), used only by the TF-IDF baseline and the LLM reranker:
@@ -225,7 +231,7 @@ Metalog pilot (w = 0 switches the LLM off for a slot); so far only biome benefit
 | `prototype` top-5 | 0.920 | 0.742 | 0.806 |
 | `prototype` back-off at 90 % strict: answered / exact | 0.79 / 0.48 | 0.60 / 0.50 | 0.81 / 0.67 |
 
-Biome numbers exclude human samples (no usable label) and use the biome label map. The trained methods are
+Biome numbers exclude human samples (no usable label; experiments §18) and use the biome label map. The trained methods are
 within ~2 points of each other; the remaining errors are mostly label conventions (near-identical samples
 from different studies share a biome label only 55 % of the time). Full tables, all experiments and the
 fold-to-fold noise: `experiments/README.md` and the findings report.
@@ -239,8 +245,9 @@ fold-to-fold noise: `experiments/README.md` and the findings report.
 - **Other labels**: write a training set with the same columns (e.g. through `2b --label_map`).
 
 ## Known limits and open decisions
-- **Human biome**: Metalog's human biome label is obsolete, so humans get *animal-associated environment*;
-  the convention needs a decision.
+- **Human biome**: Metalog's human biome label is obsolete. Decision (experiments §18): keep it blank for
+  training and calibration; human samples get *animal-associated environment* (the model already gives it to
+  29,298 of 29,300 Metalog human samples in the atlas run), reported separately from the biome scores.
 - **Accuracy targets are Metalog's**: τ, the reranker weights and the gate are fitted on Metalog-linked
   studies (shotgun, 56 % human); the atlas is mostly amplicon data from small studies. The coarse gold check
   (1,021 hand-labelled atlas samples) supports the 90 % target for animal / soil / water samples only;

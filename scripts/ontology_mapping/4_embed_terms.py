@@ -36,6 +36,9 @@ def main():
 
     terms = load_terms(args.ontology_terms)
     texts = list(dict.fromkeys(terms["text"]))  # distinct texts, stable order
+    if not texts:  # otherwise no .h5 is written, and later steps fail on a missing file with no hint why
+        raise SystemExit(f"{args.ontology_terms} has no non-obsolete terms: nothing to embed "
+                         "(check the output of 1_build_term_index.py)")
     n_tokens, method = estimate_tokens(texts, args.model)
     print(f"{len(terms)} terms ({terms['ontology'].value_counts().to_dict()}), {len(texts)} distinct texts, "
           f"{n_tokens:,} tokens ({method}) = ${n_tokens / 1e6 * PRICE_PER_1M_TOKENS[args.model]:.3f}")

@@ -155,7 +155,7 @@ def score(g, parents, term_vector_of, ancestors):
       top1_near_synonym         top-1 counted as a hit if its term vector has cosine >= 0.8 with the gold
                                 term's (near-synonyms such as 'microbial mat' / 'microbial mat material')
       macro_top1                mean of per-label top-1 (weights rare labels like frequent ones)
-      top1_confident_half       top-1 on the 50 % most confident samples
+      top1_confident_half       top-1 on the 50 % most confident samples (None for a single sample)
       top1_unseen_label         top-1 on samples whose gold term never occurs in the training fold
       pred_gold_cosine          mean cosine between predicted and gold term vectors (1 = exact)
       margin_for_90pct_precision / coverage_at_90pct_precision   see precision_threshold()
@@ -170,7 +170,7 @@ def score(g, parents, term_vector_of, ancestors):
         "top1_or_parent_child": near.mean(),
         "top1_gold_or_ancestor": np.mean([p == t or p in ancestors.get(t, ()) for p, t in zip(pred, gold)]),
         "macro_top1": pd.Series(hit).groupby(gold).mean().mean(),
-        "top1_confident_half": hit[np.argsort(-confidence, kind="stable")[:len(g) // 2]].mean(),
+        "top1_confident_half": hit[np.argsort(-confidence, kind="stable")[:len(g) // 2]].mean() if len(g) > 1 else None,
         "n_unseen_label": int(unseen.sum()), "top1_unseen_label": hit[unseen].mean() if unseen.any() else None,
         "margin_for_90pct_precision": threshold, "coverage_at_90pct_precision": coverage,
     }
@@ -194,6 +194,9 @@ def backoff_all(backoff_folds, ancestors, args, n_samples):
     name = f"{args.backoff_metric}_{args.backoff_target}"  # e.g. "strict_0.9"
     targets = sorted(set(args.backoff_targets) | {args.backoff_target})
     for (slot, method), folds in sorted(backoff_folds.items()):
+        if len(folds) < 2:  # temperature and tau are fitted on the *other* folds: impossible with one fold
+            print(f"  back-off skipped for {slot} / {method}: the slot was scored in {len(folds)} fold(s), 2 are needed")
+            continue
         report, fitted = hierarchy.oof_backoff(folds, ancestors, targets)
         reports[(slot, method)] = report
         p_top1 = []
@@ -236,6 +239,12 @@ def evaluate_fold(args, train, test, train_x, test_x, term_matrix, term_ids, ter
     records, backoff_inputs = [], {}
     for slot in SLOTS:
         tr, te = train[slot].ne("").to_numpy(), test[slot].ne("").to_numpy()  # samples labelled in this slot
+        if not tr.any() or not te.any():
+            # no label to learn from, or no sample to test: skip the slot in this fold (the methods need both;
+            # e.g. retrieval over an empty vocabulary or prototypes of 0 test rows would crash)
+            if te.any():
+                print(f"  {slot}: no labelled training sample in this fold, {te.sum()} test samples not scored")
+            continue
         y, x_tr, x_te = train[slot].to_numpy()[tr], train_x[tr], test_x[te]
         closed = np.isin(term_ids, y)  # the "closed" vocabulary: terms used as training labels of this slot
         classes, linear = M.linear_scores(x_te, x_tr, y)

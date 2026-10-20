@@ -7,6 +7,9 @@ Linking: a MicrobeAtlas record is linked to a Metalog sample when the record id
 (SRS/ERS/DRS) or any BioSample accession (SAMN/SAMEA/SAMD...) inside the record
 equals Metalog's `spire_sample_name`.
 
+Metalog: the *_all_long_<date>.tsv.gz files of ONE snapshot of --metalog_dir (--date, default: the
+latest), as in 2b_clean_metalog.py; two snapshots side by side are never mixed.
+
 Output columns: sample_id, spire_sample_name, study_code, domain,
                 biome, feature, material (term ids, "" if none), text
 
@@ -34,14 +37,35 @@ from common import iter_sample_info, record_to_text
 SLOTS = {"environment_biome": "biome", "environment_feature": "feature", "environment_material": "material"}
 GOLD_VALUE = re.compile(r"\[(ENVO|UBERON):(\d+)\]")  # "soil [ENVO:00001998]" -> ENVO, 00001998
 ACCESSION = re.compile(r"\b(SAM[END][A-Z]?\d+|[SED]RS\d+)\b")  # BioSample (SAMN/SAMEA/SAMD) or SRA sample
+SNAPSHOT_FILE = re.compile(r"_all_long_(\d{4}-\d{2}-\d{2})\.tsv\.gz$")  # human_all_long_2026-09-20.tsv.gz
+COLUMNS = ["sample_id", "spire_sample_name", "study_code", "domain", *SLOTS.values(), "text"]
 
 
-def load_metalog_labels(metalog_dir, valid_terms):
+def snapshot_paths(metalog_dir, date=None):
+    """(date, sorted *_all_long_<date>.tsv.gz paths) of one Metalog snapshot; date None = the latest in the folder.
+    Example: ('~/metalog', None) -> ('2026-09-20', ['.../animal_all_long_2026-09-20.tsv.gz', '.../human_all_long_...']).
+    Reading every snapshot would mix them, an accession keeping the values of the OLDEST file (the first
+    one in sorted order); 2b_clean_metalog.py picks its snapshot the same way."""
+    paths = sorted(glob.glob(os.path.join(metalog_dir, "*_all_long_*.tsv.gz")))
+    dates = sorted({m[1] for m in map(SNAPSHOT_FILE.search, paths) if m})
+    if not dates:
+        raise SystemExit(f"no *_all_long_<YYYY-MM-DD>.tsv.gz files in {metalog_dir}")
+    date = date or dates[-1]
+    chosen = [p for p in paths if p.endswith(f"_all_long_{date}.tsv.gz")]
+    if not chosen:
+        raise SystemExit(f"no *_all_long_{date}.tsv.gz files in {metalog_dir} (snapshots there: {', '.join(dates)})")
+    return date, chosen
+
+
+def load_metalog_labels(metalog_dir, valid_terms, date=None):
     """One row per Metalog sample: spire_sample_name, study_code, domain + one term id per slot.
     Example row: SAMEA5617776, Shao_2019_infants, human, biome "", feature ENVO_2100002 (intestine environment),
-    material ENVO_00002003 (fecal material); the human biome is blanked: Metalog's ENVO:00009003 is obsolete."""
+    material ENVO_00002003 (fecal material); the human biome is blanked: Metalog's ENVO:00009003 is obsolete.
+    Reads the snapshot `date` (default: the latest one, see snapshot_paths)."""
+    date, paths = snapshot_paths(metalog_dir, date)
+    print(f"Metalog snapshot {date}")
     frames = []
-    for path in sorted(glob.glob(os.path.join(metalog_dir, "*_all_long_*.tsv.gz"))):
+    for path in paths:
         df = pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False)
         df = df[df["metadata_item"].isin(["spire_sample_name", "study_code", *SLOTS])]
         # long table (sample_alias, metadata_item, value) -> one row per sample, one column per item
@@ -68,6 +92,7 @@ def main():
     parser.add_argument("--sample_info", required=True, help="MicrobeAtlas sample.info(.gz)")
     parser.add_argument("--ontology_terms", required=True, help="TSV from 1_build_term_index.py")
     parser.add_argument("--output", required=True)
+    parser.add_argument("--date", help="Metalog snapshot date YYYY-MM-DD (default: the latest in --metalog_dir)")
     parser.add_argument("--max_chars", type=int, default=2000, help="Truncate each sample text")
     args = parser.parse_args()
 
@@ -75,13 +100,14 @@ def main():
     code_to_label = dict(zip(terms["term_id"], terms["label"]))  # obsolete included: it is input text
     valid_terms = set(terms.loc[terms["obsolete"].astype(str) != "True", "term_id"])
 
-    labels = load_metalog_labels(os.path.expanduser(args.metalog_dir), valid_terms)
+    labels = load_metalog_labels(os.path.expanduser(args.metalog_dir), valid_terms, args.date)
     by_accession = labels.set_index("spire_sample_name")[["study_code", "domain", *SLOTS.values()]].to_dict("index")
 
     rows, n_records = [], 0
     for sample_id, lines in iter_sample_info(os.path.expanduser(args.sample_info)):
         n_records += 1
-        # the record's own id, then every BioSample / SRA accession written inside it (e.g. sample_biosample=SAMN...)
+        # the record's own id, then every BioSample / SRA accession written inside it
+        # (e.g. experiment_external_id_BioSample=SAMN...)
         accessions = [sample_id] + ACCESSION.findall(" ".join(lines))
         spire = next((acc for acc in accessions if acc in by_accession), None)  # first one Metalog knows
         if spire is None:
@@ -92,7 +118,7 @@ def main():
                      **{slot: label[slot] for slot in SLOTS.values()},
                      "text": record_to_text(lines, code_to_label, args.max_chars)})
 
-    out = pd.DataFrame(rows)
+    out = pd.DataFrame(rows, columns=COLUMNS)  # explicit columns: with no linked record, still a header
     out.to_csv(os.path.expanduser(args.output), sep="\t", index=False)
     print(f"{n_records} MicrobeAtlas records, {len(out)} linked to {out['spire_sample_name'].nunique()} Metalog samples")
     print("non-empty labels per domain:")

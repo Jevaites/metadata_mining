@@ -126,8 +126,13 @@ def coarsen_labels(labels, distances, min_support, known):
     a label never becomes an upper class outside ENVO / Uberon (e.g. a BFO root).
 
     labels: the labels to count (one per sample, "" = none). Returns {old label: new label}.
-    Example (min_support 100): 'freshwater lake biome' (40 samples) -> 'freshwater biome' when the
-    freshwater biome and its descendants together have >= 100 samples."""
+    Example (min_support 100), toy hierarchy lake -> freshwater -> aquatic, river -> freshwater,
+    marine -> aquatic, soil (no parent):
+      samples   lake 60, river 30, freshwater 20, marine 150, soil 5
+      support   lake 60, river 30, freshwater 110 (20 + 60 + 30), marine 150, soil 5, aquatic 260
+      mapping   lake -> freshwater, river -> freshwater (closest ancestor with >= 100; aquatic is farther),
+                freshwater -> freshwater (only 20 samples of its own, but 110 with its descendants),
+                marine -> marine, soil -> soil (no qualifying ancestor: kept as is)."""
     counts = pd.Series([t for t in labels if t]).value_counts()
     support = counts.copy()  # samples labelled with the term or any of its descendants
     for term, n in counts.items():
@@ -160,14 +165,19 @@ def iter_sample_info(p):
     ~10 GB uncompressed). Lines are 'key=value' without the trailing newline, e.g.
     ('SRS123', ['sample_env_biome=human gut', 'study_STUDY_TITLE=...'])."""
     sample_id, lines = None, []
-    with gzip.open(p, "rt", errors="replace") if p.endswith(".gz") else open(p) as handle:
+    opener = gzip.open if str(p).endswith(".gz") else open
+    # errors="replace" for both: a stray non-UTF-8 byte (e.g. latin-1 'é') becomes U+FFFD instead of
+    # stopping the whole 10 GB pass (plain files used to be opened without it, and with the locale encoding).
+    # newline="\n": a lone '\r' inside a value (pasted abstracts) is not a line break; it becomes a space.
+    # (Universal newlines used to split there and drop the rest of the value, or all of it.)
+    with opener(p, "rt", encoding="utf-8", errors="replace", newline="\n") as handle:
         for line in handle:
             if line.startswith(">"):
                 if sample_id:
                     yield sample_id, lines
                 sample_id, lines = line[1:].strip(), []
             else:
-                lines.append(line.rstrip("\n"))
+                lines.append(line.rstrip("\r\n").replace("\r", " "))
     if sample_id:
         yield sample_id, lines
 

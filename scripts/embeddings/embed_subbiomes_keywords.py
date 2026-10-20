@@ -146,26 +146,34 @@ def h5_append(path, **columns):
 
 
 def h5_strings(path, column):
-    """Read a string column back, or [] if the file does not exist yet."""
+    """Read a string column back, or [] if the file or the column does not exist yet."""
     if not os.path.exists(path):
         return []
     with h5py.File(path, "r") as f:
+        if column not in f:
+            return []
         return [s.decode("utf-8") if isinstance(s, bytes) else s for s in f[column][:]]
 
 
-def h5_align(path):
-    """Cut every column back to the shortest one.
+def h5_align(path, columns):
+    """Cut every column back to the shortest one; a column in `columns` that
+    does not exist yet counts as 0 rows.
 
     h5_append resizes and writes each column in turn, so a crash in the middle
     of a call (a full disk, a kill) leaves them at different lengths - and the
     longer ones point past the end of the file. Since resume trusts the row
     count, an unrepaired file would silently misalign sample_ids against
     embeddings from that point on. Dropping the incomplete tail is always safe:
-    those rows get rewritten from the source."""
+    those rows get rewritten from the source.
+
+    The expected columns must be named because a crash during the very first
+    h5_append can leave a file where the later columns were never created (a
+    full disk fails on 'embeddings', the big one): judged only by the columns
+    present, such a file would look complete."""
     if not os.path.exists(path):
         return
     with h5py.File(path, "a") as f:
-        lengths = {name: f[name].shape[0] for name in f}
+        lengths = {name: f[name].shape[0] if name in f else 0 for name in sorted(set(columns) | set(f))}
         if len(set(lengths.values())) < 2:
             return
         shortest = min(lengths.values())
@@ -190,7 +198,7 @@ def check_disk_space(out_dir, needed_bytes):
 # --------------------------------------------------------------------------
 
 def embed_unique(label, texts, out_path, client, model, dim, batch_size):
-    h5_align(out_path)
+    h5_align(out_path, ("texts", "embeddings"))
     done = set(h5_strings(out_path, "texts"))
     todo = [t for t in texts if t not in done]
     print(f"[{label}] {len(texts)} distinct texts: {len(done)} already embedded, {len(todo)} to do")
@@ -216,7 +224,7 @@ def embed_unique(label, texts, out_path, client, model, dim, batch_size):
 # --------------------------------------------------------------------------
 
 def materialize(label, samples, text_to_vector, out_path, chunk=20_000):
-    h5_align(out_path)
+    h5_align(out_path, ("sample_ids", "texts", "embeddings"))
     done = set(h5_strings(out_path, "sample_ids"))
     if done:
         print(f"  [{label}] resuming: {len(done)} samples already written")
@@ -358,6 +366,9 @@ def main():
     client = OpenAI(api_key=open(os.path.expanduser(args.api_key_path)).read().strip(), max_retries=8)
 
     for target in args.targets:
+        if not unique_of[target]:  # e.g. a subset whose samples all have empty keywords
+            print(f"\n[{target}] no usable text in this subset: nothing to embed, no file written")
+            continue
         unique_path = os.path.join(out_dir, f"GPT_{target}_unique_embeddings__{tag}.h5")
         embed_unique(target, unique_of[target], unique_path, client, args.model, dim,
                      min(args.batch_size, MAX_BATCH))

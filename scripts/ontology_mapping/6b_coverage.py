@@ -23,7 +23,8 @@ linear, prototype and knn_study atlases (merge on sample_id).
 
 Training samples: those of the atlas model (common.select_samples with the same --max_per_study and
 --seed). Similarities are computed once per distinct (keyword, sub-biome) text pair (1.6M for 3.4M
-samples) against the distinct training vectors. Resumable like step 6 (--max_seconds, parts/).
+samples) against the distinct training vectors. Resumable like step 6 (--max_seconds, parts/), with the same
+settings (--chunk_rows included).
 
 python 6b_coverage.py \
   --samples ~/MicrobeAtlasProject/metalog/clean/training_set.clean.tsv.gz \
@@ -52,6 +53,8 @@ from common import file_md5, load_npz, path, read_tsv, select_samples
 
 def top_k_mean(sim, k):
     """-> (mean of the k largest values per row, column of the largest)."""
+    if not 1 <= k <= sim.shape[1]:  # np.partition would silently accept n < k <= 2n (negative kth)
+        raise ValueError(f"k={k}: there are only {sim.shape[1]} training samples")
     best = sim.argmax(axis=1)
     if k == 1:
         return sim[np.arange(len(sim)), best], best
@@ -60,15 +63,23 @@ def top_k_mean(sim, k):
 
 
 def calibrate(kw, sb, groups, k, quantile, block=2000):
-    """Similarity of every training sample to the training samples of the other groups."""
+    """Similarity of every training sample to the training samples of the other groups.
+
+    A sample with fewer than k training samples outside its group has no held-out similarity (NaN, left out
+    of the quantiles: its top k would include masked -inf values). ValueError when no sample has one."""
     _, g = np.unique(groups, return_inverse=True)
     held_out = np.zeros(len(kw))
     for s0 in range(0, len(kw), block):
         sim = 0.5 * (kw[s0:s0 + block] @ kw.T + sb[s0:s0 + block] @ sb.T)
         sim[g[s0:s0 + block, None] == g[None, :]] = -np.inf
         held_out[s0:s0 + block] = top_k_mean(sim, k)[0]
+    held_out[~np.isfinite(held_out)] = np.nan  # -inf: fewer than k samples outside the group
+    if np.isnan(held_out).all():
+        raise ValueError(f"no training sample has {k} training sample(s) outside its own group "
+                         f"({len(set(g))} group(s)): the threshold cannot be calibrated")
     qs = [0.01, 0.02, 0.05, 0.1, 0.25, 0.5]
-    return float(np.quantile(held_out, quantile)), {str(q): round(float(np.quantile(held_out, q)), 4) for q in qs}, held_out
+    return (float(np.nanquantile(held_out, quantile)),
+            {str(q): round(float(np.nanquantile(held_out, q)), 4) for q in qs}, held_out)
 
 
 def main():
@@ -98,12 +109,15 @@ def main():
     train_kw = kw[[kw_row[s] for s in train["sample_id"]]].astype(np.float32)
     train_sb = sb[[sb_row[s] for s in train["sample_id"]]].astype(np.float32)
     train_studies = train["study_code"].to_numpy()
+    if not 1 <= args.k <= len(train):
+        raise SystemExit(f"--k {args.k}: needs 1 <= k <= {len(train)} (the number of training samples)")
 
     # inputs identified by content (md5), so a run can be resumed from another session / mount point
     md5 = lambda p: file_md5(p) if p else None
     settings = {"samples": md5(args.samples), "fold_groups": md5(args.fold_groups), "k": args.k,
                 "quantile": args.quantile, "max_per_study": args.max_per_study, "seed": args.seed,
-                "only_ids": md5(args.only_ids), "n_train": len(train)}
+                "only_ids": md5(args.only_ids), "n_train": len(train),
+                "chunk_rows": args.chunk_rows}  # parts are named by first row: another chunk size would mix them
     calibration_path = os.path.join(out_dir, "coverage_calibration.json")
     if os.path.exists(calibration_path):
         saved = json.load(open(calibration_path))
@@ -119,10 +133,12 @@ def main():
         threshold = round(threshold, 4)  # the value saved and used by every (resumed) run
         pd.DataFrame({"sample_id": train["sample_id"], "study_code": train_studies,
                       "held_out_sim": np.round(held_out, 4)}).to_csv(
-            os.path.join(out_dir, "metalog_held_out_sim.tsv.gz"), sep="\t", index=False, compression="gzip")
+            os.path.join(out_dir, "metalog_held_out_sim.tsv.gz"), sep="\t", index=False, compression="gzip",
+            na_rep="nan")  # no held-out similarity: "nan", which read_tsv(...).astype(float) still parses
         json.dump({"settings": settings, "threshold": threshold, "held_out_quantiles": quantiles},
                   open(calibration_path, "w"), indent=1)
-        print(f"{len(train)} training samples, {groups.nunique()} groups; held-out similarity quantiles {quantiles}; "
+        print(f"{len(train)} training samples, {groups.nunique()} groups, {np.isnan(held_out).sum()} without a "
+              f"held-out similarity (fewer than --k samples outside their group); quantiles {quantiles}; "
               f"threshold {threshold:.4f} ({time.time() - start:.0f}s)")
 
     index = dict(np.load(path(args.index)))
@@ -167,10 +183,12 @@ def main():
             print(f"rows {first}-{first + args.chunk_rows}: {in_chunk.sum()} samples ({time.time() - start:.0f}s)")
 
     final = os.path.join(out_dir, "atlas_coverage.tsv.gz")
-    out = pd.concat(read_tsv(p) for p in sorted(glob.glob(os.path.join(out_dir, "parts", "rows_*.tsv.gz"))))
+    parts = sorted(glob.glob(os.path.join(out_dir, "parts", "rows_*.tsv.gz")))
+    out = (pd.concat(read_tsv(p) for p in parts) if parts  # no part: no atlas sample to score
+           else pd.DataFrame(columns=["sample_id", "coverage_sim", "nearest_study", "in_coverage"]))
     out["in_coverage"] = out["coverage_sim"].astype(float) >= threshold  # same rule for every part
     out.to_csv(final, sep="\t", index=False, compression="gzip")
-    print(f"Wrote {final}: {len(out)} samples, {(~out['in_coverage']).mean():.1%} outside coverage "
+    print(f"Wrote {final}: {len(out)} samples, {(~out['in_coverage']).mean() if len(out) else 0:.1%} outside coverage "
           f"(threshold {threshold:.4f})")
 
 

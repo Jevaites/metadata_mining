@@ -79,13 +79,14 @@ class Closure:
         self.is_label = np.isin(self.nodes, self.vocab)
         self.depth = np.array([len(anc.get(n, ())) for n in nodes])  # number of ancestors (tie-break only)
         # allowed answers: "labels" = only terms Metalog uses in this slot (any depth), unless they sit above
-        # half of the slot's labels; "ontology" = also their ENVO/UBERON ancestors, unless above `floor`
+        # half of the slot's labels; "ontology" = every label (any ontology, any share: PO / FOODON labels
+        # included) plus their ENVO/UBERON ancestors that are below `floor` of the labels
         onto = np.array([n.startswith(("ENVO_", "UBERON_")) for n in nodes])
         not_root = ~np.isin(self.nodes, list(NO_ANSWER))
         if answers == "labels":
             self.informative = self.is_label & (self.n_below < 0.5 * len(self.vocab)) & not_root
         else:
-            self.informative = onto & ((self.n_below < floor * len(self.vocab)) | self.is_label) & not_root
+            self.informative = ((onto & (self.n_below < floor * len(self.vocab))) | self.is_label) & not_root
         # order among candidate answers: most specific first (fewest labels below), then labels, then
         # deeper; q (< 1) breaks the remaining ties because the other terms are multiples of 10
         self.rank_key = -self.n_below * 1e6 + self.is_label * 1e4 + self.depth * 10
@@ -183,14 +184,20 @@ def decode_candidates(cands, p, tau, allowed, anc):
     among the most probable candidate and its broader terms in `allowed` (the slot's labels; the
     slot roots never count), most specific first, the first whose summed probability (itself + the
     candidates below it) reaches tau. Probability outside the candidates is not counted, so this is
-    slightly more cautious than Closure.decode. -> (term or None, its summed probability)."""
+    slightly more cautious than Closure.decode. Broader terms of equal depth (several parents in the
+    DAG) are tried in a fixed order, the more probable first, then by id: the answer never depends on
+    the iteration order of the ancestor set (which changes with PYTHONHASHSEED).
+    -> (term or None, its summed probability)."""
+    def summed(node):  # the node's probability: candidates equal to it or below it
+        return sum(pi for c, pi in zip(cands, p) if c == node or node in anc.get(c, ()))
+
     top = cands[int(np.argmax(p))]
-    chain = [top] + sorted((a for a in anc.get(top, ()) if a in allowed and a not in NO_ANSWER),
-                           key=lambda a: len(anc.get(a, ())), reverse=True)  # deepest ancestor first
+    broader = [a for a in anc.get(top, ()) if a in allowed and a not in NO_ANSWER]
+    chain = [top] + sorted(broader, key=lambda a: (-len(anc.get(a, ())), -summed(a), a))  # deepest first
     for node in chain:
         if node in NO_ANSWER:
             continue
-        q = sum(pi for c, pi in zip(cands, p) if c == node or node in anc.get(c, ()))
+        q = summed(node)
         if q >= tau - 1e-12:
             return node, float(q)
     return None, 0.0

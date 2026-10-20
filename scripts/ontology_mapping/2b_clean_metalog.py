@@ -12,7 +12,8 @@ Outputs, in --output_dir:
                               like a control / culture / sort / mesocosm / ancient sample. One row per
                               study x category, with an empty `decision` column to fill in.
   training_set.clean.tsv.gz   step-2 rows usable for training (hard drops removed), cleaned labels in
-                              biome/feature/material, raw ids in *_raw. Same columns 5_evaluate.py reads.
+                              biome/feature/material, the step-2 ids in *_raw (ENVO / UBERON only,
+                              obsolete ids already blanked). Same columns 5_evaluate.py reads.
   training_set.gold.tsv.gz    the rows fit for evaluation: in_gold_eval and not a duplicate text
   summary.md                  counts for every flag
 
@@ -107,7 +108,12 @@ STUDY_PART = re.compile(r"(^|; )(study_title|study_abstract|study_description|ab
 
 
 def audited_fields(text):
-    """The AUDIT_KEYS fields of a step-2 text 'key: value; key: value' (study part cut off first)."""
+    """The AUDIT_KEYS fields of a step-2 text 'key: value; key: value' (study part cut off first).
+    Example (JGI_river_DOM): 'title: Freshwater microbial communities from St. Lawrence River, ... - Law_Cont_RepA_8d;
+      scientific_name: riverine metagenome; geo_loc_name: USA: New York; isolation_source: river water;
+      study_title: ...; study_abstract: ...; control no DOM added; 8d time point'
+      ->  'title: Freshwater microbial communities from St. Lawrence River, ... - Law_Cont_RepA_8d;
+           isolation_source: river water'  (the abstract's "control" is never audited)"""
     kept = []
     for pair in STUDY_PART.split(text)[0].split("; "):
         key, _, value = pair.partition(": ")
@@ -118,7 +124,9 @@ def audited_fields(text):
 
 # ----------------------------------------------------------------------------- inputs
 def snapshot_files(metalog_dir, date):
-    """{domain: (core_wide, all_long)} for one snapshot date (default: the latest one)."""
+    """(date, {domain: (core_wide, all_long)}) for one snapshot date (default: the latest one).
+    Example: snapshot_files('~/MicrobeAtlasProject/metalog', None) -> ('2026-09-20',
+      {'human': ('.../human_core_wide_2026-09-20.tsv.gz', '.../human_all_long_2026-09-20.tsv.gz'), 'animal': ...})"""
     dates = sorted({re.search(r"_(\d{4}-\d{2}-\d{2})\.tsv\.gz$", f).group(1)
                     for f in glob.glob(os.path.join(metalog_dir, "*_core_wide_*.tsv.gz"))})
     if not dates:
@@ -136,6 +144,11 @@ def snapshot_files(metalog_dir, date):
 
 
 def load_core(files):
+    """All domains' core_wide tables stacked into one frame: domain, alias, study, accession, the
+    `artificial` field and the three raw environment labels (missing cells -> "").
+    Example row: human | Cait_2019_infant.sample_AC114 | Cait_2019_infant | SAMEA5564323 | '' |
+      obsolete human-associated habitat [ENVO:00009003] | intestine environment [ENVO:2100002] |
+      fecal material [ENVO:00002003]"""
     columns = ["sample_alias", "study_code", "spire_sample_name", "artificial", *METALOG_SLOT.values()]
     frames = []
     for domain, (core, _) in files.items():
@@ -147,7 +160,11 @@ def load_core(files):
 
 
 def load_audit_text(files, samples):
-    """Per sample: its alias plus the 'key: value' pairs of the extended/all tiers (study keys skipped)."""
+    """Per sample: its alias plus the 'key: value' pairs of the extended/all tiers whose key matches
+    AUDIT_KEYS (other keys, and so study-level keys, are skipped). Aligned with `samples`.
+    Example: Cait_2019_infant.sample_AC114 has the extended/all rows age_days=90, sample_title=..., sample_description=...,
+      atopy=control, visit=mo3 -> 'Cait_2019_infant.sample_AC114; sample_title: Sample AC114, subject 20512 at mo3 visit;
+      sample_description: Sample AC114, subject 20512 at mo3 visit' (atopy 'control' is a questionnaire answer, not audited)"""
     parts = []
     for domain, (_, long) in files.items():
         df = pd.read_csv(long, sep="\t", dtype=str, keep_default_na=False)
@@ -161,6 +178,11 @@ def load_audit_text(files, samples):
 
 
 def load_overrides(p):
+    """Reviewer decisions (audit_review.tsv or a hand-written TSV with scope, id, pattern, decision[, reason]).
+    Rows with an empty decision are dropped; decisions are lower-cased and must be in DECISIONS.
+    Example rows:
+      study   Wortelboer_2023_FMT_metabolic_syndrome  <virome_enrichment regex>  perturbed  donor VLP preps
+      sample  Zhou_2022_MS.11326.BLANK21.12F          (empty)                    control"""
     if not p:
         return pd.DataFrame(columns=["scope", "id", "pattern", "decision", "reason"])
     df = read_tsv(p)
@@ -178,7 +200,9 @@ def load_overrides(p):
 
 
 def load_label_map(p):
-    """{(slot, from_id): to_id}; slot '*' applies to every slot."""
+    """{(slot, from_id): to_id}; slot '*' applies to every slot.
+    Example (clean/biome_label_map.tsv): {('biome', 'ENVO_01001305'): 'ENVO_01000245',  # vegetated area -> cropland biome
+                                          ('biome', 'ENVO_00000428'): ''}  # 'biome' itself: uninformative, blanked"""
     if not p:
         return {}
     df = read_tsv(p)
@@ -187,6 +211,15 @@ def load_label_map(p):
 
 # ----------------------------------------------------------------------------- flags
 def flag_labels(samples, terms, label_map):
+    """Add, per slot, <slot>_raw (the id in the raw value), <slot>_status, <slot>_clean (--label_map applied,
+    else the raw id when status is ok) and <slot>_ontology; plus biome_in_biome_subtree. In place.
+    Examples (raw value -> raw, status, clean):
+      'fecal material [ENVO:00002003]'                    -> ENVO_00002003, ok, ENVO_00002003
+      'obsolete human-associated habitat [ENVO:00009003]' -> ENVO_00009003, obsolete, '' (unless the label map has it)
+      'ciliated cell [CL:0000064]'                        -> CL_0000064, other_ontology, ''
+      'negative control'                                  -> '', control_value, ''
+    biome_in_biome_subtree: marine pelagic biome (ENVO_01000023) -> 'True',
+      animal-associated environment (ENVO_01001002) -> 'False', no clean biome -> ''."""
     ontology_ok = set(terms.loc[terms["obsolete"] != "True", "term_id"])
     obsolete = set(terms.loc[terms["obsolete"] == "True", "term_id"])
     ancestors = term_ancestors(terms)
@@ -205,6 +238,9 @@ def flag_labels(samples, terms, label_map):
         status[raw.eq("")] = "empty"
 
         def clean(t, s):
+            """The clean id for raw id t with status s: the label map target if (slot, t) or ('*', t) is
+            mapped (even when s is not ok), else t when s is ok, else "".
+            E.g. ('ENVO_01001305', 'ok') -> 'ENVO_01000245' with the biome map above; ('CL_0000064', 'other_ontology') -> ''."""
             for key in ((slot, t), ("*", t)):
                 if key in label_map:
                     target = label_map[key]
@@ -226,11 +262,17 @@ def flag_labels(samples, terms, label_map):
 
 
 def flag_duplicates(samples):
-    """no_accession; an accession under several aliases: conflicting labels -> drop all, else keep the first."""
+    """no_accession; an accession under several aliases: conflicting labels -> drop all, else keep the first.
+    Returns one drop reason per sample ("" = keep). Example (Pascelli_2020_sponge_virus): SAMN09948715 is under
+    sample_GBR_ECHI_13 (feature buttress zone, material sponge reef) and sample_GBR_SW (feature sponge reef,
+    material sea water) -> both 'conflicting_duplicate'. Same accession with identical labels under aliases A, B
+    -> A '', B 'duplicate_alias'. Empty spire_sample_name (e.g. Lloyd-Price_2019_HMP2IBD.sample_H4008C18) -> 'no_accession'."""
     reasons = pd.Series("", index=samples.index)
     missing = samples["spire_sample_name"].str.strip().str.lower().isin(["", "na", "nan", "none"])
     reasons[missing] = "no_accession"
     has = samples[~missing]
+    if has.empty:  # no accession at all (agg on an empty frame would return a frame, not a series)
+        return reasons
     labels = has[list(METALOG_SLOT.values())].agg("|".join, axis=1)
     n_label_sets = labels.groupby(has["spire_sample_name"]).transform("nunique")
     dup = has["spire_sample_name"].duplicated(keep=False)
@@ -241,6 +283,10 @@ def flag_duplicates(samples):
 
 
 def audit(samples, audit_text):
+    """Set samples['audit_hits'] to the ';'-joined AUDIT categories found in each sample's audit text, and
+    return that text normalised ('_' and '.' -> ' ', so word boundaries work), which override patterns are matched on.
+    Example: 'Wortelboer_2023_FMT_metabolic_syndrome.D002_M009_VLP; sample_title: gut sample of 45 yo male;
+      sample_description: Donor VLP' -> audit_hits 'virome_enrichment' ('..._VLP' -> '... VLP', so the word 'VLP' matches)."""
     norm = audit_text.str.replace(r"[_.]+", " ", regex=True)  # 'NTC_1' -> 'NTC 1' so \b works
     hits = pd.Series([[] for _ in range(len(samples))], index=samples.index)
     for name, rx in AUDIT_RE.items():
@@ -252,6 +298,12 @@ def audit(samples, audit_text):
 
 
 def apply_overrides(samples, norm_text, overrides):
+    """Set artificial_bucket from Metalog's `artificial` (BUCKET_OF; unknown values -> perturbed), then let
+    reviewer decisions overwrite it ('ok' -> none). Also sets artificial_source (metalog | override | "") and
+    `reviewed`. Returns the number of sample updates made by overrides.
+    Example: Metalog 'negative control' -> control, 'sorted cells' -> perturbed, 'paleosample' -> degraded, '' -> none;
+      the row (study, Wortelboer_2023_FMT_metabolic_syndrome, <virome pattern>, perturbed) turns that study's
+      83 '..._VLP' samples into perturbed / override / reviewed, its other samples are untouched."""
     samples["artificial_bucket"] = samples["artificial"].map(lambda v: BUCKET_OF.get(v.strip().lower(), "perturbed") if v.strip() else "none")
     samples["artificial_source"] = samples["artificial"].map(lambda v: "metalog" if v.strip() else "")
     samples["reviewed"] = False
@@ -279,7 +331,11 @@ def apply_overrides(samples, norm_text, overrides):
 
 
 def review_table(samples, audit_text):
-    """One row per (study, category) for audit hits on samples that Metalog did not flag and nobody reviewed."""
+    """One row per (study, category) for audit hits on samples that Metalog did not flag and nobody reviewed.
+    Example row: study | Wang_2021_Arctic | ancient_or_post_mortem | suggested degraded | n_hit 524 of n_study 543 |
+      no Metalog flags in the study | most common material 'sediment [ENVO:00002007]' | up to 3 text snippets
+      around the match ('sample_title: Sample for the Ancient arctic plant and animal eDNA ...') | the category regex
+      as `pattern` | decision and reason left empty for the reviewer."""
     todo = samples[samples["audit_unreviewed"]]
     rows = []
     for (study, category), group in todo.assign(cat=todo["audit_hits"].str.split(";")).explode("cat").groupby(["study_code", "cat"]):
@@ -300,11 +356,12 @@ def review_table(samples, audit_text):
                      "decision": "", "reason": ""})
     columns = ["scope", "id", "category", "suggested", "n_hit", "n_study", "metalog_flags_in_study",
                "labels", "examples", "pattern", "decision", "reason"]
-    return pd.DataFrame(rows, columns=columns).sort_values(["n_hit"], ascending=False)
+    return pd.DataFrame(rows, columns=columns).sort_values(["n_hit", "id", "category"], ascending=[False, True, True],
+                                                           kind="stable")
 
 
 def backup_review(review_path, overrides_path):
-    """Before overwriting an audit_review.tsv that holds decisions, copy it to audit_review.previous.tsv."""
+    """Before overwriting an audit_review.tsv that holds decisions, copy it to audit_review.previous.tsv.""" 
     if not os.path.exists(review_path):
         return
     old = read_tsv(review_path)
@@ -319,6 +376,12 @@ def backup_review(review_path, overrides_path):
 
 # ----------------------------------------------------------------------------- training set
 def clean_training_set(training_path, samples):
+    """Join the step-2 training set to the flags by accession (spire_sample_name), drop rows with a
+    drop_reason or without a Metalog sample, and swap labels: biome/feature/material <- the clean ids, the
+    step-2 ids move to *_raw. Returns (clean rows, gold rows, number of step-2 rows before cleaning);
+    gold = in_gold_eval and the first row of each repeated text within a study.
+    Example: SRS4247598 (JGI_river_DOM, Law_Cont_RepA_8d, biome ENVO_01000253) has Metalog artificial 'cultivation'
+      -> kept in clean (artificial_bucket perturbed, label unchanged) but not in gold."""
     ts = read_tsv(training_path)
     canonical = samples[samples["drop_reason"].ne("duplicate_alias") & samples["spire_sample_name"].ne("")]
     canonical = canonical.drop_duplicates("spire_sample_name").set_index("spire_sample_name")
@@ -344,10 +407,17 @@ def clean_training_set(training_path, samples):
 
 # ----------------------------------------------------------------------------- report
 def counts(series):
+    """Markdown table rows '| value | n |' of a series' value counts, most frequent first; "" shows as (none).
+    Example: ['', '', 'no_accession', 'artificial_control'] -> the lines '| (none) | 2 |', '| no_accession | 1 |', '| artificial_control | 1 |'"""
     return "\n".join(f"| {k if k != '' else '(none)'} | {v:,} |" for k, v in series.value_counts().items())
 
 
 def write_summary(p, date, samples, review, n_overrides, ts_info):
+    """Write summary.md: counts of drop reasons, artificial buckets, audit rows, label statuses per slot (with the
+    top unusable raw values), clean biomes under ENVO 'biome', in_train / in_gold_eval and, with ts_info
+    (from clean_training_set), the training-set row counts. Example (snapshot 2026-09-20):
+      '159,310 Metalog samples in 1,077 studies.' ... '| artificial_control | 687 |' ...
+      '58,365 step-2 rows → 58,077 clean (training) → 42,532 gold (...), 515 studies.'"""
     lines = [f"# Metalog cleaning flags, snapshot {date}", "",
              f"{len(samples):,} Metalog samples in {samples['study_code'].nunique():,} studies.", "",
              "## Hard drops (drop_reason)", "", "| reason | samples |", "|---|---|", counts(samples["drop_reason"]), "",

@@ -120,8 +120,9 @@ def train_models(args, model_path):
         y = samples[slot].to_numpy()[has]
         if args.method == "linear":
             clf = RidgeClassifier(alpha=1.0).fit(X[has], y)
+            coef, intercept = ridge_class_scores(clf)
             model[f"{slot}_coef"], model[f"{slot}_intercept"], model[f"{slot}_classes"] = \
-                clf.coef_.astype(np.float32), clf.intercept_.astype(np.float32), clf.classes_.astype(str)
+                coef.astype(np.float32), intercept.astype(np.float32), clf.classes_.astype(str)
         elif args.method == "prototype":
             classes = np.unique(y)  # closed vocabulary = the training labels, as `prototype` in 5_evaluate
             mean, prototypes, bias = prototype_model(X[has], y, term_matrix[[term_row[t] for t in classes]],
@@ -136,24 +137,52 @@ def train_models(args, model_path):
     return model
 
 
+def ridge_class_scores(clf):
+    """(coef: classes x d, intercept: classes) of a fitted RidgeClassifier, one row per class in
+    clf.classes_. With two classes scikit-learn keeps a single score s (for classes_[1]; coef_ of shape
+    (1, d), or (d,) in recent versions): class 0 then scores -s, as methods.linear_scores does. With one
+    class it keeps one constant row (every sample gets that label, with margin 0)."""
+    coef, intercept = np.atleast_2d(clf.coef_), np.atleast_1d(clf.intercept_)
+    if len(clf.classes_) == 2 and coef.shape[0] == 1:
+        coef, intercept = np.vstack([-coef, coef]), np.concatenate([-intercept, intercept])
+    return coef, intercept
+
+
+def top1_and_margin(scores):
+    """Per row: index of the best column and margin = best - second best score (0 when there is a
+    single column, as methods.rank)."""
+    if scores.shape[1] == 1:
+        return np.zeros(len(scores), dtype=int), np.zeros(len(scores))
+    top2 = np.argpartition(-scores, 1, axis=1)[:, :2]  # best two, unordered
+    top2 = np.take_along_axis(top2, np.argsort(-np.take_along_axis(scores, top2, axis=1), axis=1), axis=1)
+    return top2[:, 0], np.take_along_axis(scores, top2, axis=1) @ [1, -1]
+
+
 def knn_study_top2(sim, labels, studies, n_classes, k):
     """knn_study for a block of samples: sim = samples x training samples (unlabelled training
     samples already set to -inf). Each of the k nearest neighbours votes 1 / (number of the k from
     its study); ties go to the label whose nearest neighbour is closest, as in 5_evaluate.knn_study.
-    -> (best class, winner's vote share)."""
-    idx = np.argpartition(-sim, k, axis=1)[:, :k]
+    -> (best class, winner's vote share).
+    Training samples at -inf are never neighbours: when fewer than k samples are labelled in the slot,
+    only those vote (5_evaluate.knn_study only ever sees the labelled samples), and k may exceed the
+    number of training samples."""
+    k = min(k, sim.shape[1])
+    idx = np.argpartition(-sim, k - 1, axis=1)[:, :k]
     idx = np.take_along_axis(idx, np.argsort(-np.take_along_axis(sim, idx, axis=1), axis=1), axis=1)
+    real = np.isfinite(np.take_along_axis(sim, idx, axis=1))  # False: an unlabelled sample, not a neighbour
     g = studies[idx]
-    weight = 1 / (g[:, :, None] == g[:, None, :]).sum(axis=2)
+    per_study = ((g[:, :, None] == g[:, None, :]) & real[:, None, :]).sum(axis=2)  # real neighbours per study
+    weight = np.where(real, 1 / np.maximum(per_study, 1), 0.0)
     rows = np.repeat(np.arange(len(idx)), k)
     votes = np.zeros((len(idx), n_classes))
     np.add.at(votes, (rows, labels[idx].ravel()), weight.ravel())
     first = np.full((len(idx), n_classes), k)
-    np.minimum.at(first, (rows, labels[idx].ravel()), np.tile(np.arange(k), len(idx)))
+    np.minimum.at(first, (rows, labels[idx].ravel()), np.where(real, np.arange(k), k).ravel())
     rounded = np.round(votes, 9)  # as in 5_evaluate.knn_study: equal votes -> the closest label
     best = np.where(rounded == rounded.max(axis=1, keepdims=True), first, k).argmin(axis=1)
-    return best, votes[np.arange(len(idx)), best] / votes.sum(axis=1)
-
+    total = votes.sum(axis=1)  # 0 only if the slot has no labelled training sample at all
+    share = np.divide(votes[np.arange(len(idx)), best], total, out=np.zeros(len(idx)), where=total > 0)
+    return best, share
 
 def build_index(args, index_path):
     """For every atlas sample with a keyword text: its row in the keyword .h5 and in the
@@ -316,10 +345,7 @@ def main():
             else:
                 for slot in SLOTS:
                     scores = chunk_scores(args.method, slot, model, parts, kw, kw_local, sb_local, has_sb[in_chunk])
-                    top2 = np.argpartition(-scores, 1, axis=1)[:, :2]  # best two, unordered
-                    top2 = np.take_along_axis(top2, np.argsort(-np.take_along_axis(scores, top2, axis=1), axis=1), axis=1)
-                    best[slot] = top2[:, 0]
-                    confidence[slot] = np.take_along_axis(scores, top2, axis=1) @ [1, -1]  # margin best - second
+                    best[slot], confidence[slot] = top1_and_margin(scores)
                     if backoff:
                         extra[slot] = backoff_columns(scores, backoff[slot], model[f"{slot}_classes"], label_of, args)
             for slot in SLOTS:

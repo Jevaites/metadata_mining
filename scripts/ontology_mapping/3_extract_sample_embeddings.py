@@ -48,10 +48,17 @@ def main():
     wanted = read_first_column(os.path.expanduser(args.sample_ids))
     text_of = dict(iter_samples(os.path.expanduser(args.texts), wanted, args.kind == "keywords"))
     print(f"{len(wanted)} samples requested, {len(text_of)} have a {args.kind} text")
+    if not text_of:
+        raise SystemExit(f"None of the {len(wanted)} requested samples has a {args.kind} text in {args.texts}: "
+                         "are --sample_ids and --texts about the same samples?")
 
     with h5py.File(os.path.expanduser(args.unique_h5), "r") as h5:
         row_of = {t.decode() if isinstance(t, bytes) else t: i for i, t in enumerate(h5["texts"][:])}
         found = {sid: row_of[t] for sid, t in text_of.items() if t in row_of}
+        if not found:  # (an empty `rows` below would also crash h5py with a cryptic TypeError)
+            raise SystemExit(f"None of the {len(text_of)} {args.kind} texts is in {args.unique_h5}: check that "
+                             "--kind matches --texts (keywords vs sub_biomes) and that the .h5 was embedded "
+                             "from these texts.")
         rows = np.array(sorted(set(found.values())))  # h5py needs increasing indices
         vectors = h5["embeddings"][rows]
     print(f"{len(found)} samples found in {os.path.basename(args.unique_h5)} "
