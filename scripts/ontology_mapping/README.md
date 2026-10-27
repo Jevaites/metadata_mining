@@ -149,7 +149,8 @@ Definitions are left out: they embed far from keyword lists and add noise words 
   (ancient, post-mortem, museum) → kept for training (the label is the source habitat), excluded from evaluation;
 - **audit**: regexes over sample-level text find artificial samples Metalog did not flag (e.g. 40 negative
   controls labelled marine sediment); they go to `audit_review.tsv` for a human decision;
-- **label status** per slot and the **label map** (`slot, from_id, to_id`): `biome_label_map.tsv` maps the
+- **label status** per slot and the **label map** (`slot, from_id, to_id`, optional `study_code` for a row that
+  applies to one study only): `biome_label_map.tsv` maps the
   54 non-biome terms used in the biome slot (e.g. *lentic water body* → *freshwater lake biome*) and the
   material *rhizosphere* / *rhizoplane* → *soil*. Raw ids stay in `<slot>_raw`.
 Outputs `training_set.clean.tsv.gz` (training) and `training_set.gold.tsv.gz` (evaluation subset).
@@ -253,6 +254,8 @@ fold-to-fold noise: `experiments/README.md` and the findings report.
   (1,021 hand-labelled atlas samples) supports the 90 % target for animal / soil / water samples only;
   check a few hundred atlas samples at the term level before quoting it.
 - **The biome label map is a draft** (23 rows to review), and part of its gain is by construction.
+  `experiments/draft_biome_label_map.py` flags close or split decisions and can ask an LLM to check each term
+  (`--llm dry_run` / `run`; experiments §7).
 - **Pending decisions**: strict vs lenient accuracy (are "more specific than Metalog" answers acceptable?),
   and the review of `audit_review.tsv`.
 - **Linked samples get a prediction, not their curated label**: for the 58k Metalog-linked atlas samples the

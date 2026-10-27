@@ -161,6 +161,14 @@ def test_load_label_map(tmp_path):
     assert clean.load_label_map(None) == {}
 
 
+def test_load_label_map_study_rows_get_a_three_part_key(tmp_path):
+    p = write_tsv(tmp_path / "map.tsv", [
+        {"slot": "biome", "from_id": "ENVO_00002030", "to_id": "ENVO_01000252", "reason": "", "study_code": ""},
+        {"slot": "biome", "from_id": "ENVO_00002030", "to_id": "ENVO_00000447", "reason": "", "study_code": " S2 "}])
+    assert clean.load_label_map(p) == {("biome", "ENVO_00002030"): "ENVO_01000252",
+                                       ("biome", "ENVO_00002030", "S2"): "ENVO_00000447"}
+
+
 # ============================================================================= flag_labels
 def flag(biome="", feature="", material="", label_map=None):
     """Run flag_labels on one sample with the toy ontology; return the sample's row as a dict."""
@@ -240,6 +248,14 @@ def test_label_map_target_outside_the_index_is_used_but_warned_about(capsys):
     row = flag(material="soil [ENVO:00001998]", label_map={("material", "ENVO_00001998"): "ENVO_12345678"})
     assert row["material_clean"] == "ENVO_12345678"
     assert "WARNING: label map targets not valid in the term index: {'ENVO_12345678': 1}" in capsys.readouterr().out
+
+
+def test_label_map_study_row_applies_to_its_study_only_and_wins_over_the_plain_row():
+    label_map = {("biome", "ENVO_00000428"): "ENVO_00000447",          # every study
+                 ("biome", "ENVO_00000428", "S"): "ENVO_01000023"}     # study S (the toy sample's study)
+    assert flag(biome="biome [ENVO:00000428]", label_map=label_map)["biome_clean"] == "ENVO_01000023"
+    other = {("biome", "ENVO_00000428"): "ENVO_00000447", ("biome", "ENVO_00000428", "T"): "ENVO_01000023"}
+    assert flag(biome="biome [ENVO:00000428]", label_map=other)["biome_clean"] == "ENVO_00000447"
 
 
 # ============================================================================= flag_duplicates

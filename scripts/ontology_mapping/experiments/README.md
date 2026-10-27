@@ -32,6 +32,7 @@ folds, ≤ 50 samples per study (17.7k samples, 539 studies). Biome excludes hum
 | 17 | Is one probability threshold enough? Can zero-shot take over when the model abstains? | `confidence_checks.py` | Yes: margin, runner-up, entropy add ≤ 0.004 AUC. Abstention catches 67–86 % of unseen-label feature / material samples; zero-shot alone gets 11–25 % of them (plain label), so it needs a reranker |
 | 18 | Should human samples get a biome label (the obsolete human biome mapped to animal-associated environment)? | `human_biome.py` | No: they are all right (+14 points micro, nothing learned), the prototype loses 9 points on animal samples, and the 90 % back-off threshold gives 82 % on non-human samples. Keep blank, report separately |
 | 19 | Questions from the deck review (Oct 2026): label ceiling on near-duplicates, retrieval ablation and slot subsets, feature / material maps, back-off vs answering everything, cap, balancing, encoders, clusters, atlas checks | `deck_review/` (see `deck_review/README.md`) | 61 / 81 / 96 % of errors on near-duplicates are curator disagreements; restricting biome to ENVO biomes makes zero-shot 13× better; a reviewed feature map would add ~3 points; back-off trades exact answers for 3–6× fewer errors |
+| 20 | Does the LLM-checked biome label map improve the model? | `draft_biome_label_map.py --llm`, `biome_map_compare.py` | Taken as is, no (−2 points top-1 for linear / knn_study on samples it does not relabel). A reviewed mix (11 LLM choices, 4 own, rest as now) gives +1.3 points for the production prototype and ±0 for the others; to be confirmed by a researcher |
 | – | Is step 6 the model of step 5? | `verify_atlas_methods.py` | Identical top-1 for every method and slot |
 
 `run_all.sh` reproduces §1–4 (≈ 1.5–3 h). `_setup.py` holds the shared loading code.
@@ -151,6 +152,23 @@ top-1 points; reranking everything *lowers* feature and material. The **biome la
 (`draft_biome_label_map.py`: 54 non-biome terms used as biomes → an ENVO biome by cross-study kNN votes, a
 biome-only prototype and label similarity) lifts top-1 on samples it did *not* relabel by +4.9 points (all 3
 seeds +4.5 to +5.2): part of the overall gain is by construction, this part is not.
+
+Checking the map (2026-10-27). `draft_biome_label_map.py` now also writes `flags` per term: *disagree*
+(kNN and model top choices differ, 25 of 54 terms), *knn_close* / *model_close* (top-2 within 15 points,
+20 / 18), *weak* (the proposal's branch gets < 50 % in both, 4) and *study_split* (4): for a term used by
+several studies (10 terms), the same rules are run on each study's samples (`per_study` column) and the flag
+is set when a study with ≥ 3 samples lands outside the term-level proposal's branch, e.g. *wastewater
+treatment plant* → anthropogenic terrestrial biome for three sludge studies but *freshwater river biome* for
+Lekunberri_2018 (river water up- and downstream of a plant). 32 terms carry at least one flag. The flags
+miss semantic oddities (troposphere → urban biome with kNN 100 %, model 94 %), so `--llm` asks an LLM to
+choose among the candidates (kNN top 2, model top 2, 3 closest biome names, one broader option and, for a
+multi-study term, each study's own statistical choice, with ENVO definitions; one prompt per term; evidence = study codes, Metalog feature / material labels and sample texts, *without* the
+statistics, so agreement is an independent check) and, for multi-study terms, whether one biome fits every
+study (per study it may also answer "none fits" and name another biome). Agreement → `confirmed`; anything
+else → `review`; per-study answers become rows with a
+`study_code`, which `2b_clean_metalog.py --label_map` applies to that study only. `--llm dry_run` writes
+the prompts without an API call; `--llm run` caches answers (`<output>.llm.jsonl`, resumable). Without
+`--llm` the script gives the same to_id, status and evidence as `clean/biome_label_map.tsv`.
 
 ## 7c. LLM reranker pilot (`rerank_pilot.py`; 500 gated samples per slot)
 
@@ -436,6 +454,78 @@ that is 100 % against the mapped label. If the label is wanted in training later
 only, and give the class one prototype per domain (or a study-balanced centroid) so human-gut text does not
 redefine "animal".
 
+## 20. The LLM-checked biome label map (`biome_map_compare.py`; 2026-10-27)
+
+`draft_biome_label_map.py --llm run` (§7) gave 20 terms where the statistics and the LLM agree and 34 to review. The
+question: are the LLM's choices better labels? Five maps were compared, each through 2b and step 5
+(`--closed_only`, fold seeds 0–2, all else equal):
+
+| arm | map | biome rows that differ from `current` |
+|---|---|---|
+| current | `clean/biome_label_map.tsv` (production, 2026-10-05; = the draft's `stat_to_id`) | – |
+| llm | the draft as written (LLM choice wherever it named a candidate, plus the per-study row) | 30 |
+| reviewed | Claude's first review: LLM where its choice is better supported by the sample texts, statistics otherwise | 20 |
+| reviewed_v2 | + 7 rows set back for consistency with other studies of the same site / sample type (below) | 14 |
+| reviewed_v3 | + transportation → urban biome | 15 |
+
+The fair score is on **unchanged samples**: biome-labelled samples whose raw Metalog term is a real biome (no map
+touches them; 8,238 per seed). Their labels are identical in every arm, so a change there comes only from how the
+relabelled training samples teach the model. Paired differences vs `current` (mean over seeds [min, max], points):
+
+| arm | prototype (production) top-1 | linear top-1 | knn_study top-1 | prototype macro | prototype back-off @90 %: coverage / accuracy |
+|---|---|---|---|---|---|
+| current (absolute) | 0.645 | 0.662 | 0.676 | 0.259 | 0.813 / 0.895 |
+| llm | +0.3 [−0.3, +1.1] | −2.0 [−3.1, −0.1] | −2.1 [−2.5, −1.7] | −0.6 | −1.3 / +1.0 |
+| reviewed | +0.6 [0.0, +1.0] | −0.6 [−1.6, +0.3] | −2.4 [−3.2, −1.2] | −0.2 | +0.3 / −0.1 |
+| reviewed_v2 | +1.0 [+1.0, +1.2] | +0.3 [−0.1, +0.6] | 0.0 [−0.4, +0.5] | +0.2 | +0.3 / +0.2 |
+| reviewed_v3 | **+1.3 [+1.1, +1.4]** | +0.3 [0.0, +0.5] | 0.0 [−0.4, +0.5] | +0.5 | +0.2 / +0.1 |
+
+Linear's back-off coverage at 90 % rises by 7 points in v3 (accuracy −0.4); top-5 falls by ~0.4 points in every
+reviewed arm. On the relabelled samples themselves (own labels, prototype top-1) every new map scores lower than
+`current` (llm −21, v3 −6 points): expected, because the current to_ids were *chosen* by agreement with the
+neighbours' labels, so this number cannot rank the maps.
+
+What `flips.tsv` shows (unchanged samples whose correctness changed):
+- Metalog's own curators disagree on plant / rhizosphere studies: cropland biome (JGI_rhizosphere_Kellogg,
+  Dai_2019) vs terrestrial biome (Zhang_2019_rhizosphere, JGI_leaf_various). vegetated area → terrestrial (LLM) wins
+  +378 / loses −122 for the prototype. Same for wastewater: Ye_2019_sludge is anthropogenic terrestrial,
+  Wang_2018_wastewater aquatic; the LLM's aquatic for the 4 wastewater terms loses more than it gains (−225 / +181).
+- A specific term chosen for one study pulls the samples of another study of the same site that its curators
+  labelled more broadly: tropical soil (Luquillo) → tropical moist broadleaf forest pulled JGI_soil_forest_Luquillo
+  (forest biome); microbial mat (Yellowstone) → freshwater pulled the other Yellowstone mats (aquatic biome);
+  brackish water (Baltic) → marine pulled Alneberg_2020 (aquatic). v2 sets these back, plus canyon / pond →
+  freshwater biome and the Lekunberri river rows → freshwater biome.
+- Air: Metalog labels air samples urban biome (Gusareva_2019_air); troposphere → no biome left no air sample in
+  urban, so they were predicted freshwater. v2 keeps troposphere → urban biome (semantically wrong for the upper
+  troposphere: a researcher's call).
+- transportation (subway skin swabs) → animal-associated environment, the *current* map's choice, pulls urban
+  built-environment samples (Fahimipour_2018_surfaces, Gusareva_2019_air) to animal-associated; urban (LLM) wins +99.
+
+Caveat: the v2 / v3 changes were chosen after looking at flips on the same samples, so their gain is optimistic.
+Each one follows one rule (use the term the other studies of the same site or sample type use), not a search over
+options. The proposal to review is `clean/biome_label_map_draft.reviewed.tsv` (= v3): `review_decision`
+(keep / stats / LLM / other) and `review_notes` per row. Kept for the record: `clean/biome_label_map.tsv` (still
+what 2b applies) and its copy `biome_label_map.2026-10-05.tsv`; the LLM draft `biome_label_map_draft.tsv` and its copy
+`biome_label_map_draft.2026-10-27_before_review.tsv`. Every map, clean set, run log, metrics and calibration is in
+`ontology_mapping/experiments/biome_map_review/` (step-5 predictions were not kept: rerun to get them).
+
+```bash
+P=~/MicrobeAtlasProject; X=$P/ontology_mapping/experiments/biome_map_review
+for a in current llm reviewed reviewed_v2 reviewed_v3; do
+  python 2b_clean_metalog.py --metalog_dir $P/metalog --ontology_terms $P/ontology_terms.tsv.gz \
+    --training_set $P/metalog/metalog_training_set.tsv.gz --label_map $X/maps/$a.tsv --output_dir $X/$a/clean   # ~20 s
+  for s in 0 1 2; do
+    python 5_evaluate.py --ontology_terms $P/ontology_terms.tsv.gz --samples $X/$a/clean/training_set.clean.tsv.gz \
+      --features $P/metalog/keywords__large1024.npz $P/metalog/sub_biomes__large1024.npz \
+      --term_vectors $P/ontology_mapping/ontology_terms_unique_embeddings__text-embedding-3-large__dim1024.h5 \
+      --fold_seed $s --closed_only --output_dir $X/runs/$a/cv_s$s                                              # ~4 min, 3 GB
+  done
+done
+python experiments/biome_map_compare.py --runs $X/runs --arms current llm reviewed reviewed_v2 reviewed_v3 --seeds 0 1 2 \
+  --training_set $X/current/clean/training_set.clean.tsv.gz --maps $X/maps --ontology_terms $P/ontology_terms.tsv.gz \
+  --output $X/results
+```
+
 ## Verification (2026-10-05 review)
 
 Every pipeline step was re-run with the reviewed code and compared with the production outputs:
@@ -455,4 +545,4 @@ Every pipeline step was re-run with the reviewed code and compared with the prod
 | §18 `human_biome.py compare`, run twice | byte-identical outputs; variant step 5 vs the current one on the same machine: feature / material predictions identical |
 | experiments, reviewed vs original code: `gold_check`, `coverage_check`, `coarsen_labels`, `project_groups`, `hierarchical_backoff` | identical (`term_to_coarse_biome.tsv`: same rows, tie order differed; the sort is now deterministic) |
 | `analyses.py` | identical except `granularity` for feature / material at min_support 300 (and material at 100): the bug fix keeps coarsening inside ENVO / Uberon, e.g. material @300: 42 labels, top-1 0.779 (was 31 labels, 0.782) |
-| `draft_biome_label_map.py` | not comparable: needs plain-label term vectors (`term_text/term_variants.h5`), which were not re-staged; the map itself is a reviewed, versioned input |
+| `draft_biome_label_map.py` (2026-10-27, on the Mac) | identical to the previous version of the script on all 55 biome rows; vs the stored `clean/biome_label_map.tsv`: same to_id, status and evidence, only the example sample text differs (an earlier sample order); rows tied on n_samples are now ordered by id. The flags / per-study / LLM columns are additions |

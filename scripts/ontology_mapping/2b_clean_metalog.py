@@ -200,13 +200,19 @@ def load_overrides(p):
 
 
 def load_label_map(p):
-    """{(slot, from_id): to_id}; slot '*' applies to every slot.
+    """{(slot, from_id): to_id}; slot '*' applies to every slot. With an optional `study_code` column, a row
+    with a study code gives the key (slot, from_id, study_code) and applies only to that study's samples
+    (it wins over the row without one). Empty study codes give the plain key.
     Example (clean/biome_label_map.tsv): {('biome', 'ENVO_01001305'): 'ENVO_01000245',  # vegetated area -> cropland biome
-                                          ('biome', 'ENVO_00000428'): ''}  # 'biome' itself: uninformative, blanked"""
+                                          ('biome', 'ENVO_00000428'): '',  # 'biome' itself: uninformative, blanked
+                                          ('biome', 'ENVO_00002030', 'Smith_2019_lake'): 'ENVO_01000252'}  # one study only"""
     if not p:
         return {}
     df = read_tsv(p)
-    return {(r.slot.strip(), r.from_id.strip()): r.to_id.strip() for r in df.itertuples()}
+    if "study_code" not in df.columns:
+        df["study_code"] = ""
+    return {((r.slot.strip(), r.from_id.strip(), r.study_code.strip()) if r.study_code.strip()
+             else (r.slot.strip(), r.from_id.strip())): r.to_id.strip() for r in df.itertuples()}
 
 
 # ----------------------------------------------------------------------------- flags
@@ -237,11 +243,12 @@ def flag_labels(samples, terms, label_map):
         status[term.eq("") & raw.str.lower().isin(CONTROL_VALUES)] = "control_value"
         status[raw.eq("")] = "empty"
 
-        def clean(t, s):
-            """The clean id for raw id t with status s: the label map target if (slot, t) or ('*', t) is
-            mapped (even when s is not ok), else t when s is ok, else "".
-            E.g. ('ENVO_01001305', 'ok') -> 'ENVO_01000245' with the biome map above; ('CL_0000064', 'other_ontology') -> ''."""
-            for key in ((slot, t), ("*", t)):
+        def clean(t, s, study):
+            """The clean id for raw id t with status s in study `study`: the label map target if
+            (slot, t, study), ('*', t, study), (slot, t) or ('*', t) is mapped, in that order (even when s
+            is not ok), else t when s is ok, else "".
+            E.g. ('ENVO_01001305', 'ok', 'X') -> 'ENVO_01000245' with the biome map above; ('CL_0000064', 'other_ontology', 'X') -> ''."""
+            for key in ((slot, t, study), ("*", t, study), (slot, t), ("*", t)):
                 if key in label_map:
                     target = label_map[key]
                     if target and target not in ontology_ok:
@@ -251,7 +258,7 @@ def flag_labels(samples, terms, label_map):
 
         samples[f"{slot}_raw"] = term
         samples[f"{slot}_status"] = status
-        samples[f"{slot}_clean"] = [clean(t, s) for t, s in zip(term, status)]
+        samples[f"{slot}_clean"] = [clean(t, s, st) for t, s, st in zip(term, status, samples["study_code"])]
         samples[f"{slot}_ontology"] = samples[f"{slot}_clean"].str.split("_").str[0]
 
     samples["biome_in_biome_subtree"] = [
@@ -457,7 +464,7 @@ def main():
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--training_set", help="TSV from 2_build_training_set.py (writes the clean/gold training sets)")
     parser.add_argument("--overrides", help="audit_review.tsv with decisions filled in, or your own TSV with the same columns")
-    parser.add_argument("--label_map", help="TSV: slot, from_id, to_id, reason")
+    parser.add_argument("--label_map", help="TSV: slot, from_id, to_id, reason [, study_code: the row applies to that study only]")
     parser.add_argument("--date", help="snapshot date YYYY-MM-DD (default: the latest in --metalog_dir)")
     args = parser.parse_args()
 
