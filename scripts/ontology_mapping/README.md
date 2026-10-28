@@ -73,6 +73,7 @@ KW=$P/metalog/keywords__large1024.npz; SB=$P/metalog/sub_biomes__large1024.npz
 TV=$O/ontology_terms_unique_embeddings__text-embedding-3-large__dim1024.h5
 KWH5=$E/GPT_keywords_unique_embeddings__text-embedding-3-large__dim1024__full.h5
 SBH5=$E/GPT_sub_biomes_unique_embeddings__text-embedding-3-large__dim1024__full.h5
+G=$P/metalog/clean/project_groups.tsv   # sister studies of one project stay in one fold (experiments/project_groups.py)
 
 # 1. terms (current table = the 2026-09-23 ENVO / Uberon table + PO / FOODON appended)
 python 1_build_term_index.py --append $P/ontology_terms_envo_uberon.tsv.gz \
@@ -87,31 +88,32 @@ for kind in keywords sub_biomes; do
     --unique_h5 $E/GPT_${kind}_unique_embeddings__text-embedding-3-large__dim1024__full.h5 --output $P/metalog/${kind}__large1024.npz
 done
 python 4_embed_terms.py --ontology_terms $TERMS
-# 5. evaluation (fold seed 0 with every method; seeds 1-2 closed-vocabulary only, for a pooled calibration)
-python 5_evaluate.py --ontology_terms $TERMS --samples $CLEAN --features $KW $SB --term_vectors $TV --output_dir $O/cv_backoff
+# 5. evaluation, folds by project (fold seed 0 with every method; seeds 1-2 closed-vocabulary only, for a pooled calibration)
+python 5_evaluate.py --ontology_terms $TERMS --samples $CLEAN --features $KW $SB --term_vectors $TV \
+  --fold_groups $G --output_dir $O/cv_backoff_g
 for s in 1 2; do
   python 5_evaluate.py --ontology_terms $TERMS --samples $CLEAN --features $KW $SB --term_vectors $TV \
-    --fold_seed $s --closed_only --output_dir $O/cv_backoff_s$s
+    --fold_groups $G --fold_seed $s --closed_only --output_dir $O/cv_backoff_g_s$s
 done
 # 6. atlas labels: prototype, back-off at 90 % strict accuracy (4 GB RAM: --chunk_rows 2000)
 python 6_predict_atlas.py --ontology_terms $TERMS --samples $CLEAN --train_vectors $KW $SB \
   --keywords_texts $L/GPT_keywords.txt --sub_biomes_texts $L/GPT_sub_biomes.txt --keywords_h5 $KWH5 --sub_biomes_h5 $SBH5 \
   --method prototype --term_vectors $TV --target_accuracy 0.9 --accuracy strict \
-  --calibration $O/cv_backoff/calibration.json $O/cv_backoff_s1/calibration.json $O/cv_backoff_s2/calibration.json \
-  --output_dir $O/atlas_backoff
+  --calibration $O/cv_backoff_g/calibration.json $O/cv_backoff_g_s1/calibration.json $O/cv_backoff_g_s2/calibration.json \
+  --output_dir $O/atlas_backoff_g
 # 6b. coverage flag, 6c. controls
-python 6b_coverage.py --samples $CLEAN --train_vectors $KW $SB --fold_groups $P/metalog/clean/project_groups.tsv \
-  --index $O/atlas_backoff/index.npz --keywords_h5 $KWH5 --sub_biomes_h5 $SBH5 --output_dir $O/atlas_coverage
+python 6b_coverage.py --samples $CLEAN --train_vectors $KW $SB --fold_groups $G \
+  --index $O/atlas_backoff_g/index.npz --keywords_h5 $KWH5 --sub_biomes_h5 $SBH5 --output_dir $O/atlas_coverage
 python 6c_flag_controls.py --keywords_texts $L/GPT_keywords.txt --sub_biomes_texts $L/GPT_sub_biomes.txt --output $O/atlas_controls.tsv.gz
 # 7. optional LLM reranking: fit on the Metalog pilot (experiments/rerank_pilot.py), build, submit, collect, apply
 X=$O/experiments/rerank; R=$O/rerank_atlas
 python 7_rerank_atlas.py fit --pilot $X/pilot_k5anc.jsonl --responses $X/resp_k5anc_gpt-4.1-mini.jsonl \
-  --calibration $O/cv_backoff/calibration.json --samples $CLEAN --output $R/rerank_params.json
-python 7_rerank_atlas.py build --params $R/rerank_params.json --atlas_dir $O/atlas_backoff --sample_info $P/sample.info.gz \
+  --calibration $O/cv_backoff_g/calibration.json --samples $CLEAN --output $R/rerank_params.json
+python 7_rerank_atlas.py build --params $R/rerank_params.json --atlas_dir $O/atlas_backoff_g --sample_info $P/sample.info.gz \
   --samples $CLEAN --train_vectors $KW $SB --keywords_h5 $KWH5 --sub_biomes_h5 $SBH5 --work_dir $R
 python 7_rerank_atlas.py submit --work_dir $R --limit 2000      # a trial; then without --limit
 python 7_rerank_atlas.py collect --work_dir $R                  # rerun until all batches are collected
-python 7_rerank_atlas.py apply --params $R/rerank_params.json --atlas_dir $O/atlas_backoff --work_dir $R
+python 7_rerank_atlas.py apply --params $R/rerank_params.json --atlas_dir $O/atlas_backoff_g --work_dir $R
 ```
 
 Join the outputs of 6, 6b, 6c and 7 on `sample_id`.
@@ -166,8 +168,12 @@ is comparable with sample vectors. `.npz` files store each distinct vector once 
   (1,679 samples) would dominate.
 - **Folds** (`common.study_folds`): 5 folds by study (hash of the study code mod 5), so no study is in both
   train and test (samples of a study share most of their text). `--fold_groups` keeps whole sequencing
-  projects together (TARA ×4, Stewart 2018/2019, Alneberg 2018/2020): supervised biome top-1 drops by
-  ~1.3 points from that leak (≈ 3 points in total over 3 seeds, the rest is fold noise).
+  projects together (TARA ×4, Stewart 2018/2019, Alneberg 2018/2020; 534 groups for the 539 evaluated study
+  codes), and is used for production since 2026-10-28 (`cv_backoff_g*`, `atlas_backoff_g`). Without it, fold
+  seed 0 biome top-1 was inflated by 2.0 (knn_study), 1.1 (linear) and 1.2 (hybrid) points; the production
+  prototype did not move (.653 → .655), and the pooled tau (0.825 / 0.75 / 0.675) and atlas shares are
+  unchanged. The study-fold runs (`cv_backoff*`, `atlas_backoff`) are kept: the `experiments/` and
+  `experiments/deck_review/` defaults still point at them, so their recorded numbers reproduce.
 - **Methods** (`methods.py`, all with the same vectors; top-5 + a confidence per sample):
 
 | method | idea | confidence |
@@ -220,20 +226,20 @@ candidates (prompt in `rerank_prompt.py`); its letter log-probabilities are fuse
 p ∝ exp((log p_base + w·log p_LLM) / T2), and backed off again at τ2. `fit` chooses w, T2, τ2 per slot on the
 Metalog pilot (w = 0 switches the LLM off for a slot); so far only biome benefits.
 
-## Results (fold seed 0, `training_set.clean`, 17,720 samples)
+## Results (fold seed 0, folds by project, `training_set.clean`, 17,720 samples; `cv_backoff_g`)
 
 | | biome | feature | material |
 |---|---|---|---|
 | majority | 0.285 | 0.471 | 0.445 |
 | zero-shot nearest term, all terms | 0.028 | 0.136 | 0.083 |
-| `knn_study` | 0.682 | 0.630 | 0.706 |
-| `linear` | 0.671 | 0.624 | 0.713 |
-| `prototype` (production) | 0.653 | 0.627 | 0.726 |
-| `prototype` top-5 | 0.920 | 0.742 | 0.806 |
-| `prototype` back-off at 90 % strict: answered / exact | 0.79 / 0.48 | 0.60 / 0.50 | 0.81 / 0.67 |
+| `knn_study` | 0.662 | 0.623 | 0.710 |
+| `linear` | 0.660 | 0.617 | 0.715 |
+| `prototype` (production) | 0.655 | 0.626 | 0.726 |
+| `prototype` top-5 | 0.920 | 0.732 | 0.806 |
+| `prototype` back-off at 90 % strict: answered / exact | 0.78 / 0.46 | 0.59 / 0.50 | 0.81 / 0.68 |
 
-Biome numbers exclude human samples (no usable label; experiments §18) and use the biome label map. The trained methods are
-within ~2 points of each other; the remaining errors are mostly label conventions (near-identical samples
+Biome numbers exclude human samples (no usable label; experiments §18) and use the biome label map. The strongest trained
+methods are within 1–3 points of each other; the remaining errors are mostly label conventions (near-identical samples
 from different studies share a biome label only 55 % of the time). Full tables, all experiments and the
 fold-to-fold noise: `experiments/README.md` and the findings report.
 
@@ -261,7 +267,7 @@ fold-to-fold noise: `experiments/README.md` and the findings report.
 - **Linked samples get a prediction, not their curated label**: for the 58k Metalog-linked atlas samples the
   curated label could be published instead.
 - **`rerank_atlas/` is from the 2026-10-01 atlas** (only a 2,000-request trial ran); rebuild it for the
-  current `atlas_backoff`. 53 % of the gated samples have no record in `sample.info.gz`.
+  current `atlas_backoff_g`. 53 % of the gated samples have no record in `sample.info.gz`.
 - **Memory**: on a 4 GB machine run step 6 with `--chunk_rows 2000`.
 - **Resume files**: steps 6 and 6b reuse `model.npz`, `index.npz` and `parts/`; delete the output directory
   after changing a training option (the scripts refuse mismatching calibration or settings).

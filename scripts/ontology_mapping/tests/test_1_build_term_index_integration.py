@@ -210,7 +210,8 @@ def read_table(path):
 
 
 def assert_table(path, expected_rows):
-    pd.testing.assert_frame_equal(read_table(path), pd.DataFrame(expected_rows, columns=COLUMNS))
+    # dtype=str: an empty table reads back as strings (object in pandas 2, str in pandas 3), like a filled one
+    pd.testing.assert_frame_equal(read_table(path), pd.DataFrame(expected_rows, columns=COLUMNS, dtype=str))
 
 
 # ============================================================================= basic workflow

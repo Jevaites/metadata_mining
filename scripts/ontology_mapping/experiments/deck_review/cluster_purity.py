@@ -26,7 +26,7 @@ from _common import Data, parser, path, save_json  # noqa: E402
 
 def main():
     ap = parser(__doc__, "cluster_purity", needs=["samples", "keywords", "sub_biomes"])
-    ap.add_argument("--clusters", default="~/MicrobeAtlasProject/ontology_mapping/atlas_coverage/sample_to_cluster_coarse.tsv")
+    ap.add_argument("--clusters", default="~/MicrobeAtlasProject/clusters/sample_to_cluster_coarse.tsv")
     ap.add_argument("--draws", type=int, default=5)
     args = ap.parse_args()
     d = Data(args, max_per_study=0)  # every linked sample; the draw below balances studies
