@@ -339,7 +339,10 @@ def vote(args):
             for n in names:
                 d, _ = parse(o, resp[n][k])
                 D[n].append(np.log(np.maximum(d[:kk] if d is not None else np.ones(kk) / kk, 1e-6)))
-        base, gold, D = np.array(base), np.array(gold), {n: np.array(v) for n, v in D.items()}
+        # candidate sets of different sizes (top-5 + ancestors): pad with -1e9, never the argmax
+        K = max(len(b) for b in base)
+        pad = lambda rows: np.array([np.concatenate([r, np.full(K - len(r), -1e9)]) for r in rows])
+        base, gold, D = pad(base), np.array(gold), {n: pad(v) for n, v in D.items()}
         ust = np.unique(studies)
         fold_of = {s: i % 5 for i, s in enumerate(np.random.default_rng(0).permutation(ust))}
         fold = np.array([fold_of[s] for s in studies])

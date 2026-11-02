@@ -21,6 +21,7 @@ folds, ≤ 50 samples per study (17.7k samples, 539 studies). Biome excludes hum
 | 6 | Does cleaning Metalog help? | `cleaning_effect.py`, `selective_prediction.py` | Not the model; it changes the measurement. Confidence triage works |
 | 7 | Does hierarchical back-off (+ reranking) help? | `hierarchical_backoff.py`, `draft_biome_label_map.py` | Back-off: +20–30 % coverage at equal accuracy on biome; the biome label map is the larger gain |
 | 7c | Does a real LLM reranker help? | `rerank_pilot.py` | Biome and feature, a little (+2 points overall top-1); material no |
+| 7d | Can Jev (TypeSafe) rerank, choose from the whole slot vocabulary, or walk the ontology top-down? | `jev_pilot.py`, `jev_questions.py`, `jev_baselines.py`, `jev_analyses.py` | Rerank: as good as gpt-4.1-mini, cheaper and faster; gated (30 %) +3 / +2 / +1 points overall on random samples, ungated it hurts feature. Whole vocabulary: far below the prototype; vs our best zero-shot retrieval better on biome / material, worse on feature; as extra candidates only +0–2.4 points over the prototype's next 3. Top-down: worst, also on random samples |
 | 8 | Does the atlas back-off hold outside Metalog? | `gold_check_extract.sh`, `gold_check.py` | At the coarse level, yes for animal / soil / water; abstains more out of domain |
 | 9 | Do sister studies leak across folds? | `project_groups.py`, `5_evaluate.py --fold_groups` | A little: ~1.3 biome points |
 | 10 | Can we flag samples Metalog does not cover? | `6b_coverage.py`, `coverage_check.py` | Yes (8.5 % of the atlas); within Metalog the probability already holds this signal |
@@ -183,6 +184,133 @@ With recalibrated fusion and back-off, at ~80 % answered: biome strict accuracy 
 0.281 → 0.390, material no gain. A manual review of 47 "more specific than Metalog" answers found 68 % stated
 in the metadata and 6 % wrong, so the strict metric understates the LLM. Top-5 + broader terms is the
 candidate set used by step 7.
+
+## 7d. Jev pilot (`jev_pilot.py`, `jev_questions.py`; the same 1,500 gated samples as 7c, top-5 + ancestors)
+
+Results (jev-1.14.0, 2026-10-29, $1.4 in all; project doc `claude/jev-pilot-results.md`), exact top-1 on the gated
+samples, biome / feature / material:
+
+| decision | exact | Δ vs base (95 % CI) | confidence AUROC |
+|---|---|---|---|
+| base (prototype) | 0.334 / 0.218 / 0.356 | – | 0.49 / 0.73 / 0.68 |
+| gpt-4.1-mini (same candidates) | 0.390 / 0.296 / 0.274 | +0.06 / **+0.08** / **−0.08** | 0.57 / 0.57 / 0.65 |
+| `jev_rerank` | **0.404 / 0.300 / 0.304** | +0.07 / **+0.08** / −0.05 | 0.57 / 0.63 / 0.67 |
+| `jev_fits` | 0.268 / 0.244 / 0.256 | −0.07 / +0.03 / **−0.10** | 0.59 / 0.44 / 0.47 |
+| `jev_vocab` (zero-shot, ~40–200 terms) | 0.272 / 0.252 / 0.294 | −0.06 / +0.03 / −0.06 | 0.55 / 0.63 / 0.60 |
+| `topdown_lca` / `topdown_root` | 0.22 / 0.17 / 0.21 and 0.23 / 0.15 / 0.19 | all ≤ 0 | 0.53–0.70 |
+
+Jev − gpt-4.1-mini (paired): +0.01 / +0.00 / +0.03, all within noise; fused with the base (`rerank_pilot.py vote`)
+0.412 / 0.292 / 0.368, and adding GPT brings nothing. Jev's probabilities are as over-confident as GPT's (top
+probability 0.98 → 36–48 % right): recalibrate before fusion. The whole-vocabulary Choice holds gold in its top 3 for
+40 / 15 / 11 % of the samples whose gold the prototype did not offer (candidate recall +6 / +7 / +5 points). Top-down
+leaves gold's branch in 42–76 % of reachable samples, mostly at the first decision. `check_order`: no first-option
+bias, but 10–33 % of picks change when the option order is reversed.
+
+**Fair baselines for the whole-vocabulary Choice** (`jev_baselines.py`, no API): our own models scored over exactly
+Jev's vocabulary, trained on every other study (leave-one-study-out), same samples. Biome / feature / material:
+
+| source | exact | recall@3 | candidates (0.848 / 0.504 / 0.540) + its 3 best new terms |
+|---|---|---|---|
+| prototype | **0.336** / 0.218 / **0.350** | **0.718** / 0.402 / 0.484 | 0.894 / 0.544 / 0.564 |
+| retrieval_prior | 0.234 / 0.158 / 0.248 | 0.620 / 0.372 / 0.432 | 0.878 / 0.530 / 0.552 |
+| retrieval (zero-shot) | 0.174 / 0.190 / 0.168 | 0.362 / 0.314 / 0.364 | 0.890 / 0.570 / 0.574 |
+| Jev vocabulary Choice (zero-shot) | 0.272 / **0.252** / 0.294 | 0.664 / **0.436** / **0.500** | **0.916 / 0.590 / 0.596** |
+
+Jev's 3 new terms raise candidate recall more than any other source's: vs the prototype's next 3 +2.2 (−0.2…+5.7) /
++4.6 (+0.4…+8.7) / +3.2 (+0.6…+6.1) points; vs zero-shot retrieval +2.6 / +2.0 / +2.2. The samples were gated on
+the prototype's own low confidence, which biases these numbers against prototype-like models.
+
+**All-samples pilot** (`jev/pilot_all_k5anc.jsonl`: 500 random out-of-fold samples per slot, not gated, built with
+`rerank_pilot.py build --gate 1.0 --add_ancestors`; outputs in `jev/all/`; $1.2). Exact top-1, biome / feature /
+material:
+
+| decision | exact | Δ vs base (95 % CI) | confidence AUROC |
+|---|---|---|---|
+| base (prototype) | **0.644 / 0.634 / 0.700** | – | **0.80 / 0.92 / 0.87** |
+| `jev_rerank`, every sample | 0.630 / 0.514 / 0.696 | −0.01 / **−0.12** / −0.00 | 0.66 / 0.68 / 0.86 |
+| `jev_rerank` on the 30 % least confident only | 0.676 / 0.658 / 0.710 | +0.03 (−0.01…+0.07) / **+0.02 (+0.01…+0.04)** / +0.01 | – |
+| `jev_vocab` (zero-shot) | 0.516 / 0.316 / 0.666 | **−0.13 / −0.32** / −0.03 | 0.64 / 0.57 / 0.87 |
+| `jev_fits` | 0.440 / 0.538 / 0.622 | all < 0 | 0.69 / 0.63 / 0.60 |
+| `topdown_lca` / `topdown_root` | 0.434 / 0.286 / 0.630 and 0.406 / 0.230 / 0.612 | all < 0 | 0.46–0.85 |
+| retrieval (zero-shot, ours, centred; `jev_baselines.py`) | 0.342 / 0.156 / 0.292 | – | – |
+| retrieval (zero-shot, uncentred plain label: our best) | 0.398 / 0.398 / 0.436 | – | – |
+
+- Reranking pays only where the prototype is unsure (lowest 30 %: base 0.33 / 0.16 / 0.35 → Jev 0.44 / 0.24 / 0.38);
+  reranking everything hurts feature. Gate on the prototype's confidence: it ranks errors far better than Jev's.
+- Top-down is not only a hard-sample failure: on random samples it still trails the whole-vocabulary Choice on every
+  slot. Feature walks leave gold's branch at the first decision in 90–92 % of their wrong-branch cases (abstract
+  ENVO / UBERON top level: environmental system vs anatomical entity both hold host terms).
+- Candidates (0.932 / 0.762 / 0.818) + 3 new terms: prototype's next 3 0.968 / 0.798 / 0.836, zero-shot retrieval
+  0.960 / 0.802 / 0.844, Jev 0.970 / 0.818 / 0.860. Jev's extra over the prototype +0.2 / +2.0 / +2.4 points, over
+  retrieval +1.0 / +1.6 / +1.6: small on random samples, for a question that is half the request's tokens.
+
+
+Jev (TypeSafe's "System One" model) answers typed questions: a Choice returns a probability per option (≤ 255
+options), a Noul the probability that a statement is true; $0.042 per 1M input tokens, output free. The design follows
+TypeSafe's cookbooks (project doc `claude/jev-cookbook-refactor.md`) and its integration skill (`typesafe-ai`).
+
+**Requests.** `flat`: one request per sample (parallel questions over the same state, answered in isolation):
+a Choice over the whole slot vocabulary (every term used in the slot by another study: 37–42 biome, ~200 feature,
+~180 material; the form of "the whole ontology in the input" that fits: ENVO + UBERON exceed 64k tokens and 255
+options), a Choice over the prototype's candidates (exactly those GPT saw, in GPT's order), and one Noul per
+candidate ("does this term describe the sample?"). `topdown`: beam 3 down the slot's part of the ontology, one
+request per level, one Choice per open node ("Which of these terms covers …?" over its children + "X itself"),
+from the common ancestor of the base top-3 (`--start lca`) or from the top (`--start root`).
+
+**Decisions in code** (recomputed by `score` from the stored answers, so thresholds change without new calls):
+
+| decision | rule |
+|---|---|
+| `jev_vocab` | top term of the vocabulary Choice; also "rescue": gold in Jev's top 3 when the prototype did not offer it |
+| `jev_rerank` | top candidate of the rerank Choice; none when no candidate's Noul reaches 0.3 (Choice says which, Nouls say whether: skill-suggestion cookbook) |
+| `jev_fits` | Nouls alone: the most specific candidate ≥ 0.7, else the highest if > 0.3, else none |
+| `topdown_lca` / `topdown_root` | best finished path; back-off on the distribution over finished paths |
+
+**Wording** is all in `jev_questions.py`: state = the sample's metadata as named fields; plain questions anchored to
+the curators' choice, with no "prefer the general term" rule (how specific the answer is, is the back-off's job).
+**Cache**: every request goes through a request-keyed cache (`jev_cache.jsonl` next to the output: key, exact
+payload, answers), so reruns replay, crashed runs resume for free and lca / root share node calls.
+**Option order**: one order per question (the rerank in GPT's order); `check_order` measures the first-option bias
+(documented for jev-1.13; we use 1.14) on a few samples, and `--orders 2` averages two orders if it is real.
+
+Vocabulary (`prepare`): labels of the training set (with the 2026-10-01 biome map, as the pilot) used by at least
+one *other* study. Gold is in it for 92 / 66 / 66 % of the pilot samples (the rest are labels only their own study
+uses: unseen labels, which only a coarser answer can get right). Slot trees: biome 94 nodes (depth 8), feature 412
+(depth 11), material 355 (depth 12).
+
+Dry run (`--fake`, o200k token estimate) for the 1,500 samples: flat $0.56, topdown lca $0.16, topdown root $0.24
+(top-down paths will differ with the real model). Needs `pip install typesafe-sdk==0.7.5` (Python ≥ 3.10; it
+upgrades pydantic to ≥ 2.12, which openai 1.93 accepts) and the API key in `~/MicrobeAtlasProject/jev_api_key` (or
+`$TYPESAFE_API_KEY` if that file is missing).
+
+```bash
+cd scripts/ontology_mapping
+X=~/MicrobeAtlasProject/ontology_mapping/experiments/rerank; J=~/MicrobeAtlasProject/ontology_mapping/experiments/jev
+python3 experiments/jev_pilot.py prepare --pilot $X/pilot_k5anc.jsonl \
+    --label_map ~/MicrobeAtlasProject/metalog/clean/previous_2026-10-01/biome_label_map.tsv --output $J/inputs.json
+python3 experiments/jev_pilot.py check_order --pilot $X/pilot_k5anc.jsonl --inputs $J/inputs.json --cache $J/jev_cache.jsonl --limit 30
+python3 experiments/jev_pilot.py run --arm flat --pilot $X/pilot_k5anc.jsonl --inputs $J/inputs.json --output $J/flat.jsonl --limit 10   # smoke test
+python3 experiments/jev_pilot.py run --arm flat --pilot $X/pilot_k5anc.jsonl --inputs $J/inputs.json --output $J/flat.jsonl
+python3 experiments/jev_pilot.py run --arm topdown --start lca --pilot $X/pilot_k5anc.jsonl --inputs $J/inputs.json --output $J/topdown_lca.jsonl
+python3 experiments/jev_pilot.py run --arm topdown --start root --pilot $X/pilot_k5anc.jsonl --inputs $J/inputs.json --output $J/topdown_root.jsonl
+python3 experiments/jev_pilot.py score --pilot $X/pilot_k5anc.jsonl --inputs $J/inputs.json --responses $J/flat.jsonl $J/topdown_*.jsonl \
+    --reference gpt-4.1-mini=$X/resp_k5anc_gpt-4.1-mini.jsonl --output $J/score.json
+python3 experiments/rerank_pilot.py vote --pilot $X/pilot_k5anc.jsonl --responses $J/flat.jsonl $X/resp_k5anc_gpt-4.1-mini.jsonl
+```
+
+`score` reports per decision, paired on the samples every arm answered: top-1 exact / coarser / too specific /
+other / none, r (exact when gold is offered), confidence AUROC, back-off at ~80 % / ~60 % answered
+(`hierarchy.Closure`), Δ exact vs base with a study-bootstrap 95 % interval, recall and rescue (vocab), gold
+reachability and questions per sample (top-down), cost. `rerank_pilot.py vote` now pads candidate sets of different
+sizes (top-5 + ancestors), which it could not combine before. Tests: `tests/test_jev_pilot.py` (17, incl. the request
+shape through the real `typesafe-sdk` client on a mock transport).
+
+**Follow-up analyses** (`jev_analyses.py <block>`, no API; every other number in `claude/jev-pilot-results.md` and the
+write-up "Jev for ontology mapping"): `confidence` (AUROC of Jev's signals, calibration), `tokens` (token share per
+question kind), `vs_gpt` (paired Jev − gpt-4.1-mini), `gate` (gain by gate size, accuracy by confidence band, selection
+effect), `zero_shot` (embedding retrieval vs Jev over the same vocabulary), `topdown` (where walks leave gold's branch,
+gold among the beam's paths), `ontology_size` (terms and tokens of one question per term set), `open_retrieval` (gold in
+the top k of retrieval over all of ENVO + UBERON). `all` runs every block on both sample sets.
 
 ## 8. Gold-set check (`gold_check.py`; 1,021 hand-labelled samples outside Metalog, coarse labels)
 
