@@ -323,7 +323,7 @@ def decide_rerank(probs, fits):
     no candidate's Noul reaches NOUL_NO. -> (pick: candidate index, k = none; distribution over candidates + none,
     with P(some candidate fits) taken as the highest Noul)."""
     probs, fits = np.asarray(probs, float), np.asarray(fits, float)
-    some = float(fits.max()) if len(fits) else 0.0
+    some = float(fits.max()) if len(fits) else 1.0  # no Nouls asked: no "none" decision
     pick = len(probs) if some < W.NOUL_NO else int(np.argmax(probs))
     return pick, np.append(some * probs, 1 - some)
 
@@ -364,28 +364,36 @@ def flat_questions(o, ctx):
     cids = [c["term_id"] for c in o["candidates"]]
     cnames = option_names(cids, ctx)
     cdesc = [describe(c["term_id"], ctx, example=c.get("example")) for c in o["candidates"]]
+    ask = set(getattr(ctx.args, "questions", None) or ("vocab", "rerank", "fits"))
     q = {}
-    for j, order in enumerate(orders(len(vids), ctx.args.orders, seed + ("vocab",))):  # random order: no frequency prior
-        q[f"vocab_{j}"] = choice_question(W.which_term(slot), vnames, vdesc, order)
-    for j, order in enumerate(orders(len(cids), ctx.args.orders, seed + ("rerank",), first=o["option_order"])):
-        q[f"rerank_{j}"] = choice_question(W.which_term(slot), cnames, cdesc, order)
-    for i, (name, d) in enumerate(zip(cnames, cdesc)):
-        q[f"fits_{i}"] = W.term_fits(slot, {"name": name, **(d or {})})
+    if "vocab" in ask:
+        for j, order in enumerate(orders(len(vids), ctx.args.orders, seed + ("vocab",))):  # random order: no frequency prior
+            q[f"vocab_{j}"] = choice_question(W.which_term(slot), vnames, vdesc, order)
+    if "rerank" in ask:
+        for j, order in enumerate(orders(len(cids), ctx.args.orders, seed + ("rerank",), first=o["option_order"])):
+            q[f"rerank_{j}"] = choice_question(W.which_term(slot), cnames, cdesc, order)
+    if "fits" in ask:
+        for i, (name, d) in enumerate(zip(cnames, cdesc)):
+            q[f"fits_{i}"] = W.term_fits(slot, {"name": name, **(d or {})})
     return q, (vids, vnames, cids, cnames)
 
 
 async def ask_flat(client, o, ctx):
     q, (vids, vnames, cids, cnames) = flat_questions(o, ctx)
-    r = await client.system_one(W.state(o["text"]), q)
-    vocab = mean_probs(r.answers, [k for k in q if k.startswith("vocab_")], vnames)
-    rerank = mean_probs(r.answers, [k for k in q if k.startswith("rerank_")], cnames)
-    fits = [float(r.answers[f"fits_{i}"].noul) for i in range(len(cids))]
+    r = await client.system_one(W.state(o["text"], o.get("similar"), o["slot"]), q)
     rec = {"slot": o["slot"], "sample_id": o["sample_id"], "arm": "flat", "model": r.model,
-           "vocab": {t: round(float(p), 6) for t, p in zip(vids, vocab) if p >= 1e-6},
-           "rerank": [round(float(p), 6) for p in rerank], "fits": [round(f, 6) for f in fits],
-           "n_vocab": len(vids), "questions": len(q), "usage": {"in": usage_in(r), "out": 0}}
-    pick, dist = decide_rerank(rerank, fits)
-    rec.update(letters_record(o, pick, dist))  # rerank_pilot.py score / vote read the jev_rerank decision
+           "questions": len(q), "usage": {"in": usage_in(r), "out": 0}}
+    if any(k.startswith("vocab_") for k in q):
+        vocab = mean_probs(r.answers, [k for k in q if k.startswith("vocab_")], vnames)
+        rec["vocab"] = {t: round(float(p), 6) for t, p in zip(vids, vocab) if p >= 1e-6}
+        rec["n_vocab"] = len(vids)
+    if any(k.startswith("rerank_") for k in q):
+        rerank = mean_probs(r.answers, [k for k in q if k.startswith("rerank_")], cnames)
+        fits = [float(r.answers[f"fits_{i}"].noul) for i in range(len(cids)) if f"fits_{i}" in q]
+        rec.update(rerank=[round(float(p), 6) for p in rerank], fits=[round(f, 6) for f in fits])
+        if len(cids) < len(LETTERS):  # rerank_pilot.py score / vote read the jev_rerank decision (<= 22 candidates)
+            pick, dist = decide_rerank(rerank, fits)
+            rec.update(letters_record(o, pick, dist))
     return rec
 
 
@@ -686,13 +694,16 @@ def arm_views(rec, o, ctx):
     cands = [c["term_id"] for c in o["candidates"]]
     out = {}
     if rec.get("arm") == "flat":
-        P = dict(rec["vocab"])
-        pick = max(P, key=P.get) if P else None
-        out["jev_vocab"] = (P, pick, P.get(pick, 0.0))
-        k, dist = decide_rerank(rec["rerank"], rec["fits"])
-        out["jev_rerank"] = (dict(zip(cands, dist[:-1])), None if k == len(cands) else cands[k], float(dist[k]))
-        k, _, dist = decide_fits(rec["fits"], cands, ctx.anc)
-        out["jev_fits"] = (dict(zip(cands, dist[:-1])), None if k == len(cands) else cands[k], float(dist[k]))
+        if "vocab" in rec:
+            P = dict(rec["vocab"])
+            pick = max(P, key=P.get) if P else None
+            out["jev_vocab"] = (P, pick, P.get(pick, 0.0))
+        if "rerank" in rec:
+            k, dist = decide_rerank(rec["rerank"], rec["fits"])
+            out["jev_rerank"] = (dict(zip(cands, dist[:-1])), None if k == len(cands) else cands[k], float(dist[k]))
+        if rec.get("fits"):
+            k, _, dist = decide_fits(rec["fits"], cands, ctx.anc)
+            out["jev_fits"] = (dict(zip(cands, dist[:-1])), None if k == len(cands) else cands[k], float(dist[k]))
     elif "terminals" in rec:
         tot = sum(rec["terminals"].values())
         P = {t: p / tot for t, p in rec["terminals"].items()} if tot > 0 else {}
@@ -808,6 +819,8 @@ def main(argv=None):
     r = sub.add_parser("run")
     api_options(r)
     r.add_argument("--arm", choices=["flat", "topdown"], required=True)
+    r.add_argument("--questions", nargs="+", choices=["vocab", "rerank", "fits"], default=["vocab", "rerank", "fits"],
+                   help="flat: which questions to ask (e.g. rerank fits: reranking only, no whole-vocabulary Choice)")
     r.add_argument("--start", choices=["lca", "root"], default="lca", help="topdown: where the walk starts")
     r.add_argument("--beam", type=int, default=3)
     r.add_argument("--output", required=True)

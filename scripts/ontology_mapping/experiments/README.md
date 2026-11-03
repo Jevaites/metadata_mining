@@ -21,7 +21,7 @@ folds, ≤ 50 samples per study (17.7k samples, 539 studies). Biome excludes hum
 | 6 | Does cleaning Metalog help? | `cleaning_effect.py`, `selective_prediction.py` | Not the model; it changes the measurement. Confidence triage works |
 | 7 | Does hierarchical back-off (+ reranking) help? | `hierarchical_backoff.py`, `draft_biome_label_map.py` | Back-off: +20–30 % coverage at equal accuracy on biome; the biome label map is the larger gain |
 | 7c | Does a real LLM reranker help? | `rerank_pilot.py` | Biome and feature, a little (+2 points overall top-1); material no |
-| 7d | Can Jev (TypeSafe) rerank, choose from the whole slot vocabulary, or walk the ontology top-down? | `jev_pilot.py`, `jev_questions.py`, `jev_baselines.py`, `jev_analyses.py` | Rerank: as good as gpt-4.1-mini, cheaper and faster; gated (30 %) +3 / +2 / +1 points overall on random samples, ungated it hurts feature. Whole vocabulary: far below the prototype; vs our best zero-shot retrieval better on biome / material, worse on feature; as extra candidates only +0–2.4 points over the prototype's next 3. Top-down: worst, also on random samples |
+| 7d | Can Jev (TypeSafe) rerank, choose from the whole slot vocabulary, or walk the ontology top-down? | `jev_pilot.py`, `jev_questions.py`, `jev_baselines.py`, `jev_analyses.py`, `jev_followups.py` | Rerank: as good as gpt-4.1-mini, cheaper and faster; gated (30 %) +3 / +2 / +1 points overall on random samples, ungated it hurts feature. Whole vocabulary: far below the prototype; vs our best zero-shot retrieval better on biome / material, worse on feature; as extra candidates only +0–2.4 points over the prototype's next 3. Top-down: worst, also on random samples |
 | 8 | Does the atlas back-off hold outside Metalog? | `gold_check_extract.sh`, `gold_check.py` | At the coarse level, yes for animal / soil / water; abstains more out of domain |
 | 9 | Do sister studies leak across folds? | `project_groups.py`, `5_evaluate.py --fold_groups` | A little: ~1.3 biome points |
 | 10 | Can we flag samples Metalog does not cover? | `6b_coverage.py`, `coverage_check.py` | Yes (8.5 % of the atlas); within Metalog the probability already holds this signal |
@@ -311,6 +311,118 @@ question kind), `vs_gpt` (paired Jev − gpt-4.1-mini), `gate` (gain by gate siz
 effect), `zero_shot` (embedding retrieval vs Jev over the same vocabulary), `topdown` (where walks leave gold's branch,
 gold among the beam's paths), `ontology_size` (terms and tokens of one question per term set), `open_retrieval` (gold in
 the top k of retrieval over all of ENVO + UBERON). `all` runs every block on both sample sets.
+
+**Follow-up experiments** (`jev_followups.py`; inputs built in `jev/followups/`; run and scored by `bash experiments/run_jev_followups.sh`, results in `jev/followups/results/`; run 2026-11-03, Jev $3.85 for 13 runs of 1,500 slot-samples, gpt-4.1-mini $2.53 for 3):
+
+| question | inputs | run (Jev) | score |
+|---|---|---|---|
+| Jev vs gpt-5.1 on exactly the same top-5 candidates | `rerank/pilot.jsonl` | `--questions rerank fits` | `compare` with the round-2 GPT files |
+| Does reranking turn the extra candidates into right answers? | `{gated,random}_plus_{jev_vocab,prototype,retrieval}3.jsonl` (prototype candidates + 3 new terms per source) | `--questions rerank fits`; gpt-4.1-mini on the gated files | `compare`, also gated at 30 % |
+| A second pass over Jev's own top 3 / 5 with the reranker's descriptions | `{gated,random}_jevtop{3,5}.jsonl` | `--questions rerank fits` | `compare` against Jev's whole-vocabulary top 1 |
+| Retrieve, then choose over the whole ontology (biome: ENVO biome branch + Metalog conventions; feature / material: retrieval top 255 of ENVO + UBERON) | `{gated,random}_open.jsonl` + `inputs_{gated,random}_open.json` | `--questions rerank` | `score_open` (all / unseen / seen labels); `jev_analyses.py open_hybrid` |
+
+Results (exact top-1, biome / feature / material, 500 samples per slot; 95 % CIs from the study bootstrap):
+
+| same top-5 candidates, gated samples | biome | feature | material |
+|---|---|---|---|
+| prototype | 0.334 | 0.218 | 0.356 |
+| Jev rerank | 0.398 | 0.286 | 0.284 |
+| gpt-5.1 (round 2) | 0.358 | 0.294 | 0.234 |
+| gpt-4.1-mini (round 2) | 0.356 | 0.288 | 0.268 |
+| Jev − gpt-5.1 | +0.040 (−0.031, 0.109) | −0.008 (−0.040, 0.021) | **+0.050 (0.013, 0.087)** |
+
+| augmented candidates, gated samples | gold offered | Jev | gpt-4.1-mini |
+|---|---|---|---|
+| top 5 + ancestors | 0.848 / 0.504 / 0.540 | 0.404 / 0.300 / 0.304 | 0.390 / 0.296 / 0.274 |
+| + 3 from Jev's vocabulary Choice | 0.916 / 0.590 / 0.596 | 0.378 / 0.302 / 0.326 | 0.354 / 0.270 / 0.246 |
+| + 3 more prototype candidates | 0.894 / 0.544 / 0.564 | 0.388 / 0.288 / 0.302 | 0.414 / 0.298 / 0.274 |
+| + 3 from retrieval | 0.890 / 0.570 / 0.574 | 0.380 / 0.304 / 0.310 | 0.378 / 0.284 / 0.280 |
+
+Random samples, Jev on the prototype's 30 % least-confident: 0.676 / 0.658 / 0.710 with the plain candidates,
+0.646–0.660 / 0.660–0.666 / 0.710–0.724 with the augmented ones (prototype 0.644 / 0.634 / 0.700); on all samples
+the augmented candidates lower Jev further (feature 0.514 → 0.428–0.478). The extra terms raise recall by 2–9
+points but the rerankers pick the new wrong terms about as often as the new right ones: no source helps.
+
+| second pass over Jev's own candidates | gated | random |
+|---|---|---|
+| Jev whole-vocabulary Choice, top 1 | 0.272 / 0.252 / 0.294 | 0.516 / 0.316 / 0.666 |
+| rerank of its top 3 | 0.348 / 0.276 / 0.316 | 0.568 / 0.346 / 0.688 |
+| rerank of its top 5 | 0.358 / 0.282 / 0.318 | 0.564 / 0.380 / 0.690 |
+| Nouls only (most specific "fits"), top 5 | 0.240 / 0.226 / 0.262 | 0.420 / 0.274 / 0.612 |
+| prototype | 0.334 / 0.218 / 0.356 | 0.644 / 0.634 / 0.700 |
+
+The second pass gains +5 to +9 / +2 to +6 / +2 points over the vocabulary Choice (significant for biome and random
+feature) for about $0.1 per 1,500 slot-samples; its descriptions carry example samples from other studies, so it is
+not zero-shot. It stays well below the prototype on random samples and below Jev reranking the prototype's
+candidates on gated ones.
+
+The same second pass by GPT (`run_jev_followups.sh gpt_pass2`, $4.3; exact, GPT − Jev paired):
+
+| | gated | random |
+|---|---|---|
+| Jev | 0.358 / 0.282 / 0.318 | 0.564 / 0.380 / 0.690 |
+| gpt-4.1-mini | 0.348 / 0.240 / 0.252 (−1.0 / **−4.2** / **−6.6**) | 0.628 / 0.420 / 0.640 (**+6.4** / +4.0 / **−5.0**) |
+| gpt-5.1 | 0.300 / 0.244 / 0.224 (−5.8 / −3.8 / **−9.4**) | 0.590 / 0.400 / 0.654 (+2.6 / +2.0 / −3.6) |
+
+No consistent winner: Jev is better on the hard samples and on material (GPT picks a too-specific material 8–13 % of
+the time vs Jev's 5–7 %), gpt-4.1-mini on random biome and feature; gpt-5.1 is never better than gpt-4.1-mini. All
+stay below the prototype on random samples.
+
+| retrieve, then choose | gated, all | gated, unseen labels | random, all | random, unseen labels |
+|---|---|---|---|---|
+| n (biome / feature / material) | 500 each | 38 / 168 / 170 | 500 each | 12 / 79 / 53 |
+| prototype | 0.334 / 0.218 / 0.356 | 0 / 0 / 0 | 0.644 / 0.634 / 0.700 | 0 / 0 / 0 |
+| Jev, Metalog vocabulary | 0.272 / 0.252 / 0.294 | 0 / 0 / 0 | 0.516 / 0.316 / 0.666 | 0 / 0 / 0 |
+| open Choice | 0.232 / 0.222 / 0.292 | 0.184 / 0.202 / 0.241 | 0.466 / 0.140 / 0.554 | 0.333 / 0.165 / 0.358 |
+
+The open Choice is the only method that ever gets an unseen label right, but on seen labels it loses Metalog's
+conventions (random feature: 218 of 430 errors are gut samples whose *intestine environment* becomes *fecal
+material*, *feces* or *fecal environment*). Used only where it picks a term outside the training vocabulary with
+probability ≥ 0.9, it changes the prototype by +0.6 / −2.2 / +1.8 points (gated) and +0.4 / −2.2 / −0.4 (random);
+a perfect unseen-label detector would give +1.4 / +6.8 / +8.2 and +0.8 / +2.6 / +3.8.
+
+Which samples should get the open pick, by signals outside the open Choice (`jev_analyses.py open_detector`;
+coverage = held-out similarity from `6b_coverage.py`, known for 403 / 403 / 394 of the gated samples): the
+prototype's low confidence works for feature and material, the coverage flag only for material, nothing for biome.
+
+| rule (gated set; random set) | feature | material | biome |
+|---|---|---|---|
+| prototype confidence in its lowest 20 % | +2.5 (0.0…+5.4); +1.0 (−1.0…+3.1) | **+4.6 (+1.1…+8.5)**; +2.2 (−1.6…+5.6) | −5.0; −2.6 |
+| prototype confidence in its lowest 30 % | **+3.2 (+0.5…+6.5)**; +1.8 (−1.6…+5.0) | +3.6 (−1.3…+8.5); +1.6 (−3.1…+5.8) | −8.7; −3.2 |
+| coverage < 0.611 (the flag) | −0.2; −0.6 | +2.0 (−1.0…+5.2); **+1.8 (+0.2…+3.8)** | +0.5; −1.2 |
+
+Where the confidence rule fires on feature / material, 59–78 % (gated) and 23–70 % (random) of the labels are unseen; the
+open pick is right 10–40 % of the time there, the prototype 2–35 %.
+
+Retrieve-then-choose with similar samples (`run_jev_followups.sh open_similar`, $1.42): the 5 most similar labelled
+samples of other studies (≤ 2 per study, 300 characters each) and the term the curators assigned them in the state,
+their terms added to the options (`jev_followups.py open --similar 5`); analysis `jev_analyses.py open_examples`.
+
+| exact top-1 | gated, all | gated, unseen | random, all | random, unseen |
+|---|---|---|---|---|
+| prototype | 0.334 / 0.218 / 0.356 | 0 / 0 / 0 | 0.644 / 0.634 / 0.700 | 0 / 0 / 0 |
+| Jev rerank of the prototype's candidates | 0.404 / 0.300 / 0.304 | 0 / 0 / 0 | 0.630 / 0.514 / 0.696 | 0 / 0 / 0 |
+| open Choice | 0.232 / 0.222 / 0.292 | 0.184 / 0.202 / 0.241 | 0.466 / 0.140 / 0.554 | 0.333 / 0.165 / 0.358 |
+| open Choice + similar samples | 0.406 / 0.248 / 0.332 | 0.184 / 0.179 / 0.282 | 0.676 / 0.570 / 0.706 | 0.333 / 0.177 / 0.283 |
+| vote of the same 5 samples (no Jev) | 0.432 / 0.250 / 0.262 | 0 / 0 / 0 | 0.652 / 0.636 / 0.668 | 0 / 0 / 0 |
+
+- The examples fix the conventions: +17 / +3 / +4 points (gated), +21 / +43 / +15 (random) over the plain open
+  Choice; *intestine environment → fecal material* errors drop from 114 to 13. Overall it now matches the prototype
+  (random: +3.2 / −6.4 / +0.6).
+- The gain is the neighbours' labels: Jev picks one of the examples' terms 43–89 % of the time, is right 46–87 % of
+  the time when gold is among them and 12–25 % when not; a plain majority vote of the same 5 samples does as well
+  (with examples − vote: −2.6 / −0.2 / +7.0 gated, +2.4 / **−6.6** / +3.8 random). Random material: 11 % of samples
+  get gold among the options only through the examples.
+- Labels no other study used: unchanged (examples cannot carry them): −2.4 / +4.1 (feature / material, gated),
+  +1.3 / −7.5 (random, n 79 / 53).
+- Triggered on the prototype's least-confident samples it is as good as Jev reranking the prototype's candidates
+  (random, lowest 30 %: 0.678 / 0.646 / 0.724 vs 0.676 / 0.658 / 0.710), and it can return a new label. Gain over the
+  prototype (gated): feature lowest 30 % **+4.7 (+0.7…+9.5)**, material lowest 20 % **+4.8 (+1.2…+9.0)**; biome
+  no longer loses (−1.5 to +0.2). When it and the reranker agree, the pick is right 42–84 % of the time, against
+  15–43 % when they differ.
+
+`jev_pilot.py run --questions` asks only some of the flat request's questions (e.g. rerank and fits, without the
+whole-vocabulary Choice). Tests: `tests/test_jev_followups.py` (8).
 
 ## 8. Gold-set check (`gold_check.py`; 1,021 hand-labelled samples outside Metalog, coarse labels)
 

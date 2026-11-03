@@ -18,6 +18,11 @@ pipeline's inputs. Each subcommand prints one block of numbers quoted in the wri
   ontology_size   terms and tokens of one Choice question per term set (slot vocabularies, ENVO branches, all of
                   ENVO / UBERON), by what each option carries
   open_retrieval  gold in the top k of plain embedding retrieval over all of ENVO + UBERON (k = 10 ... 255)
+  open_hybrid     retrieve-then-choose results (run_jev_followups.sh): its pick as a fallback for labels no other
+                  study used (oracle and a usable rule), and its most frequent errors
+  open_detector   the same fallback, triggered by the coverage flag or the prototype's low confidence instead
+  open_examples   the open Choice with similar labelled samples: vs a plain vote of the same samples and vs Jev
+                  reranking the prototype's candidates; where its gain comes from
 
 cd scripts/ontology_mapping
 python3 experiments/jev_analyses.py all          # every block, both sample sets (a few minutes)
@@ -309,8 +314,167 @@ def open_retrieval(args):
             print(f"  {slot:8} n {len(ps)}: " + " / ".join(f"{np.mean(rank <= k):.2f}" for k in ks))
 
 
+def open_hybrid(args):
+    """Retrieve-then-choose (jev_followups.py open, run by run_jev_followups.sh): can its pick replace the
+    prototype's when the gold label is one no other study used? Oracle (open pick exactly on unseen-label samples),
+    a usable rule (open pick when it lies outside the training vocabulary with probability >= p) and the most
+    frequent open-Choice errors."""
+    import collections
+    J = path(args.jev)
+    F, O = f"{J}/followups", f"{J}/followups/results"
+    for name, pf, *_ in sets(args):
+        if not os.path.exists(f"{O}/{name}_{args.open_variant}.jsonl"):
+            print(f"\n== {name}: no {O}/{name}_{args.open_variant}.jsonl (run run_jev_followups.sh)")
+            continue
+        pilot = {(o["slot"], o["sample_id"]): o for o in jp.read_jsonl(pf)}
+        opened = {(o["slot"], o["sample_id"]): o for o in jp.read_jsonl(f"{F}/{name}_{args.open_variant}.jsonl")}
+        inputs = json.load(open(f"{F}/inputs_{name}_{args.open_variant}.json"))
+        ctx = jp.Ctx(inputs, SimpleNamespace(min_studies=1))
+        label = lambda t: (inputs["terms"].get(t) or {}).get("label", t)
+        resp = {(r["slot"], r["sample_id"]): r for r in jp.read_jsonl(f"{O}/{name}_{args.open_variant}.jsonl")}
+        print(f"\n== open Choice as a fallback for unseen labels, {name} samples")
+        for slot in SLOTS:
+            keys = [k for k in resp if k[0] == slot]
+            if not keys:
+                continue
+            pro, ope, out, prob, uns, st, errors = [], [], [], [], [], [], collections.Counter()
+            for k in keys:
+                o = pilot[k]
+                pr = np.array(resp[k]["rerank"])
+                pick = cands(opened[k])[int(np.argmax(pr))]
+                voc = set(ctx.vocab(slot, o["study"])[0])
+                pro.append(o["candidates"][0]["term_id"] == o["gold"])
+                ope.append(pick == o["gold"])
+                out.append(pick not in voc)
+                prob.append(float(pr.max()))
+                uns.append(o["gold"] not in voc)
+                st.append(o["study"])
+                if pick != o["gold"]:
+                    errors[(label(o["gold"]), label(pick))] += 1
+            pro, ope, out, prob, uns, st = map(np.array, (pro, ope, out, prob, uns, st))
+            print(f"  {slot}: prototype {pro.mean():.3f} | open pick outside the training vocabulary {out.mean():.3f} "
+                  f"(gold unseen {uns.mean():.3f}) | oracle {np.where(uns, ope, pro).mean():.3f}")
+            for th in (0.0, 0.5, 0.7, 0.9):
+                use = out & (prob >= th)
+                hyb = np.where(use, ope, pro)
+                prec = f"{ope[use].mean():.3f}" if use.any() else "-"
+                print(f"    open pick if outside the vocabulary and p >= {th}: fires {use.mean():.3f}, right {prec} "
+                      f"-> exact {hyb.mean():.3f}, vs prototype {jp.boot_diff(hyb, pro, st)}")
+            print("    most frequent errors (gold -> open pick): " + "; ".join(
+                f"{g} -> {p} ({n})" for (g, p), n in errors.most_common(5)))
+
+
+def open_detector(args):
+    """When should the open Choice replace the prototype? Two signals that do not come from the open Choice itself:
+    the coverage flag (held-out similarity to the nearest training sample of another project,
+    atlas_coverage/metalog_held_out_sim.tsv.gz; flag < 0.611) and the prototype's own confidence (base_maxp).
+    For each rule: share of samples it fires on, share of those with an unseen label, open / prototype right there,
+    and overall exact top-1 vs the prototype (paired, study bootstrap)."""
+    import gzip
+    import csv
+    J = path(args.jev)
+    F, O = f"{J}/followups", f"{J}/followups/results"
+    with gzip.open(path(args.coverage), "rt") as fh:
+        sim = {r["sample_id"]: float(r["held_out_sim"]) for r in csv.DictReader(fh, delimiter="\t")}
+    for name, pf, *_ in sets(args):
+        if not os.path.exists(f"{O}/{name}_{args.open_variant}.jsonl"):
+            continue
+        pilot = {(o["slot"], o["sample_id"]): o for o in jp.read_jsonl(pf)}
+        opened = {(o["slot"], o["sample_id"]): o for o in jp.read_jsonl(f"{F}/{name}_{args.open_variant}.jsonl")}
+        ctx = jp.Ctx(json.load(open(f"{F}/inputs_{name}_{args.open_variant}.json")), SimpleNamespace(min_studies=1))
+        resp = {(r["slot"], r["sample_id"]): r for r in jp.read_jsonl(f"{O}/{name}_{args.open_variant}.jsonl")}
+        print(f"\n== which samples get the open Choice's pick, {name} samples")
+        for slot in SLOTS:
+            keys = [k for k in resp if k[0] == slot and k[1] in sim]
+            if not keys:
+                continue
+            o_ = [pilot[k] for k in keys]
+            pro = np.array([o["candidates"][0]["term_id"] == o["gold"] for o in o_])
+            ope = np.array([cands(opened[k])[int(np.argmax(resp[k]["rerank"]))] == pilot[k]["gold"] for k in keys])
+            uns = np.array([o["gold"] not in ctx.vocab(slot, o["study"])[0] for o in o_])
+            cov = np.array([sim[k[1]] for k in keys])
+            conf = np.array([o["base_maxp"] for o in o_])
+            st = np.array([o["study"] for o in o_])
+            print(f"  {slot}: n {len(keys)} (of {sum(k[0] == slot for k in resp)} with a coverage value), unseen {uns.mean():.3f}, "
+                  f"prototype {pro.mean():.3f}, oracle {np.where(uns, ope, pro).mean():.3f}")
+            rules = [(f"coverage < {c}", cov < c) for c in (0.611, 0.7, 0.8)]
+            rules += [(f"prototype confidence in its lowest {q:.0%}", conf <= np.quantile(conf, q)) for q in (0.1, 0.2, 0.3)]
+            rules += [("coverage < 0.7 and confidence in the lowest 30%", (cov < 0.7) & (conf <= np.quantile(conf, 0.3)))]
+            for label, use in rules:
+                if not use.any():
+                    continue
+                hyb = np.where(use, ope, pro)
+                print(f"    {label:48} fires {use.mean():.3f}, unseen there {uns[use].mean():.2f}, open / prototype right there "
+                      f"{ope[use].mean():.2f} / {pro[use].mean():.2f} -> exact {hyb.mean():.3f}, vs prototype {jp.boot_diff(hyb, pro, st)}")
+
+
+def open_examples(args):
+    """Retrieve-then-choose with similar labelled samples (run_jev_followups.sh open_similar): where its gain comes from.
+    Exact top-1 of the open Choice with examples vs a plain vote of the same 5 examples (1-NN and majority, ties to
+    the most similar) and vs Jev reranking the prototype's candidates (the flat run); whether gold is among the
+    examples' terms; how often it picks one of them; agreement with the reranker. Random samples: both as gated
+    rerankers on the prototype's 30 % least-confident samples."""
+    import collections
+    J = path(args.jev)
+    F, O = f"{J}/followups", f"{J}/followups/results"
+    for name, pf, inputs_f, flat_f, _ in sets(args):
+        if not os.path.exists(f"{O}/{name}_open_similar.jsonl"):
+            print(f"\n== {name}: no {O}/{name}_open_similar.jsonl (run run_jev_followups.sh open_similar)")
+            continue
+        pilot, _, flat = load(pf, inputs_f, flat_f)
+        opened = {(o["slot"], o["sample_id"]): o for o in jp.read_jsonl(f"{F}/{name}_open_similar.jsonl")}
+        resp = {(r["slot"], r["sample_id"]): r for r in jp.read_jsonl(f"{O}/{name}_open_similar.jsonl")}
+        terms = json.load(open(f"{F}/inputs_{name}_open_similar.json"))["terms"]
+        by_label = {}
+        for t, v in terms.items():
+            by_label.setdefault(v["label"], t)
+        print(f"\n== open Choice with similar samples, {name} samples")
+        for slot in SLOTS:
+            ks = [k for k in resp if k[0] == slot and k in flat]
+            if not ks:
+                continue
+            gold = np.array([pilot[k]["gold"] for k in ks])
+            st = np.array([pilot[k]["study"] for k in ks])
+            ex_terms = [[by_label.get(x["term"]) for x in opened[k].get("similar", [])] for k in ks]
+            sim = np.array([cands(opened[k])[int(np.argmax(resp[k]["rerank"]))] for k in ks])
+            pro = np.array([pilot[k]["candidates"][0]["term_id"] for k in ks])
+            rer = np.array([jev_rerank_pick(pilot[k], flat[k]) for k in ks], object)
+
+            def vote(ts):
+                cnt = collections.Counter(ts)
+                return next(t for t in ts if cnt[t] == max(cnt.values())) if ts else None
+            nn1 = np.array([ts[0] if ts else None for ts in ex_terms], object)
+            knn = np.array([vote(ts) for ts in ex_terms], object)
+            gin = np.array([g in ts for g, ts in zip(gold, ex_terms)])
+            copied = np.array([p in ts for p, ts in zip(sim, ex_terms)])
+            e = {n: (a == gold) for n, a in [("prototype", pro), ("Jev rerank", rer), ("1-NN", nn1), ("5-NN vote", knn),
+                                              ("Jev with examples", sim)]}
+            agree = sim == rer
+            print(f"  {slot}: " + ", ".join(f"{n} {v.mean():.3f}" for n, v in e.items()))
+            print(f"    with examples - 5-NN vote {jp.boot_diff(e['Jev with examples'], e['5-NN vote'], st)}; "
+                  f"- Jev rerank {jp.boot_diff(e['Jev with examples'], e['Jev rerank'], st)}")
+            print(f"    gold among the examples' terms {gin.mean():.3f} (right there {e['Jev with examples'][gin].mean():.2f}, "
+                  f"elsewhere {e['Jev with examples'][~gin].mean():.2f}); picks one of the examples' terms {copied.mean():.3f}")
+            print(f"    agrees with Jev rerank {agree.mean():.3f}: right when they agree {e['Jev with examples'][agree].mean():.2f}, "
+                  f"when not {e['Jev with examples'][~agree].mean():.2f} (with examples) / {e['Jev rerank'][~agree].mean():.2f} (rerank)")
+            if name == "random":
+                conf = np.array([pilot[k]["base_maxp"] for k in ks])
+                low = conf <= np.quantile(conf, 0.3)
+                a, b = np.where(low, e["Jev rerank"], e["prototype"]), np.where(low, e["Jev with examples"], e["prototype"])
+                print(f"    on the 30 % least-confident only: Jev rerank {a.mean():.3f}, with examples {b.mean():.3f}, "
+                      f"difference {jp.boot_diff(b, a, st)}")
+
+
+def jev_rerank_pick(o, rec):
+    p, _ = jp.decide_rerank(rec["rerank"], rec["fits"])
+    c = cands(o)
+    return None if p == len(c) else c[p]
+
+
 BLOCKS = {"confidence": confidence, "tokens": tokens, "vs_gpt": vs_gpt, "gate": gate, "zero_shot": zero_shot,
-          "topdown": topdown, "ontology_size": ontology_size, "open_retrieval": open_retrieval}
+          "topdown": topdown, "ontology_size": ontology_size, "open_retrieval": open_retrieval,
+          "open_hybrid": open_hybrid, "open_detector": open_detector,
+          "open_examples": open_examples}
 
 
 def main(argv=None):
@@ -321,6 +485,9 @@ def main(argv=None):
     p.add_argument("--gpt_file", default="resp_k5anc_gpt-4.1-mini.jsonl")
     p.add_argument("--plain_label_vectors",
                    default="~/MicrobeAtlasProject/ontology_mapping/slot_vocab_label__text-embedding-3-large__dim1024.h5")
+    p.add_argument("--coverage", default="~/MicrobeAtlasProject/ontology_mapping/atlas_coverage/metalog_held_out_sim.tsv.gz",
+                   help="open_detector: held-out similarity of each Metalog training sample (6b_coverage.py)")
+    p.add_argument("--open_variant", default="open", help="open_hybrid / open_detector: open (default) or open_similar")
     p.add_argument("--n_requests", type=int, default=300, help="tokens: flat requests sampled from the cache")
     args = p.parse_args(argv)
     for name, fn in BLOCKS.items():

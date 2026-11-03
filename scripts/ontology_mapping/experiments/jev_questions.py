@@ -44,9 +44,19 @@ def metadata_fields(text):
     return fields
 
 
-def state(text):
-    """The request state: the sample's metadata as named fields."""
-    return {"sample_metadata": metadata_fields(text)}
+MIXS = {"biome": "env_broad_scale", "feature": "env_local_scale", "material": "env_medium"}
+
+
+def state(text, similar=None, slot=None):
+    """The request state: the sample's metadata as named fields; optionally similar samples from other studies with
+    the term the curators assigned them for this slot (a fact the model lacks: how Metalog's curators label such
+    samples). similar = [{"text": ..., "term": label}, ...], most similar first."""
+    s = {"sample_metadata": metadata_fields(text)}
+    if similar:
+        s["similar_samples_labelled_by_curators"] = {
+            f"sample_{i + 1}": {"sample_metadata": metadata_fields(x["text"]), f"{MIXS[slot]}_assigned": x["term"]}
+            for i, x in enumerate(similar)}
+    return s
 
 
 # ----------------------------------------------------------------------------- questions

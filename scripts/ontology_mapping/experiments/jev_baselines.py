@@ -28,16 +28,83 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.dirname(HERE))
-from common import SLOTS, load_npz, load_terms, path, read_tsv, select_samples  # noqa: E402
+from common import SLOTS, path  # noqa: E402
 import jev_pilot as jp  # noqa: E402
 
 MODELS = {"prototype": (0.5, 0.1), "retrieval_prior": (0.0, 0.1), "retrieval": (0.0, 0.0)}
 
 
+def load_training(args):
+    """The training samples (training set + label map, those with both embeddings), their vectors and the term
+    vectors. -> namespace(S, X, studies, vec(ids) -> vectors, terms, trow, TM)."""
+    from common import load_npz, load_terms, read_tsv, select_samples
+    import hierarchical_backoff as hb
+    terms = load_terms(args.ontology_terms)
+    (kr, K), (sr, B) = load_npz(args.keywords), load_npz(args.sub_biomes)
+    S = select_samples(args.samples, [set(kr), set(sr)])
+    if args.label_map:
+        lm = read_tsv(args.label_map)
+        for slot in SLOTS:
+            m = {r.from_id.strip(): r.to_id.strip() for r in lm.itertuples() if r.slot.strip() in (slot, "*")}
+            S[slot] = S[slot].map(lambda t: m.get(t, t))
+    vec = lambda ids: (np.hstack([K[[kr[s] for s in ids]], B[[sr[s] for s in ids]]]) / np.sqrt(2)).astype(np.float32)
+    return SimpleNamespace(S=S, X=vec(S["sample_id"]), studies=S["study_code"].to_numpy(), vec=vec, terms=terms,
+                           trow={t: i for i, t in enumerate(terms["term_id"])},
+                           TM=hb.term_matrix(terms, args.term_vectors).astype(np.float32))
+
+
+def loso_rankings(T, slot, ps, ctx, top=30):
+    """Rank Jev's vocabulary for each pilot sample of `slot` with the three models of MODELS, trained on every other
+    study. -> {model: {sample_id: [term, ...] best first}}.
+
+    methods.prototype_model, leave-one-study-out by subtraction: per (label, study) sums of the centred, normalised
+    training samples, computed once; a group's sums = all - its own study. The centring mean is the slot's overall
+    training mean (leaving one study out of 539 moves it negligibly)."""
+    from sklearn.preprocessing import normalize
+    X, studies, y = T.X, T.studies, T.S[slot].to_numpy()
+    ranked = {name: {} for name in MODELS}
+    lab = y != ""
+    mean = X[lab].mean(axis=0)
+    Z = normalize(X[lab] - mean)
+    ylab, slab = y[lab], studies[lab]
+    labels = sorted(set(ylab))
+    li = {t: i for i, t in enumerate(labels)}
+    pairs = {}
+    for i, (t, st) in enumerate(zip(ylab, slab)):
+        pairs.setdefault((li[t], st), []).append(i)
+    total = np.zeros((len(labels), X.shape[1]), np.float32)
+    count = np.zeros(len(labels))
+    own = {}
+    for (l, st), rows in pairs.items():
+        v = Z[rows].sum(axis=0)
+        total[l] += v
+        count[l] += len(rows)
+        own.setdefault(st, []).append((l, v, len(rows)))
+    a, b = MODELS["prototype"]
+    for study in sorted({o["study"] for o in ps}):
+        group = [o for o in ps if o["study"] == study]
+        vocab = ctx.vocab(slot, study)[0]
+        sums, n_lab = total.copy(), count.copy()
+        for l, v, n in own.get(study, []):
+            sums[l] -= v
+            n_lab[l] -= n
+        rows = [li[v] for v in vocab]
+        n = n_lab[rows]
+        P0 = normalize(T.TM[[T.trow[v] for v in vocab]] - T.TM[[T.trow[v] for v in vocab]].mean(axis=0))  # alpha 0
+        P = P0.copy()
+        seen = n > 0
+        P[seen] = normalize(a * normalize(sums[rows][seen]) + (1 - a) * P0[seen])
+        bias = b * np.log((n + 0.5) / (n + 0.5).sum())
+        Xte = normalize(T.vec([o["sample_id"] for o in group]) - mean)
+        scores = {"prototype": Xte @ P.T + bias, "retrieval_prior": Xte @ P0.T + bias, "retrieval": Xte @ P0.T}
+        for name, sc in scores.items():
+            for o, row in zip(group, sc):
+                ranked[name][o["sample_id"]] = [vocab[i] for i in np.argsort(-row)[:top]]
+    return ranked
+
+
 def main():
     from _setup import DEFAULTS
-    from sklearn.preprocessing import normalize
-    import hierarchical_backoff as hb
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--pilot", required=True)
     p.add_argument("--inputs", required=True)
@@ -52,65 +119,12 @@ def main():
     pilot = jp.read_jsonl(args.pilot)
     flat = {(r["slot"], r["sample_id"]): r for r in jp.read_jsonl(args.flat)}
     ctx = jp.Ctx(json.load(open(path(args.inputs))), SimpleNamespace(min_studies=1))
-    terms = load_terms(args.ontology_terms)
-    trow = {t: i for i, t in enumerate(terms["term_id"])}
-    TM = hb.term_matrix(terms, args.term_vectors).astype(np.float32)
-    (kr, K), (sr, B) = load_npz(args.keywords), load_npz(args.sub_biomes)
-    S = select_samples(args.samples, [set(kr), set(sr)])
-    if args.label_map:
-        lm = read_tsv(args.label_map)
-        for slot in SLOTS:
-            m = {r.from_id.strip(): r.to_id.strip() for r in lm.itertuples() if r.slot.strip() in (slot, "*")}
-            S[slot] = S[slot].map(lambda t: m.get(t, t))
-    vec = lambda ids: (np.hstack([K[[kr[s] for s in ids]], B[[sr[s] for s in ids]]]) / np.sqrt(2)).astype(np.float32)
-    X = vec(S["sample_id"])
-    studies = S["study_code"].to_numpy()
-    print(f"{len(S)} training samples, {len(pilot)} pilot samples ({time.time() - t0:.0f}s)", flush=True)
+    T = load_training(args)
+    print(f"{len(T.S)} training samples, {len(pilot)} pilot samples ({time.time() - t0:.0f}s)", flush=True)
     report = {}
     for slot in SLOTS:
         ps = [o for o in pilot if o["slot"] == slot and (slot, o["sample_id"]) in flat]
-        y = S[slot].to_numpy()
-        ranked = {name: {} for name in MODELS}
-        # methods.prototype_model, leave-one-study-out by subtraction: per (label, study) sums of the centred,
-        # normalised training samples, computed once; a group's sums = all - its own study. The centring mean is
-        # the slot's overall training mean (leaving one study out of 539 moves it negligibly).
-        lab = y != ""
-        mean = X[lab].mean(axis=0)
-        Z = normalize(X[lab] - mean)
-        ylab, slab = y[lab], studies[lab]
-        labels = sorted(set(ylab))
-        li = {t: i for i, t in enumerate(labels)}
-        pairs = {}
-        for i, (t, st) in enumerate(zip(ylab, slab)):
-            pairs.setdefault((li[t], st), []).append(i)
-        total = np.zeros((len(labels), X.shape[1]), np.float32)
-        count = np.zeros(len(labels))
-        own = {}
-        for (l, st), rows in pairs.items():
-            v = Z[rows].sum(axis=0)
-            total[l] += v
-            count[l] += len(rows)
-            own.setdefault(st, []).append((l, v, len(rows)))
-        a, b = MODELS["prototype"]
-        for study in sorted({o["study"] for o in ps}):
-            group = [o for o in ps if o["study"] == study]
-            vocab = ctx.vocab(slot, study)[0]
-            sums, n_lab = total.copy(), count.copy()
-            for l, v, n in own.get(study, []):
-                sums[l] -= v
-                n_lab[l] -= n
-            rows = [li[v] for v in vocab]
-            n = n_lab[rows]
-            P0 = normalize(TM[[trow[v] for v in vocab]] - TM[[trow[v] for v in vocab]].mean(axis=0))  # alpha 0
-            P = P0.copy()
-            seen = n > 0
-            P[seen] = normalize(a * normalize(sums[rows][seen]) + (1 - a) * P0[seen])
-            bias = b * np.log((n + 0.5) / (n + 0.5).sum())
-            Xte = normalize(vec([o["sample_id"] for o in group]) - mean)
-            scores = {"prototype": Xte @ P.T + bias, "retrieval_prior": Xte @ P0.T + bias, "retrieval": Xte @ P0.T}
-            for name, sc in scores.items():
-                for o, row in zip(group, sc):
-                    ranked[name][o["sample_id"]] = [vocab[i] for i in np.argsort(-row)[:30]]
+        ranked = loso_rankings(T, slot, ps, ctx)
         for o in ps:  # Jev: its vocabulary Choice, best first
             P = flat[(slot, o["sample_id"])]["vocab"]
             ranked.setdefault("jev_vocab", {})[o["sample_id"]] = sorted(P, key=lambda t: -P[t])[:30]
