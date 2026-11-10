@@ -351,3 +351,17 @@ Quirks pinned: the LLM's "none of these" probability is dropped in llm_logprob, 
 undecided LLM (changing it would invalidate the fitted w / T2 / tau2); fit needs one unmerged calibration.json
 (a merged one has no quantiles: KeyError); apply does not check that requests / members match the current atlas;
 parse reads only a whole number after the letter as a stated confidence.
+
+## experiments/set_valued.py
+
+The first experiment script with tests of its own (README §21: set-valued decoding over the DAG). Tests import it
+from `experiments/` (the files insert that folder on `sys.path`).
+
+| file | covers |
+|---|---|
+| `test_set_valued_unit.py` (33) | `oof_probabilities` (temperature of a fold fitted on the other folds only, an unlabelled slot), `candidate_sets` (only allowed nodes, mass order, `--min_mass` inclusive, no term with its ancestor, max terms), `set_table` on a hand-made DAG (a label under both nodes counted once, IC, expected credit), `conformal_pick`, `expected_value_pick` (penalty favours the safer set, zero value abstains), `cross_fit` and `fallback` (thresholds from the other folds / their abstentions only, ties, infeasible targets), `decode_slot` on hand-made probabilities (split samples: back-off abstains, every set method answers {ocean, soil}, fallbacks keep the back-off answers), `RuleScorer` (synonyms, out-of-fold co-labels, facets, IC / depth credit, any vs split, macro over learnable labels), helpers |
+| `test_set_valued_integration.py` (10) | `main()` on step5_toy.py's world + 12 estuary-like samples split between marine and freshwater, 2 folds, a 3-term OBO: every method and slot reported, one decision per labelled sample, answers are terms and never hold a term with its ancestor, summary recomputed from decisions.tsv.gz, top-1 rule scores = plain accuracy, split ≤ any, thresholds per fold, fallbacks keep the primary answers, `--no_rules --max_terms 1` |
+| `test_set_valued_mutations.py` (19 + 1) | 19 bugs in a copy of the script (~35 s): non-label nodes as answers, `--min_mass` boundary, ancestor + descendant sets, a label counted twice under two parents, expected credit without IC, conformal largest-first / ignoring max terms, expected value answering at 0 / penalising the right mass, thresholds tuned on the own fold, infeasible -> most permissive, fallback overwriting or tuned on all rows, temperature on all folds, pooling weights swapped, split = any, co-labels from the test fold, learnable = 1 study, narrower answers counted right |
+
+Fixed while writing them: a slot without labelled training samples in a fold crashed (`np.vstack` of nothing); it now
+gives empty folds (never the case in Metalog).
