@@ -21,6 +21,12 @@ pipeline's inputs. Each subcommand prints one block of numbers quoted in the wri
   open_hybrid     retrieve-then-choose results (run_jev_followups.sh): its pick as a fallback for labels no other
                   study used (oracle and a usable rule), and its most frequent errors
   open_detector   the same fallback, triggered by the coverage flag or the prototype's low confidence instead
+  topdown_width   top-down: gold reachable from the common ancestor of the prototype's top n; where gold is lost
+                  (not reachable / pruned from the beam, at which question and rank / finished but not first)
+  acceptable      every method's top-1 (incl. the open top-down runs) sorted into exact / broader / narrower /
+                  equivalent / facet / none / wrong (acceptable_answers.py's rules), with IC credit for broader
+                  answers; all samples and unseen-label samples
+  open_pass2      the second pass over the open top 5: first vs second pass vs a mix keeping new-term first picks
   open_examples   the open Choice with similar labelled samples: vs a plain vote of the same samples and vs Jev
                   reranking the prototype's candidates; where its gain comes from
 
@@ -471,10 +477,221 @@ def jev_rerank_pick(o, rec):
     return None if p == len(c) else c[p]
 
 
+def topdown_width(args):
+    """Is the top-down walk too narrow? (1) Where it starts: gold reachable from the common ancestor of the prototype's
+    top n candidates (n = 1, 2, 3 = the pilot's --start lca, 5, 10) or from the root, and how many slot labels lie below
+    the start. (2) Where gold is lost, replaying each walk's beam from its stored answers: not reachable from the start;
+    pruned from the beam (at which question, and at which rank among that question's expanded paths: a wider beam would
+    have kept it at that step, though what it would have chosen below is unknown); among the finished paths but not
+    ranked first; first (exact)."""
+    for name, pf, inp, fl, folder in sets(args):
+        pilot, ctx, _ = load(pf, inp, fl)
+        print(f"\n== top-down width ({name} samples)")
+        for slot in SLOTS:
+            ps = [o for o in pilot.values() if o["slot"] == slot]
+            row = []
+            for n in (1, 2, 3, 5, 10):
+                reach, size = [], []
+                for o in ps:
+                    tree = ctx.tree(slot, o["study"])
+                    st = jp.lca_start(o, tree, ctx, n=n)
+                    below = tree["below"].get(st, []) if st != jp.ROOT else tree["answers"]
+                    reach.append(o["gold"] in below)
+                    size.append(len(below))
+                row.append(f"top {n}: {np.mean(reach):.2f} ({np.median(size):.0f})")
+            reach = np.mean([o["gold"] in ctx.tree(slot, o["study"])["answers"] for o in ps])
+            vocab = np.median([len(ctx.tree(slot, o["study"])["answers"]) for o in ps])
+            print(f"  {slot:8} gold reachable from the common ancestor of the prototype's ... (median labels below): "
+                  + "; ".join(row) + f"; root: {reach:.2f} ({vocab:.0f})")
+        for arm in ("topdown_lca", "topdown_root"):
+            f = os.path.join(folder, f"{arm}.jsonl")
+            if not os.path.exists(f):
+                continue
+            recs = jp.read_jsonl(f)
+            for slot in SLOTS:
+                fate, ranks, mismatch = [], [], 0
+                for r in [r for r in recs if r["slot"] == slot]:
+                    o = pilot[(slot, r["sample_id"])]
+                    tree, g = ctx.tree(slot, o["study"]), o["gold"]
+                    on_line = lambda route, done: (route[-1] == g) if done else (g in tree["below"].get(route[-1], []))  # noqa: E731
+                    beam = [(1.0, *jp.advance((r["start"],), tree, ctx))]
+                    lost = None
+                    if not r["gold_reachable"]:
+                        lost = ("not reachable", None, None)
+                    for level, asked in enumerate(r["trace"]):
+                        new = [b for b in beam if b[2]]
+                        for p, route, done in beam:
+                            if done:
+                                continue
+                            probs = asked[route[-1]]
+                            for name_, child, _ in jp.node_options(route[-1], tree, ctx):
+                                pc = probs.get(name_, 0.0)
+                                new.append((p * pc, route, True) if child is None else (p * pc, *jp.advance(route + (child,), tree, ctx)))
+                        new = sorted(new, key=lambda b: -b[0])
+                        hits = [i for i, b in enumerate(new) if on_line(b[1], b[2])]
+                        beam = new[:args.beam]
+                        if lost is None and hits and hits[0] >= args.beam:
+                            lost = ("pruned", level + 1, hits[0] + 1)
+                        elif lost is None and not hits:
+                            lost = ("pruned", level + 1, 99)
+                    terms_ = {}
+                    for p, route, done in beam:
+                        if done and route[-1] in tree["answers"]:
+                            terms_[route[-1]] = terms_.get(route[-1], 0.0) + p
+                    mismatch += set(terms_) != set(r["terminals"])
+                    if lost is None:
+                        best = max(r["terminals"], key=r["terminals"].get, default=None)
+                        lost = ("exact", None, None) if best == g else (("finished, not first", None, None) if g in r["terminals"]
+                                                                       else ("pruned", None, 99))
+                    fate.append(lost[0])
+                    if lost[0] == "pruned" and lost[2] is not None:
+                        ranks.append((lost[1], lost[2]))
+                fate = np.array(fate)
+                rk = np.array([x[1] for x in ranks]) if ranks else np.array([99])
+                lv = np.array([x[0] or 0 for x in ranks]) if ranks else np.array([0])
+                print(f"  {arm:13} {slot:8} n {len(fate)}: exact {np.mean(fate == 'exact'):.2f} | finished, not first "
+                      f"{np.mean(fate == 'finished, not first'):.2f} | pruned {np.mean(fate == 'pruned'):.2f} (at question 1 / 2 / 3+: "
+                      f"{np.mean(lv == 1):.0%} / {np.mean(lv == 2):.0%} / {np.mean(lv >= 3):.0%}; its rank 4-5 / 6-10 / > 10 or gone: "
+                      f"{np.mean((rk >= 4) & (rk <= 5)):.0%} / {np.mean((rk >= 6) & (rk <= 10)):.0%} / {np.mean(rk > 10):.0%}) | "
+                      f"not reachable {np.mean(fate == 'not reachable'):.2f}" + (f" | replay differs on {mismatch}" if mismatch else ""))
+
+
+def acceptable(args):
+    """How wrong are the wrong answers? Every method's top-1 on both sample sets, sorted into exclusive classes in this
+    order: exact; broader (an is_a ancestor of gold); narrower (an is_a descendant, i.e. right but more specific than the
+    curators); equivalent (an automatic synonym pair, or a pair curators used for near-identical samples in >= 2 study
+    pairs: acceptable_answers.py's synonym and co-label rules; the co-labels here are not restricted to other folds, so
+    a ceiling); facet (a direct non-is_a ENVO relation: ocean / sea water, river / river water; UBERON relations are not
+    loaded); none (abstained); wrong. Also the IC credit for broader answers (IC(answer) / IC(gold), IC = -log share of
+    the slot's labels at or below the term) and "acceptable" = any of the classes but wrong and none. Methods: the
+    prototype, Jev rerank / vocabulary, the slot-tree walks, retrieve-then-choose (+ similar samples) and every open
+    top-down run in followups/results ({set}_td_*.jsonl). Two tables per set: all samples, and samples whose label no
+    other study used (unseen labels). Rules and data from claude/label-equivalence-and-acceptable-answers.md
+    (experiments/acceptable_answers/, envo.obo)."""
+    import csv
+    import glob
+    from acceptable_answers import envo_relations
+    A = path(args.acceptable_dir)
+    syn = set()
+    with open(os.path.join(A, "synonym_candidates.tsv")) as fh:
+        for r in csv.DictReader(fh, delimiter="\t"):
+            syn.add(tuple(sorted((r["term_a"], r["term_b"]))))
+    colab = {}
+    with open(os.path.join(A, "label_pairs.tsv")) as fh:
+        for r in csv.DictReader(fh, delimiter="\t"):
+            if int(r["study_pairs"]) >= 2:
+                colab.setdefault(r["slot"], set()).add(tuple(sorted((r["term_a"], r["term_b"]))))
+    relations = envo_relations(args.envo_obo)
+    J = path(args.jev)
+    F, O = f"{J}/followups", f"{J}/followups/results"
+    classes = ["exact", "broader", "narrower", "equivalent", "facet", "none", "wrong"]
+
+    def classify(ctx, slot, g, p):
+        pair = tuple(sorted((g, p or "")))
+        if p == g:
+            return "exact"
+        if p is None:
+            return "none"
+        if p in ctx.anc.get(g, ()):
+            return "broader"
+        if g in ctx.anc.get(p, ()):
+            return "narrower"
+        if pair in syn or pair in colab.get(slot, ()):
+            return "equivalent"
+        if any(o_ == t for a, t in [(g, p), (p, g)] for _, o_ in relations.get(a, ())):
+            return "facet"
+        return "wrong"
+
+    for name, pf, inp, fl, folder in sets(args):
+        # the largest term set available, so that ancestors of open picks (any ENVO / UBERON term) are known
+        big = next((f for f in (f"{F}/inputs_{name}_topdown_open.json", f"{F}/inputs_{name}_open_similar.json")
+                    if os.path.exists(f)), inp)
+        pilot, _, flat = load(pf, inp, fl)
+        ctx = jp.Ctx(json.load(open(big)), SimpleNamespace(min_studies=1))
+        runs = {"prototype": {k: o["candidates"][0]["term_id"] for k, o in pilot.items()}}
+        runs["Jev rerank"] = {k: jev_rerank_pick(pilot[k], r) for k, r in flat.items() if k in pilot and "rerank" in r}
+        runs["Jev vocabulary"] = {k: (max(r["vocab"], key=r["vocab"].get) if r.get("vocab") else None) for k, r in flat.items() if k in pilot}
+        for arm in ("topdown_lca", "topdown_root"):
+            f = os.path.join(folder, f"{arm}.jsonl")
+            if os.path.exists(f):
+                runs[arm.replace("_", " ")] = {(r["slot"], r["sample_id"]): max(r["terminals"], key=r["terminals"].get, default=None)
+                                               for r in jp.read_jsonl(f)}
+        for variant, label in (("open", "open Choice"), ("open_similar", "open + similar samples")):
+            if os.path.exists(f"{O}/{name}_{variant}.jsonl"):
+                op = {(o["slot"], o["sample_id"]): o for o in jp.read_jsonl(f"{F}/{name}_{variant}.jsonl")}
+                runs[label] = {(r["slot"], r["sample_id"]): cands(op[(r["slot"], r["sample_id"])])[int(np.argmax(r["rerank"]))]
+                               for r in jp.read_jsonl(f"{O}/{name}_{variant}.jsonl")}
+        for f in sorted(glob.glob(f"{O}/{name}_td_*.jsonl")):
+            arm = os.path.basename(f)[len(name) + 1:-len(".jsonl")]
+            runs[arm] = {(r["slot"], r["sample_id"]): max(r["terminals"], key=r["terminals"].get, default=None)
+                         for r in jp.read_jsonl(f)}
+        unseen = {k: o["gold"] not in ctx.vocab(k[0], o["study"])[0] for k, o in pilot.items()}
+        for subset in ("all samples", "unseen labels"):
+            print(f"\n== how wrong are the wrong answers ({name} samples, {subset}; shares of samples)")
+            print(f"  {'':26} {'':9} {'n':>4} " + " ".join(f"{c:>10}" for c in classes) + f" {'acceptable':>10} {'IC credit':>9}")
+            for slot in SLOTS:
+                counts = {}
+                for t, st in ctx.slots[slot].items():
+                    for a in {t} | ctx.anc.get(t, set()):
+                        counts[a] = counts.get(a, 0) + sum(st.values())
+                total = sum(sum(st.values()) for st in ctx.slots[slot].values())
+                ic = lambda t: -np.log(max(counts.get(t, 0), 0.5) / total)  # noqa: E731
+                for method, picks in runs.items():
+                    keys = [k for k in picks if k[0] == slot and k in pilot and (subset == "all samples" or unseen[k])]
+                    if not keys:
+                        continue
+                    cls, credit = [], []
+                    for k in keys:
+                        g, p = pilot[k]["gold"], picks[k]
+                        c = classify(ctx, slot, g, p)
+                        cls.append(c)
+                        credit.append(1.0 if c == "exact" else (ic(p) / ic(g) if ic(g) > 0 else 0.0) if c == "broader" else 0.0)
+                    cls = np.array(cls)
+                    share = {c: np.mean(cls == c) for c in classes}
+                    ok = 1 - share["wrong"] - share["none"]
+                    print(f"  {method:26} {slot:9} {len(keys):4d} " + " ".join(f"{share[c]:10.3f}" for c in classes)
+                          + f" {ok:10.3f} {np.mean(credit):9.3f}")
+
+
+def open_pass2(args):
+    """The second pass over the top 5 of retrieve-then-choose with similar samples (run_jev_followups.sh pass2_open):
+    does it trade labels no other study used for seen ones? First pick vs second pass, and a mix that keeps the first
+    pick when it is a term no other study used (else the second pass), overall and on unseen-label samples."""
+    J = path(args.jev)
+    F, O = f"{J}/followups", f"{J}/followups/results"
+    for name, pf, *_ in sets(args):
+        if not os.path.exists(f"{O}/{name}_open_similar_pass2_ex.jsonl"):
+            continue
+        pilot = {(o["slot"], o["sample_id"]): o for o in jp.read_jsonl(pf)}
+        ctx = jp.Ctx(json.load(open(f"{F}/inputs_{name}_open_similar.json")), SimpleNamespace(min_studies=1))
+        op = {(o["slot"], o["sample_id"]): o for o in jp.read_jsonl(f"{F}/{name}_open_similar.jsonl")}
+        r1 = {(r["slot"], r["sample_id"]): r for r in jp.read_jsonl(f"{O}/{name}_open_similar.jsonl")}
+        print(f"\n== second pass over the open top 5, {name} samples (first / second pass / mix; unseen-label samples in brackets)")
+        for v in ("ex", "noex"):
+            p2 = {(o["slot"], o["sample_id"]): o for o in jp.read_jsonl(f"{F}/{name}_open_similar_pass2_{v}.jsonl")}
+            r2 = {(r["slot"], r["sample_id"]): r for r in jp.read_jsonl(f"{O}/{name}_open_similar_pass2_{v}.jsonl")}
+            for slot in SLOTS:
+                ks = [k for k in r1 if k[0] == slot and k in r2]
+                g = np.array([pilot[k]["gold"] for k in ks])
+                st = np.array([pilot[k]["study"] for k in ks])
+                voc = [set(ctx.vocab(slot, pilot[k]["study"])[0]) for k in ks]
+                first = np.array([cands(op[k])[int(np.argmax(r1[k]["rerank"]))] for k in ks])
+                second = np.array([cands(p2[k])[int(np.argmax(r2[k]["rerank"]))] for k in ks])
+                new_ = np.array([f not in v_ for f, v_ in zip(first, voc)])
+                uns = np.array([gg not in v_ for gg, v_ in zip(g, voc)])
+                mix = np.where(new_, first, second)
+                e = {n: a == g for n, a in [("first", first), ("second", second), ("mix", mix)]}
+                print(f"  {'with' if v == 'ex' else 'without'} examples, {slot:8} " + " / ".join(f"{e[n].mean():.3f}" for n in e)
+                      + " (" + " / ".join(f"{e[n][uns].mean():.3f}" for n in e) + f"); first pick a new term {new_.mean():.2f}; "
+                      f"second - first {jp.boot_diff(e['second'], e['first'], st)}, mix - first {jp.boot_diff(e['mix'], e['first'], st)}")
+
+
 BLOCKS = {"confidence": confidence, "tokens": tokens, "vs_gpt": vs_gpt, "gate": gate, "zero_shot": zero_shot,
           "topdown": topdown, "ontology_size": ontology_size, "open_retrieval": open_retrieval,
           "open_hybrid": open_hybrid, "open_detector": open_detector,
-          "open_examples": open_examples}
+          "open_examples": open_examples,
+          "topdown_width": topdown_width, "acceptable": acceptable,
+          "open_pass2": open_pass2}
 
 
 def main(argv=None):
@@ -488,6 +705,10 @@ def main(argv=None):
     p.add_argument("--coverage", default="~/MicrobeAtlasProject/ontology_mapping/atlas_coverage/metalog_held_out_sim.tsv.gz",
                    help="open_detector: held-out similarity of each Metalog training sample (6b_coverage.py)")
     p.add_argument("--open_variant", default="open", help="open_hybrid / open_detector: open (default) or open_similar")
+    p.add_argument("--beam", type=int, default=3, help="topdown_width: the beam of the stored walks")
+    p.add_argument("--acceptable_dir", default="~/MicrobeAtlasProject/ontology_mapping/experiments/acceptable_answers",
+                   help="acceptable: acceptable_answers.py outputs (synonym_candidates.tsv, label_pairs.tsv)")
+    p.add_argument("--envo_obo", default="~/MicrobeAtlasProject/ontologies/envo.obo")
     p.add_argument("--n_requests", type=int, default=300, help="tokens: flat requests sampled from the cache")
     args = p.parse_args(argv)
     for name, fn in BLOCKS.items():

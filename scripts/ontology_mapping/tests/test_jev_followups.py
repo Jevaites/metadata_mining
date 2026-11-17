@@ -119,3 +119,19 @@ def test_similar_samples_leave_the_study_out_and_cap_per_study():
     out = jf.similar_samples(T, X / np.linalg.norm(X, axis=1, keepdims=True), "feature", {"sample_id": "q", "study": "own"}, info, a)
     assert [x["text"] for x in out] == ["b", "c", "e"]  # "a" is the sample's own study; s1 capped at 2
     assert [x["term"] for x in out] == ["t1", "t2", "t3"]
+
+
+def test_pass2_takes_the_open_top_k_and_keeps_the_similar_samples(tmp_path):
+    from types import SimpleNamespace
+    o = {"slot": "feature", "sample_id": "s1", "study": "A", "gold": "T3", "text": "title: x",
+         "candidates": [{"term_id": t} for t in ("T1", "T2", "T3", "T4")], "similar": [{"text": "a", "term": "t1"}]}
+    jf.write_jsonl([o], str(tmp_path / "open.jsonl"))
+    jf.write_jsonl([{"slot": "feature", "sample_id": "s1", "rerank": [0.1, 0.2, 0.6, 0.1], "fits": []}], str(tmp_path / "resp.jsonl"))
+    (tmp_path / "inputs.json").write_text(json.dumps({"terms": {t: {"label": t.lower(), "definition": "d"} for t in ("T1", "T2", "T3", "T4")}}))
+    a = SimpleNamespace(open_pilot=str(tmp_path / "open.jsonl"), responses=str(tmp_path / "resp.jsonl"),
+                        inputs=str(tmp_path / "inputs.json"), k=2, examples=0, example_chars=300, seed=0,
+                        output=str(tmp_path / "out.jsonl"))
+    jf.pass2(a)
+    rec = jp.read_jsonl(str(tmp_path / "out.jsonl"))[0]
+    assert [c["term_id"] for c in rec["candidates"]] == ["T3", "T2"] and rec["gold_in_topk"]
+    assert rec["base_probs"] == [0.6, 0.2] and rec["similar"] == o["similar"] and all(c["example"] == "" for c in rec["candidates"])

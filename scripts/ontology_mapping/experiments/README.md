@@ -421,8 +421,150 @@ their terms added to the options (`jev_followups.py open --similar 5`); analysis
   no longer loses (−1.5 to +0.2). When it and the reranker agree, the pick is right 42–84 % of the time, against
   15–43 % when they differ.
 
+Top-down width and how wrong the answers are (`jev_analyses.py topdown_width`, `acceptable`; no API calls). The lca
+start is the common ancestor of the prototype's top 3 candidate terms. Gold reachable from it: gated 0.84 / 0.63 /
+0.63, random 0.94 / 0.83 / 0.89; from the root 0.92 / 0.66 / 0.66 and 0.98 / 0.84 / 0.89 (feature / material are
+capped by labels no other study used), so a wider start only helps biome. Where gold is lost (random, lca; replayed
+from the stored answers): not reachable 6 / 17 / 11 %, pruned from the beam 21 / 28 / 13 % (69–87 % of those at
+rank 4–5, so a beam of 5 would have kept them at that step), finished but not ranked first 30 / 26 / 13 %, exact
+43 / 29 / 63 %. Wrong answers sorted with acceptable_answers.py's rules (random; exact / broader / narrower /
+equivalent / facet / wrong):
+
+| | biome | feature | material |
+|---|---|---|---|
+| prototype | 0.64 / 0.11 / 0.12 / 0.01 / 0 / **0.11** | 0.63 / 0.01 / 0.01 / 0.05 / 0.03 / **0.27** | 0.70 / 0.04 / 0.03 / 0.02 / 0.01 / **0.20** |
+| top-down lca | 0.43 / 0.02 / 0.24 / 0 / 0 / **0.31** | 0.29 / 0.00 / 0.02 / 0.03 / 0.01 / **0.65** | 0.63 / 0.01 / 0.11 / 0.03 / 0.01 / **0.21** |
+| open + similar samples | 0.68 / 0.06 / 0.12 / 0.01 / 0 / **0.13** | 0.57 / 0.00 / 0.02 / 0.02 / 0.04 / **0.35** | 0.71 / 0.02 / 0.05 / 0.03 / 0.02 / **0.17** |
+
+Top-down's errors lean to "narrower" (it walks to a leaf: biome 24 %, material 11 %, rarely broader), so its
+acceptable share is 0.69 / 0.35 / 0.79 vs the prototype's 0.89 / 0.73 / 0.80; feature errors stay mostly plain wrong.
+"Narrower" assumes the extra detail is right; the co-labels are not fold-restricted (a ceiling).
+
+Second pass over the top 5 of retrieve-then-choose with similar samples (`run_jev_followups.sh pass2_open`, $0.66;
+`jev_followups.py pass2`; analysis `jev_analyses.py open_pass2`). The similar samples stay in the state; each option
+with its definition and, for "examples", the most similar labelled sample of another study carrying it (none for a
+term no study used), or none at all. Exact top-1, first pick → second pass with / without examples:
+
+| | gated, all | gated, unseen labels | random, all | random, unseen labels |
+|---|---|---|---|---|
+| biome | 0.406 → 0.438 / 0.438 | 0.184 → 0.158 / 0.158 | 0.676 → 0.658 / 0.662 | 0.333 → 0.167 / 0.167 |
+| feature | 0.248 → 0.262 / 0.236 | 0.179 → 0.131 / 0.113 | 0.570 → **0.632** / 0.596 | 0.177 → **0.101** / **0.101** |
+| material | 0.332 → 0.312 / 0.318 | 0.282 → **0.188** / **0.194** | 0.706 → 0.698 / 0.716 | 0.283 → **0.189** / 0.226 |
+
+The second pass trades labels no study used for seen ones: −5 to −9 points on unseen labels (significant for gated
+material and random feature / material), −1 to +9 on seen labels (random feature with examples +8.8, significant).
+Net: gated biome +3.2 (0.438, the best gated biome so far; +10.4 over the prototype), random feature +6.2 (= the
+prototype's 0.634), the rest ±2. Without examples the loss on unseen labels is the same, so it is not the missing
+examples; with fewer options Jev follows the similar samples' terms more. Keeping the first pick whenever it is a term
+no study used and the second pass otherwise loses the gains too (−1.6 to +2.0): the gains are exactly the samples
+whose first pick was a new term. On the prototype's 30 % least-confident random samples: ±1.4. The Nouls alone (fits)
+are worse everywhere. Not worth adding for unseen labels.
+
+Top-down over open vocabularies (`jev_open_topdown.py`, `run_jev_followups.sh topdown_open`, $6.7 for both sets;
+results below). The slot trees above only hold labels other studies used, so they never reach an
+unseen label. Trees: biome = the ENVO biome branch only (128 terms; holds gold for 0.92 gated / 0.72 random, all
+unseen gold); feature / material = the whole open ontology (every ENVO + UBERON term under the 11 meaningful roots,
+17,870 terms), or a restricted but open "climb-M" vocabulary (from each label the slot uses in other studies, climb
+to the broadest ancestors with <= M terms below them; the walk starts with a Choice among those nodes). Starts: root,
+the common ancestor of the prototype's top 3, or of retrieve-then-choose-with-similar-samples' top 5. Nodes with more
+than 255 children (organ part 347, regional part of brain 305; organ part holds the gold of ~5 % of gated feature /
+material samples) are split: two Choices of ~174 children each in the level's request, then a final Choice among each
+half's top 3 and "X itself" (one more request; `--wide trim` keeps the 255 children closest to the sample by
+retrieval instead). A level's questions are split into requests of <= 60k tokens.
+Heuristics checked first (gold inside the vocabulary, LOSO; gated / random, unseen labels):
+
+| vocabulary | feature: start nodes, terms, unseen gold inside | material: start nodes, terms, unseen gold inside |
+|---|---|---|
+| whole open ontology | 11, 17.9k, 0.93 / 0.96 | 11, 17.9k, 0.99 / 1.00 |
+| depth-2 cover of the slot labels | 87, 16.4k, 0.75 | 64, —, 0.91 |
+| climb-300 | 56, 6.1k, 0.84 / 0.82 | 58, 6.1k, 0.72 / 0.64 |
+| climb-1000 | 28, 9.3k, 0.89 / 0.91 | 34, 11.8k, 0.86 / 0.74 |
+| climb from the sample's top 5 (+ prototype's top 5), M = 1000 | 4, 1.8k, 0.76 / 0.80 | 3–4, 1.5–2.1k, 0.85 / 0.79 |
+
+A fixed depth restricts little (ENVO is flat and multi-parent: 282 terms sit directly under a root). In the open
+ontology the common ancestor of 3–5 candidates is usually the root for feature (they span several roots), so the lca
+starts mostly equal the root start; for biome (branch) it restricts to ~55 terms and keeps unseen gold 0.87 (prototype
+top 3) / 1.00 (open top 5). Tests: `tests/test_jev_open_topdown.py` (10).
+
+Results (exact top-1; `results/score_topdown_open_{gated,random}.json`). Unseen labels (gated n 38 / 168 / 170,
+random 12 / 79 / 53):
+
+| | gated biome / feature / material | random biome / feature / material |
+|---|---|---|
+| open Choice (retrieve-then-choose) | 0.18 / **0.20** / 0.24 | 0.33 / 0.17 / **0.36** |
+| open + similar samples | 0.18 / 0.18 / **0.28** | 0.33 / **0.18** / 0.28 |
+| top-down, root | 0.26 / 0.04 / 0.17 | **0.50** / 0.04 / 0.21 |
+| top-down, lca of open+similar top 5 | **0.29** / 0.04 / 0.18 | **0.50** / 0.04 / 0.21 |
+| top-down, lca of prototype top 3 | 0.16 / 0.06 / 0.20 | 0.25 / 0.06 / 0.21 |
+| top-down, climb-1000 | — / 0.07 / 0.14 | — / 0.10 / 0.25 |
+| top-down, climb-300 | — / 0.04 / 0.19 | — / 0.01 / 0.23 |
+
+All samples: biome 0.23–0.26 (gated and random) vs open + similar 0.41 / 0.68; feature 0.12–0.22 / 0.19–0.42 vs
+0.25 / 0.57; material 0.20–0.23 / 0.57–0.59 vs 0.33 / 0.71. Top-down over open vocabularies is only the best method
+for unseen biome labels (+8 to +17 points over the open Choices, CIs include 0 at these n; +26 to +50 over the
+prototype, significant). For feature it is 6–17 points under the open Choices on unseen labels (significant for the
+whole ontology), for material 4–15 under. Why:
+- the biome branch misses gold for 8 % (gated) / 28 % (random) of samples (Metalog biome labels outside it), and the
+  walk ends too specific (narrower than gold 29–32 % of biome samples, 13–19 % of material);
+- the abstract upper levels: gold of unseen feature labels is under a node asked at level 2 / 3 / 4 for 70 / 41 /
+  18–21 % of samples (seen material 98 / 86 / 70 %); e.g. lakes, bays and rivers sit under "astronomical body part",
+  where Jev rarely goes;
+- gold finished on the beam but not picked: 3–29 %.
+The lca starts change little for feature / material (the root for 77–88 % of samples with the open top 5); the
+prototype's top 3 lowers reach. Climb-M vocabularies help seen labels (random feature climb-300 0.50 vs 0.21 for the
+whole ontology) and cost unseen ones. Using top-down's pick only when it is a label no other study used, else open +
+similar, loses on all samples (biome gated 0.34 vs 0.41). Split nodes (organ part) were reached by 1–2 % of samples.
+
+Curated top layer (`run_jev_followups.sh topdown_curated`, $1.9 for both sets; results after the table below). A best-effort prototype
+for experts to correct: `experiments/curated_top_layer.tsv` (one row per anchor term: slot, group, category, their
+descriptions, anchor id and label). Feature: 7 groups / 31 categories (host body site, plant-associated, aquatic,
+terrestrial, built and engineered, atmosphere, "material named as the local environment"); material: 6 groups /
+21 categories (host-derived, soil / sediment / rock, water and liquids, biological and organic, air and human-made,
+"habitat used as the material"). The walk: groups → categories (virtual nodes, described by their description and
+their children) → anchor terms → the ontology below them. `--links isa` follows is_a only; `--links both` also
+part_of (ENVO BFO:0000050, UBERON part_of from uberon-basic.obo; `jev_open_topdown.py add_links` writes them into the
+inputs file): UBERON's body-site paths (digestive system > colon > colonic mucosa) exist only through part_of. Also
+run: the whole ontology with `--links both`. Built with all Metalog labels in view, so the coverage below is optimistic
+for unseen labels (unseen pilot golds inside the tree, gated / random):
+
+| tree | feature: terms, unseen golds inside | material: terms, unseen golds inside | options on the way to unseen gold (median) |
+|---|---|---|---|
+| whole open ontology (is_a) | 17.9k, 0.93 / 0.96 | 17.9k, 0.99 / 1.00 | 90 / 95 |
+| curated, is_a | 4.1k, 0.87 / 0.85 | 4.5k, 0.71 / 0.66 | 23 / 22 |
+| curated, is_a + part_of | 15.3k, 0.96 / 0.97 | 15.0k, 1.00 / 1.00 | 26 / 37 |
+
+Results (exact top-1, root start; `results/score_topdown_open_{gated,random}.json`):
+
+| | gated feature / material, unseen | random feature / material, unseen | gated feature / material, all | random feature / material, all |
+|---|---|---|---|---|
+| prototype | 0 / 0 | 0 / 0 | 0.22 / **0.36** | **0.63** / 0.70 |
+| open Choice | **0.20** / 0.24 | 0.17 / **0.36** | 0.22 / 0.29 | 0.14 / 0.55 |
+| open + similar samples | 0.18 / 0.28 | **0.18** / 0.28 | **0.25** / 0.33 | 0.57 / **0.71** |
+| top-down, whole ontology, is_a | 0.04 / 0.17 | 0.04 / 0.21 | 0.13 / 0.20 | 0.19 / 0.57 |
+| top-down, whole ontology, is_a + part_of | 0.02 / 0.16 | 0.00 / 0.19 | 0.11 / 0.18 | 0.12 / 0.58 |
+| top-down, curated, is_a | 0.10 / 0.31 | 0.10 / 0.26 | **0.25** / 0.31 | 0.62 / 0.62 |
+| top-down, curated, is_a + part_of | 0.09 / **0.32** | 0.09 / 0.28 | 0.21 / 0.31 | 0.61 / 0.62 |
+
+- The curated top layer fixes the first steps: gold stays under the chosen group for 95–99 % of samples (whole
+  ontology: 70 % at level 2 for unseen feature labels). Top-down goes from far behind to on par with retrieve-then-
+  choose + similar samples on all samples for feature (random 0.62 vs 0.57, seen labels 0.72 vs 0.64, +7.4
+  significant; gated 0.25 vs 0.25), a little under for material (0.31 vs 0.33, 0.62 vs 0.71).
+- Unseen labels: material is the best so far on gated (0.31–0.32 vs 0.28 / 0.24; CIs include 0) and between the two
+  open Choices on random (0.26–0.28 vs 0.28 / 0.36); feature doubles (0.04 → 0.09–0.10) but stays under the open
+  Choices (0.17–0.20).
+- part_of: more gold inside the tree (unseen material 0.66–0.71 → 1.00) but no more exact answers, and slightly worse
+  on the whole ontology and on gated feature: more paths are more competing options.
+- Where it now loses: at the category and below (gold still under an asked node at levels 3 / 4: unseen 0.71–0.91 /
+  0.52–0.77); errors are often near misses (building → room, oropharynx → respiratory tract, brackish water
+  environment → coast) or the "material named as the local environment" group pulling places towards materials
+  (marsh → shallow marine sediment). Too specific: material 13–20 %.
+
+MIxS / ENVO guidance used for the slots: env_local_scale = ENVO terms of smaller grain than the biome, or for host
+samples anatomical terms (UBERON, PO); env_medium = ENVO environmental material, or for host samples anatomical terms
+naming a substance (MIxS host_body_site ↔ feature, host_body_product ↔ material: e.g. colon / feces).
+
 `jev_pilot.py run --questions` asks only some of the flat request's questions (e.g. rerank and fits, without the
-whole-vocabulary Choice). Tests: `tests/test_jev_followups.py` (8).
+whole-vocabulary Choice). Tests: `tests/test_jev_followups.py` (9).
 
 ## 8. Gold-set check (`gold_check.py`; 1,021 hand-labelled samples outside Metalog, coarse labels)
 

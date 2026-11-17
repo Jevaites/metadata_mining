@@ -6,6 +6,13 @@
 #                                                    # gpt-5.1, ~$4.5), then the scores
 #   bash experiments/run_jev_followups.sh open_similar  # retrieve-then-choose with 5 similar labelled samples of
 #                                                    # other studies in the request (both sets, Jev, ~$1.4), then the scores
+#   bash experiments/run_jev_followups.sh pass2_open # a second pass over the top 5 of retrieve-then-choose with
+#                                                    # similar samples, with / without an example per option (~$0.55)
+#   bash experiments/run_jev_followups.sh topdown_open  # top-down over open vocabularies (jev_open_topdown.py): biome
+#                                                    # branch / whole ENVO+UBERON / climb-M covers, 3 starts (~$4)
+#   bash experiments/run_jev_followups.sh topdown_curated  # top-down from a curated top layer
+#                                                    # (experiments/curated_top_layer.tsv), is_a vs is_a + part_of links,
+#                                                    # and the whole ontology with is_a + part_of (feature, material; ~$2)
 # The inputs in $J/followups/ were built with `jev_followups.py candidates / open` (commands in README 7d).
 # Resumable: Jev answers are cached in $J/jev_cache.jsonl and rerank_pilot.py run skips answered samples, so a rerun
 # after an interruption only sends what is missing. Jev key: ~/MicrobeAtlasProject/jev_api_key; OpenAI key:
@@ -13,6 +20,7 @@
 set -euo pipefail
 X=~/MicrobeAtlasProject/ontology_mapping/experiments; R=$X/rerank; J=$X/jev; F=$J/followups; O=$F/results
 mkdir -p $O
+LM=~/MicrobeAtlasProject/metalog/clean/previous_2026-10-01/biome_label_map.tsv
 jev() { python3 experiments/jev_pilot.py run --arm flat --cache $J/jev_cache.jsonl "$@"; }
 
 if [ "${1:-all}" = "gpt_pass2" ]; then
@@ -28,6 +36,48 @@ if [ "${1:-all}" = "open_similar" ]; then
     jev --pilot $F/${SET}_open_similar.jsonl --inputs $F/inputs_${SET}_open_similar.json --questions rerank \
       --output $O/${SET}_open_similar.jsonl
   done
+fi
+
+if [ "${1:-all}" = "pass2_open" ]; then
+  # 4f. second pass over the open Choice's top 5 (inputs: jev_followups.py pass2, README 7d); the similar samples stay in
+  # the state; ex = each option with an example sample of another study (none for a term no study used), noex = none
+  for SET in gated random; do for V in ex noex; do
+    jev --pilot $F/${SET}_open_similar_pass2_$V.jsonl --inputs $F/inputs_${SET}_open_similar.json --questions rerank fits \
+      --output $O/${SET}_open_similar_pass2_$V.jsonl
+  done; done
+fi
+
+if [ "${1:-all}" = "topdown_open" ]; then
+  # 5. top-down over open vocabularies (README 7d): build (no API; the training set and term vectors), then the walks
+  for SET in gated random; do
+    P=$R/pilot_k5anc.jsonl; [ $SET = random ] && P=$J/pilot_all_k5anc.jsonl
+    [ -f $F/${SET}_topdown_open.jsonl ] || python3 experiments/jev_open_topdown.py build --pilot $P \
+      --inputs $F/inputs_${SET}_open_similar.json --open_pilot $F/${SET}_open_similar.jsonl \
+      --open_responses $O/${SET}_open_similar.jsonl --label_map $LM \
+      --output $F/${SET}_topdown_open.jsonl --inputs_out $F/inputs_${SET}_topdown_open.json
+    for A in "auto root" "auto lca_proto3" "auto lca_open5" "climb300 root" "climb1000 root"; do
+      set -- $A
+      python3 experiments/jev_open_topdown.py run --pilot $F/${SET}_topdown_open.jsonl \
+        --inputs $F/inputs_${SET}_topdown_open.json --tree $1 --start $2 --cache $J/jev_cache.jsonl \
+        --output $O/${SET}_td_$1_$2.jsonl
+    done
+  done
+  set -- topdown_open
+fi
+
+if [ "${1:-all}" = "topdown_curated" ]; then
+  # 5b. curated top layer + ontology trees below its anchors; part_of links from ENVO and UBERON (uberon-basic.obo)
+  for SET in gated random; do
+    python3 experiments/jev_open_topdown.py add_links --inputs $F/inputs_${SET}_topdown_open.json
+    for A in "curated isa" "curated both" "auto both"; do
+      set -- $A
+      N=$1; [ $2 = both ] && N=${1}_both
+      python3 experiments/jev_open_topdown.py run --pilot $F/${SET}_topdown_open.jsonl \
+        --inputs $F/inputs_${SET}_topdown_open.json --tree $1 --links $2 --start root --slots feature material \
+        --cache $J/jev_cache.jsonl --output $O/${SET}_td_${N}_root.jsonl
+    done
+  done
+  set -- topdown_curated
 fi
 
 if [ "${1:-all}" = "all" ]; then
@@ -119,4 +169,35 @@ if [ -f $O/gated_open_similar.jsonl ]; then
   python3 experiments/jev_analyses.py open_hybrid --open_variant open_similar
   python3 experiments/jev_analyses.py open_detector --open_variant open_similar
   python3 experiments/jev_analyses.py open_examples
+fi
+if [ -f $O/gated_open_similar_pass2_ex.jsonl ]; then
+  for SET in gated random; do
+    P=$R/pilot_k5anc.jsonl; FL=$J/flat.jsonl; G=""
+    [ $SET = random ] && { P=$J/pilot_all_k5anc.jsonl; FL=$J/all/flat.jsonl; G="--gate 0.3"; }
+    echo; echo "######## 4f. Second pass over the top 5 of retrieve-then-choose with similar samples ($SET samples)"
+    cmp --inputs $F/inputs_${SET}_open_similar.json $G --output $O/compare_open_pass2_$SET.json --runs \
+      open_similar=$F/${SET}_open_similar.jsonl,$O/${SET}_open_similar.jsonl,rerank \
+      pass2_examples=$F/${SET}_open_similar_pass2_ex.jsonl,$O/${SET}_open_similar_pass2_ex.jsonl,rerank \
+      pass2_examples_fits=$F/${SET}_open_similar_pass2_ex.jsonl,$O/${SET}_open_similar_pass2_ex.jsonl,fits \
+      pass2_no_examples=$F/${SET}_open_similar_pass2_noex.jsonl,$O/${SET}_open_similar_pass2_noex.jsonl,rerank \
+      prototype=$P,-,prototype \
+      jev_rerank=$P,$FL,rerank
+    echo; echo "######## 4g. The same, split by labels seen / unseen in other studies ($SET samples)"
+    python3 experiments/jev_followups.py score_open --pilot $P --open_pilot $F/${SET}_open_similar.jsonl \
+      --inputs_open $F/inputs_${SET}_open_similar.json --responses $O/${SET}_open_similar.jsonl --open_name open_similar \
+      --output $O/score_open_pass2_$SET.json --also \
+      pass2_examples=$F/${SET}_open_similar_pass2_ex.jsonl,$O/${SET}_open_similar_pass2_ex.jsonl \
+      pass2_no_examples=$F/${SET}_open_similar_pass2_noex.jsonl,$O/${SET}_open_similar_pass2_noex.jsonl
+  done
+  echo; echo "######## 4h. Does the second pass trade new labels for seen ones?"
+  python3 experiments/jev_analyses.py open_pass2
+fi
+if [ -f $O/gated_td_auto_root.jsonl ]; then
+  for SET in gated random; do
+    P=$R/pilot_k5anc.jsonl; [ $SET = random ] && P=$J/pilot_all_k5anc.jsonl
+    echo; echo "######## 5. Top-down over open vocabularies vs retrieve-then-choose ($SET samples; unseen = gold no other study uses)"
+    python3 experiments/jev_open_topdown.py score --pilot $P --inputs $F/inputs_${SET}_topdown_open.json \
+      --responses $O/${SET}_td_*.jsonl --output $O/score_topdown_open_$SET.json --open \
+      open=$F/${SET}_open.jsonl,$O/${SET}_open.jsonl open_similar=$F/${SET}_open_similar.jsonl,$O/${SET}_open_similar.jsonl
+  done
 fi

@@ -230,13 +230,14 @@ def score_open(args):
         pf, rf = rest.split(",")
         also.append((name, {(o["slot"], o["sample_id"]): o for o in jp.read_jsonl(pf)},
                      {(r["slot"], r["sample_id"]): r for r in jp.read_jsonl(rf)}))
+    base = args.open_name
     report = {}
     for slot in SLOTS:
         keys = [k for k in resp if k[0] == slot and k in opened and (not vocab or k in vocab)
                 and all(k in a_resp for _, _, a_resp in also)]
         if not keys:
             continue
-        picks = {"prototype": [], "open Choice": []}
+        picks = {"prototype": [], base: []}
         if vocab:
             picks["Jev, Metalog vocabulary"] = []
         for name, _, _ in also:
@@ -246,7 +247,7 @@ def score_open(args):
             o, op = pilot[k], opened[k]
             ids = [c["term_id"] for c in op["candidates"]]
             picks["prototype"].append(o["candidates"][0]["term_id"])
-            picks["open Choice"].append(ids[int(np.argmax(resp[k]["rerank"]))])
+            picks[base].append(ids[int(np.argmax(resp[k]["rerank"]))])
             if vocab:
                 P = vocab[k]["vocab"]
                 picks["Jev, Metalog vocabulary"].append(max(P, key=P.get) if P else None)
@@ -268,10 +269,10 @@ def score_open(args):
                 row[name]["exact or coarser"] = round(row[name]["exact"] + row[name]["coarser"], 3)
             ex = {name: np.array([p == g for p, g in zip(pk, gold)]) for name, pk in picks.items()}
             for name in picks:
-                if name != "open Choice":
-                    row[f"open Choice - {name}, exact (95% CI)"] = jp.boot_diff(ex["open Choice"][m], ex[name][m], np.array(studies)[m])
+                if name != base:
+                    row[f"{base} - {name}, exact (95% CI)"] = jp.boot_diff(ex[base][m], ex[name][m], np.array(studies)[m])
             for name, _, _ in also:
-                for ref in ("open Choice", "prototype"):
+                for ref in (base, "prototype"):
                     row[f"{name} - {ref}, exact (95% CI)"] = jp.boot_diff(ex[name][m], ex[ref][m], np.array(studies)[m])
             res[subset] = row
         report[slot] = res
@@ -360,6 +361,50 @@ def compare(args):
         json.dump(report, open(path(args.output), "w"), indent=1)
 
 
+# ----------------------------------------------------------------------------- pass2
+def pass2(args):
+    """A second pass over the open Choice's top k (retrieve-then-choose, usually the run with similar samples): the k
+    terms it ranked highest become rerank candidates, each with its definition and, with --examples, the most similar
+    labelled sample of another study carrying it (none for a term no study used). The record keeps the open pilot's
+    similar samples, so they stay in the state. base_probs = the open Choice's probabilities of the k terms."""
+    from sklearn.preprocessing import normalize
+    opened = {(o["slot"], o["sample_id"]): o for o in jp.read_jsonl(args.open_pilot)}
+    resp = {(r["slot"], r["sample_id"]): r for r in jp.read_jsonl(args.responses)}
+    terms = json.load(open(path(args.inputs)))["terms"]
+    T = jb.load_training(args) if args.examples else None
+    Xn = normalize(T.X) if T is not None else None
+    out, stats = [], {}
+    for k, o in opened.items():
+        if k not in resp:
+            continue
+        slot, sid = k
+        ids = cands_of(o)
+        probs = np.array(resp[k]["rerank"], float)
+        top = [ids[i] for i in np.argsort(-probs, kind="stable")[:args.k]]
+        if T is not None:
+            y = T.S[slot].to_numpy()
+            x = normalize(T.vec([sid]))[0]
+
+            def example(t):
+                idx = np.where((y == t) & (T.studies != o["study"]))[0]
+                return T.S["text"].iloc[int(idx[np.argmax(Xn[idx] @ x)])][:args.example_chars] if len(idx) else ""
+        else:
+            example = lambda t: ""  # noqa: E731
+        cs = [term_entry(t, terms, example(t)) for t in top]
+        p = [float(probs[ids.index(t)]) for t in top]
+        rng = np.random.default_rng(jp.stable_seed(args.seed, slot, sid, "pass2", args.k))
+        rec = dict(o, candidates=cs, option_order=rng.permutation(len(cs)).tolist(), gold_in_topk=o["gold"] in top,
+                   base_probs=p, base_maxp=max(p), topk_mass=float(sum(p)), base_top1=top[0],
+                   built={"pass2_of": os.path.basename(args.open_pilot), "k": args.k, "examples": bool(args.examples)})
+        out.append(rec)
+        stats.setdefault(slot, []).append((rec["gold_in_topk"], sum(bool(c["example"]) for c in cs)))
+    write_jsonl(out, args.output)
+    print(f"wrote {len(out)} samples to {args.output} (top {args.k} of {args.open_pilot}, examples {bool(args.examples)})")
+    for slot, v in stats.items():
+        print(f"  {slot:8} gold among the {args.k}: {np.mean([a for a, _ in v]):.3f}; options with an example sample "
+              f"{np.mean([b for _, b in v]):.1f} of {args.k}")
+
+
 def main(argv=None):
     from _setup import DEFAULTS
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -397,16 +442,27 @@ def main(argv=None):
     s.add_argument("--inputs_open", required=True)
     s.add_argument("--responses", required=True, help="jev_pilot.py run --arm flat --questions rerank on the open pilot")
     s.add_argument("--flat", default=None, help="the original flat run (Jev's Metalog-vocabulary Choice)")
+    s.add_argument("--open_name", default="open Choice", help="name of the --open_pilot run in the report")
     s.add_argument("--also", nargs="*", default=None,
                    help="other open-Choice variants on the same samples, name=open_pilot,responses (e.g. with similar samples)")
     s.add_argument("--output", default=None)
+    q = sub.add_parser("pass2")
+    training(q)
+    q.add_argument("--open_pilot", required=True, help="a jev_followups.py open output (e.g. with --similar 5)")
+    q.add_argument("--responses", required=True, help="jev_pilot.py run --questions rerank on it")
+    q.add_argument("--inputs", required=True, help="its --inputs_out")
+    q.add_argument("--k", type=int, default=5)
+    q.add_argument("--examples", type=int, default=1, help="1: an example sample per option (as the reranker); 0: none")
+    q.add_argument("--example_chars", type=int, default=300)
+    q.add_argument("--output", required=True)
     m = sub.add_parser("compare")
     m.add_argument("--runs", nargs="+", required=True, help="name=pilot,responses,decision (the first is the reference)")
     m.add_argument("--inputs", default=None, help="needed for the fits decision (ancestors)")
     m.add_argument("--gate", type=float, default=0.0, help="also score each run gated on the reference pilot's confidence")
     m.add_argument("--output", default=None)
     args = p.parse_args(argv)
-    {"candidates": candidates, "open": open_vocabulary, "score_open": score_open, "compare": compare}[args.step](args)
+    {"candidates": candidates, "open": open_vocabulary, "score_open": score_open, "compare": compare,
+     "pass2": pass2}[args.step](args)
 
 
 if __name__ == "__main__":
