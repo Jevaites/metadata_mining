@@ -183,6 +183,24 @@ MUTATIONS = [
         'groups = samples["sample_id"].map(project).fillna(samples["study_code"])',
         'groups = samples["study_code"]',
         lambda c: integration.test_fold_groups_keep_a_project_on_one_side(c.tmp())),
+    # ------------------------------------------------------------------------------------- several answers
+    Mutation(
+        "set_label_counts_of_one_fold",
+        "calibration.json's label counts (the IC of 6_predict_atlas.py's set answers) must cover every training label, "
+        "not only the first fold's",
+        'Counter(g for f in folds for g in f["gold"])', 'Counter(g for f in folds[:1] for g in f["gold"])',
+        lambda c: integration.test_basic_set_answers_are_the_single_right_term(basic_run(c))),
+    Mutation(
+        "set_columns_from_the_back_off",
+        "the set answer must come from hierarchy.oof_sets, not repeat the back-off answer",
+        'extra[(r, slot, method)].update({c: v[i] for c, v in columns.items()})',
+        'extra[(r, slot, method)].update({c: v[i] for c, v in columns.items()}, answer=extra[(r, slot, method)]["backoff"])',
+        lambda c: unit.test_backoff_all_set_answers()),
+    Mutation(
+        "set_answers_ignore_set_max_terms",
+        "--set_max_terms must reach the decoder (1 = never a set)",
+        "args.set_max_terms, args.set_candidates", "3, args.set_candidates",
+        lambda c: unit.test_backoff_all_set_answers_max_terms_1()),
 ]
 
 

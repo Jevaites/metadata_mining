@@ -50,17 +50,20 @@ def run(tmp_path_factory):
     sv.main(["--ontology_terms", paths["ontology_terms.tsv"], "--keywords", paths["features.npz"],
              "--sub_biomes", paths["features.npz"], "--term_vectors", paths["term_vectors.h5"],
              "--samples", paths["training_set.tsv"], "--folds", "2", "--envo_obo", str(tmp / "envo.obo"),
-             "--bootstrap", "20", "--output_dir", str(out)])
+             "--bootstrap", "20", "--answers", "ontology", "--output_dir", str(out)])
     terms = load_terms(paths["ontology_terms.tsv"])
     return {"out": out, "anc": term_ancestors(terms), "terms": set(terms["term_id"]),
             "summary": pd.read_csv(out / "summary.tsv", sep="\t"),
             "rules": pd.read_csv(out / "rule_scores.tsv", sep="\t"),
             "decisions": pd.read_csv(out / "decisions.tsv.gz", sep="\t", dtype=str, keep_default_na=False),
+            "flags": pd.read_csv(out / "flags.tsv.gz", sep="\t", dtype=str, keep_default_na=False),
+            "flags_summary": pd.read_csv(out / "flags_summary.tsv", sep="\t"),
             "settings": json.loads((out / "settings.json").read_text())}
 
 
 METHODS = ["top1", "backoff", "conformal_m1", "ev_m1", "conformal_m2", "ev_m2", "conformal_m3", "ev_m3",
-           "backoff+set", "backoff+set@0.8", "ev1+ev2set"]
+           "evr_d0.7", "evr_d0.8", "evr_d0.9", "evr_d1", "backoff+set", "backoff+set@0.8", "ev1+ev2set",
+           "backoff@onto", "backoff+set@onto"]
 
 
 def test_every_method_and_slot_is_reported(run):
@@ -156,3 +159,31 @@ def test_no_rules_mode_needs_no_obo(tmp_path):
     # max_terms 1: no set methods, no fallbacks, no sets
     assert sorted(s["method"].unique()) == sorted(["top1", "backoff", "conformal_m1", "ev_m1"])
     assert (s["sets"] == 0).all()
+
+
+def test_masses_follow_the_answer(run):
+    d = run["decisions"]
+    for answer, masses, set_mass in zip(d["answer"], d["masses"], d["set_mass"]):
+        terms = [t for t in answer.split("||") if t]
+        m = [float(v) for v in masses.split("||") if v]
+        assert len(m) == len(terms)
+        if not terms:
+            assert float(set_mass) == 0.0
+            continue
+        assert m == sorted(m, reverse=True)  # primary answer first
+        assert max(m) - 2e-4 <= float(set_mass) <= min(1.0, sum(m)) + 3e-4  # 4-decimal rounding
+
+
+def test_flags(run):
+    f, d = run["flags"], run["decisions"]
+    assert set(f["slot"]) == {"biome", "feature", "material"}
+    for slot, g in f.groupby("slot"):
+        b = d[(d["slot"] == slot) & (d["method"] == "backoff")].set_index("sample_id")["answer"]
+        assert (g.set_index("sample_id")["backoff"] == b.reindex(g["sample_id"]).to_numpy()).all()
+        flagged = g["ambiguous_branches"] == "True"
+        assert (g.loc[flagged, "runner_up_p"].astype(float) >= 0.2).all()
+        assert (g.loc[~flagged, "runner_up_p"].astype(float) < 0.2).all()
+        assert (g["runner_up"] != g["top1"]).all()
+    s = run["flags_summary"]
+    assert sorted(s["slot"]) == ["biome", "feature", "material"]
+    assert ((s["flagged"] >= 0) & (s["flagged"] <= 1)).all()

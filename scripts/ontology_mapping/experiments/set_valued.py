@@ -19,6 +19,11 @@ small set of terms instead, and better single-node decoding, on the same out-of-
   backoff+set     back-off; where it abstains, a conformal_m2 set (its own tau, chosen on the other folds'
                   abstentions); backoff+set@0.8 the same with an 80 % target for the sets
   ev1+ev2set      ev_m1; where it abstains, an ev_m2 set (its own lambda)
+  evr_d<d>        expected value with the reviewer score: a set of <= --max_terms nodes is worth the credit of its
+                  best term covering gold, min(1, IC(term) / IC(gold)), times d for each term beyond the first
+                  (--discounts); d = 1 does not penalise sets, d -> 0 approaches ev_m1
+  backoff@onto,   with --answers ontology: back-off and back-off + set where ENVO / UBERON terms that no curator used
+  backoff+set@onto  can also be answers (hierarchy.Closure(answers="ontology")); the other methods keep the labels
 
 Every threshold (tau, lambda) is chosen on the other folds as the one answering most samples at >= --target accuracy
 among answered (accuracy = one term of the set is the gold label or an ancestor of it), then applied to the held-out
@@ -41,19 +46,27 @@ Scores, all over every sample with a gold label (abstain = 0):
   rule_scores.tsv  the acceptance rules and graded credits of acceptable_answers.py (README §15), micro / macro /
                    macro over learnable labels, for each method and two set conventions: 'any' (a set scores if one
                    of its terms does: a reviewer picks the right one) and 'split' (mean over its terms: a random pick)
-  decisions.tsv.gz one row per sample, slot and method: the answer terms ('||'-joined, '' = abstain)
+  decisions.tsv.gz one row per sample, slot and method: the answer terms ('||'-joined, '' = abstain), each term's
+                   summed probability ('masses', same order) and the set's summed probability ('set_mass'; a label
+                   under two of the terms counted once). Terms are ordered by mass: the first is the primary
+                   answer, the rest are the alternatives
+  flags.tsv.gz     one row per sample and slot: top-1 label and probability, the unrelated runner-up (the most
+                   probable of the next --flag_top labels that is neither an ancestor nor a descendant of the top-1
+                   and shares no allowed ancestor with it) and its probability, ambiguous_branches (runner-up
+                   probability >= --flag_mass), the back-off answer, gold and whether gold was a training label
+  flags_summary.tsv per slot: share flagged, among all samples and among back-off abstentions, and how often the
+                   top-1, the runner-up or either is right when flagged
   settings.json    the options, temperatures and the threshold chosen per fold
 
-Example (~10 min, most of it the per-sample candidate sets and the rule scoring):
+Example (~15 min, most of it the per-sample candidate sets and the rule scoring):
 python experiments/set_valued.py \
   --samples ~/MicrobeAtlasProject/metalog/clean/training_set.clean.tsv.gz \
   --fold_groups ~/MicrobeAtlasProject/metalog/clean/project_groups.tsv \
-  --envo_obo ~/MicrobeAtlasProject/ontologies/envo.obo \
+  --envo_obo ~/MicrobeAtlasProject/ontologies/envo.obo --answers ontology \
   --output_dir ~/MicrobeAtlasProject/ontology_mapping/experiments/set_valued/seed0
 """
 
 import argparse
-import itertools
 import json
 import os
 from collections import Counter, defaultdict
@@ -64,12 +77,12 @@ import pandas as pd
 from _setup import DEFAULTS, SLOTS, load_npz, load_term_vectors, load_terms, path, select_samples, study_folds
 import methods as M  # noqa: E402  (importable once _setup has put scripts/ontology_mapping on the path)
 from common import ancestor_distances, read_tsv, term_ancestors  # noqa: E402
-from hierarchy import TAUS, Closure, fit_temperature, softmax  # noqa: E402
+from hierarchy import (LAMBDAS, TAUS, Closure, candidate_sets, cross_fit, fit_temperature,  # noqa: E402,F401
+                       reviewer_value_pick, set_table, softmax, unrelated_runner_up)
 from acceptable_answers import (GENERIC_HEADS, direct_relation, envo_relations, isa_relation,  # noqa: E402
                                 near_duplicate_pairs)
 
 CONFORMAL_TAUS = np.round(np.arange(0.3, 1.0001, 0.025), 3)
-LAMBDAS = np.round(np.concatenate([np.arange(0, 2, 0.05), np.arange(2, 20, 0.5)]), 3)
 RULES = ["exact", "broader", "narrower", "synonyms", "co-labels", "facets", "synonyms + co-labels", "all"]
 SCHEMES = ["exact", "depth 0.5^k", "IC ratio", "full credit", "hierarchical F"]
 
@@ -120,33 +133,9 @@ def oof_probabilities(samples, x, vector_of, folds, alpha=0.5, beta=0.1, pool=0.
     return out
 
 
-# ----------------------------------------------------------------------------- 2. candidate sets
-def candidate_sets(q, A, informative, n_candidates=10, max_terms=3, min_mass=0.02):
-    """Antichains of <= max_terms node indices among the n_candidates allowed nodes with the most mass (q >= min_mass).
-    A: labels x nodes closure (bool); two nodes are comparable when the labels below one include the other's."""
-    order = np.argsort(-q, kind="stable")
-    cand = [int(k) for k in order if informative[k] and q[k] >= min_mass][:n_candidates]
-    below = {k: A[:, k] for k in cand}
-
-    def comparable(a, b):
-        return bool((below[a] <= below[b]).all() or (below[b] <= below[a]).all())
-
-    return [s for m in range(1, max_terms + 1) for s in itertools.combinations(cand, m)
-            if all(not comparable(a, b) for a, b in itertools.combinations(s, 2))]
-
-
-def set_table(p, sets, A, share):
-    """Per candidate set: covered-label mask (sets x labels), summed probability, labels covered, number of terms,
-    IC = -log(training share of the covered labels) and expected credit sum_y p_y min(1, IC(set) / IC(y)).
-    p: probability row over labels; share: training share of each label (> 0)."""
-    cover = np.array([A[:, list(s)].any(1) for s in sets])
-    ic_label = -np.log(share)
-    ic = -np.log(cover @ share)
-    return {"cover": cover, "mass": cover @ p, "n_labels": cover.sum(1), "n_terms": np.array([len(s) for s in sets]),
-            "ic": ic, "expected_credit": (cover * p * np.minimum(1, ic[:, None] / ic_label[None, :])).sum(1)}
-
-
-# ----------------------------------------------------------------------------- 3. decision rules
+# ----------------------------------------------------------------------------- 2-3. candidate sets, decision rules
+# candidate_sets, set_table, reviewer_value_pick, unrelated_runner_up and cross_fit live in hierarchy.py (shared with
+# 5_evaluate.py / 6_predict_atlas.py, whose vectorised hierarchy.SetDecoder gives the same evr decisions)
 def conformal_pick(table, tau, max_terms):
     """Index of the smallest set (fewest labels covered, then most mass, then first) with <= max_terms terms and mass
     >= tau; -1 if none."""
@@ -165,21 +154,6 @@ def expected_value_pick(table, lam, max_terms):
 
 
 # ----------------------------------------------------------------------------- 4. thresholds chosen on other folds
-def cross_fit(answered, covered, fold, target):
-    """answered, covered: samples x grid (0/1). Per held-out fold k, the grid index that answers most of the OTHER
-    folds' samples with accuracy (covered / answered) >= target (ties: the first); the last grid index if none.
-    -> (grid index per sample, {fold: grid index})."""
-    chosen, per_sample = {}, np.zeros(len(fold), int)
-    for k in np.unique(fold):
-        o = fold != k
-        n_ans = answered[o].sum(0)
-        acc = covered[o].sum(0) / np.maximum(n_ans, 1)
-        ok = np.where((acc >= target) & (n_ans > 0))[0]
-        chosen[int(k)] = int(ok[n_ans[ok].argmax()]) if len(ok) else answered.shape[1] - 1
-        per_sample[fold == k] = chosen[int(k)]
-    return per_sample, chosen
-
-
 def fallback(primary_answered, answered, covered, fold, target):
     """Keep the primary decision; where it abstains, use the grid index chosen on the other folds' ABSTENTIONS only
     (most answered at >= target). -> (grid index per sample, -1 = keep the primary decision; {fold: index or None})."""
@@ -294,15 +268,18 @@ class RuleScorer:
 
 
 # ----------------------------------------------------------------------------- 6. one slot, every method
-def sample_rows(folds, anc, args):
+def sample_rows(folds, anc, args, answers="labels", max_terms=None):
     """Per test sample: gold, top-1, back-off answer at every tau of TAUS, and the candidate sets with their table,
-    coverage of gold, set credit and exactness (set credit uses the training fold's label counts)."""
+    coverage of gold, set credit and exactness (set credit uses the training fold's label counts). `answers` is
+    hierarchy.Closure's answer mode ("labels" or "ontology"); max_terms overrides args.max_terms. Each row also keeps
+    its probability row, the closure and the node columns, for the masses of any answer (answer_masses)."""
     rows = []
+    max_terms = args.max_terms if max_terms is None else max_terms
     for k, f in enumerate(folds):
         P, vocab = f["P"], f["vocab"]
         if not len(P):
             continue
-        C = Closure(vocab, anc)
+        C = Closure(vocab, anc, answers=answers)
         A, nodes, inf = C.A > 0, list(C.nodes), np.asarray(C.informative)
         counts = Counter(t for j, g in enumerate(folds) if j != k for t in g["gold"])  # fold k's training labels
         cnt = np.array([counts.get(v, 0) for v in vocab], float) + 0.5
@@ -311,27 +288,47 @@ def sample_rows(folds, anc, args):
         node_ic = -np.log(A.T.astype(float) @ share)  # IC of each single node
         node_labels = A.sum(0)
         Q = P @ C.A
+        col = {n: j for j, n in enumerate(nodes)}
+        allowed = set(np.asarray(nodes)[inf])
         bo = np.stack([C.decode(P, t)[0] for t in TAUS], 1)  # samples x taus, -1 = abstain
         for i in range(len(P)):
             gold = f["gold"][i]
             ic_gold = ic_label.get(gold, ic_unseen)
             r = {"fold": k, "gold": gold, "sample_id": f["sample_id"][i], "study": f["study"][i],
-                 "top1": vocab[P[i].argmax()]}
+                 "top1": vocab[P[i].argmax()], "top1_p": float(P[i].max()), "p": P[i], "A": A, "col": col,
+                 "gold_seen": bool(gold in ic_label)}
+            r["runner_up"], r["runner_up_p"] = unrelated_runner_up(P[i], vocab, anc, allowed, args.flag_top)
             # back-off outcomes per tau: (answered, covered, set credit, exact, labels covered)
             r["backoff"] = [[] if n < 0 else [nodes[n]] for n in bo[i]]
             r["backoff_out"] = [(0, 0, 0.0, 0, 0) if n < 0 else
                                 (1, int(covers(nodes[n], gold, anc)),
                                  min(1.0, node_ic[n] / ic_gold) if covers(nodes[n], gold, anc) else 0.0,
                                  int(nodes[n] == gold), int(node_labels[n])) for n in bo[i]]
-            sets = candidate_sets(Q[i], A, inf, args.n_candidates, args.max_terms, args.min_mass)
+            sets = candidate_sets(Q[i], A, inf, args.n_candidates, max_terms, args.min_mass)
             r["sets"] = [[nodes[n] for n in s] for s in sets]
             if sets:
                 t = set_table(P[i], sets, A, share)
+                t.pop("cover")  # sets x labels per sample: ~1.5 GB per slot if kept, and not needed after this
                 ok = np.array([any(covers(n, gold, anc) for n in s) for s in r["sets"]])
                 r.update(t, covered=ok, credit=np.where(ok, np.minimum(1, t["ic"] / ic_gold), 0.0),
                          exact=np.array([s == [gold] for s in r["sets"]]))
             rows.append(r)
     return rows
+
+
+def answer_masses(r, terms):
+    """(per-term summed probability, in the order given; summed probability of the whole answer, each label once)."""
+    if not terms:
+        return [], 0.0
+    cols = [r["col"][t] for t in terms]
+    per_term = [float(r["p"] @ r["A"][:, c]) for c in cols]
+    return per_term, float(r["p"] @ r["A"][:, cols].any(1))
+
+
+def by_mass(r, terms):
+    """The answer's terms ordered by summed probability, most probable first (the primary answer), ties by id."""
+    m, _ = answer_masses(r, terms)
+    return [t for _, t in sorted(zip(m, terms), key=lambda x: (-x[0], x[1]))]
 
 
 def set_outcome(r, k):
@@ -343,7 +340,7 @@ def set_outcome(r, k):
 
 def decode_slot(folds, anc, args):
     """Every method on one slot -> (rows, {method: answer-term lists}, {method: samples x 5 outcomes},
-    {method: {fold: threshold}})."""
+    {method: {fold: threshold}}, {method: row list the answers come from}). Answers are ordered by mass."""
     rows = sample_rows(folds, anc, args)
     fold = np.array([r["fold"] for r in rows])
     answers, outcomes, thresholds, grids = {}, {}, {}, {}
@@ -378,6 +375,13 @@ def decode_slot(folds, anc, args):
         run(f"conformal_m{m}", conf(m), CONFORMAL_TAUS)
         run(f"ev_m{m}", ev(m), LAMBDAS)
 
+    def evr(d):
+        return lambda r, lam: reviewer_value_pick(r, lam, args.max_terms, d) if "mass" in r else -1
+
+    if args.max_terms >= 2:
+        for d in args.discounts:
+            run(f"evr_d{d:g}", evr(d), LAMBDAS)
+
     def run_fallback(name, primary, sets_from, target):
         picks, O, grid = grids[sets_from]
         g, chosen = fallback(outcomes[primary][:, 0], O[:, :, 0], O[:, :, 1], fold, target)
@@ -389,7 +393,29 @@ def decode_slot(folds, anc, args):
         run_fallback("backoff+set", "backoff", "conformal_m2", args.target)
         run_fallback("backoff+set@0.8", "backoff", "conformal_m2", 0.8)
         run_fallback("ev1+ev2set", "ev_m1", "ev_m2", args.target)
-    return rows, answers, outcomes, thresholds
+    source = {name: rows for name in answers}
+
+    if args.answers == "ontology":  # back-off-based rules with ENVO / UBERON terms no curator used as answers too
+        onto = sample_rows(folds, anc, args, answers="ontology", max_terms=min(2, args.max_terms))
+        O = np.array([r["backoff_out"] for r in onto])
+        g, chosen = cross_fit(O[:, :, 0], O[:, :, 1], fold, args.target)
+        answers["backoff@onto"] = [r["backoff"][gi] for r, gi in zip(onto, g)]
+        outcomes["backoff@onto"] = O[np.arange(len(onto)), g]
+        thresholds["backoff@onto"] = {k: float(TAUS[v]) for k, v in chosen.items()}
+        source["backoff@onto"] = onto
+        if args.max_terms >= 2:
+            picks = np.array([[conf(2)(r, t) for t in CONFORMAL_TAUS] for r in onto])
+            Os = np.array([[set_outcome(r, k) for k in p] for r, p in zip(onto, picks)])
+            g, chosen = fallback(outcomes["backoff@onto"][:, 0], Os[:, :, 0], Os[:, :, 1], fold, args.target)
+            answers["backoff+set@onto"] = [a if gi < 0 else answer(r, p[gi])
+                                           for r, a, p, gi in zip(onto, answers["backoff@onto"], picks, g)]
+            outcomes["backoff+set@onto"] = np.array([o if gi < 0 else Os[i, gi]
+                                                     for i, (o, gi) in enumerate(zip(outcomes["backoff@onto"], g))])
+            thresholds["backoff+set@onto"] = {k: (None if v is None else float(CONFORMAL_TAUS[v]))
+                                              for k, v in chosen.items()}
+            source["backoff+set@onto"] = onto
+    answers = {name: [by_mass(r, a) for r, a in zip(source[name], ans)] for name, ans in answers.items()}
+    return rows, answers, outcomes, thresholds, source
 
 
 def summarise(answers, outcomes, gold, studies, bootstrap=500):
@@ -410,6 +436,31 @@ def summarise(answers, outcomes, gold, studies, bootstrap=500):
     return rows
 
 
+def flag_table(rows, backoff_answers, anc, flag_mass):
+    """flags.tsv rows of one slot (see the module docstring)."""
+    return pd.DataFrame({
+        "sample_id": [r["sample_id"] for r in rows], "study_code": [r["study"] for r in rows],
+        "fold": [r["fold"] for r in rows], "gold": [r["gold"] for r in rows],
+        "gold_seen": [r["gold_seen"] for r in rows],
+        "top1": [r["top1"] for r in rows], "top1_p": [round(r["top1_p"], 4) for r in rows],
+        "runner_up": [r["runner_up"] for r in rows], "runner_up_p": [round(r["runner_up_p"], 4) for r in rows],
+        "ambiguous_branches": [r["runner_up_p"] >= flag_mass for r in rows],
+        "backoff": ["||".join(a) for a in backoff_answers]})
+
+
+def flag_summary(flags, anc):
+    """Share flagged (all / among back-off abstentions) and, when flagged, how often top-1 / runner-up / either covers
+    gold (is gold or an ancestor of it)."""
+    fl = flags["ambiguous_branches"].to_numpy()
+    abst = (flags["backoff"] == "").to_numpy()
+    top_ok = np.array([covers(t, g, anc) for t, g in zip(flags["top1"], flags["gold"])])
+    run_ok = np.array([bool(t) and covers(t, g, anc) for t, g in zip(flags["runner_up"], flags["gold"])])
+    rate = lambda m: float(m.mean()) if len(m) else np.nan  # noqa: E731
+    return {"flagged": rate(fl), "flagged_among_abstentions": rate(fl[abst]), "abstentions": rate(abst),
+            "top1_right_if_flagged": rate(top_ok[fl]), "runner_up_right_if_flagged": rate(run_ok[fl]),
+            "either_right_if_flagged": rate((top_ok | run_ok)[fl])}
+
+
 # ----------------------------------------------------------------------------- main
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -426,6 +477,12 @@ def main(argv=None):
     ap.add_argument("--n_candidates", type=int, default=10)
     ap.add_argument("--min_mass", type=float, default=0.02)
     ap.add_argument("--study_pool", type=float, default=0.0)
+    ap.add_argument("--discounts", type=float, nargs="*", default=[0.7, 0.8, 0.9, 1.0],
+                    help="Set discounts d of the reviewer-score expected value (one evr_d<d> method each)")
+    ap.add_argument("--answers", choices=["labels", "ontology"], default="labels",
+                    help="ontology: also run back-off and back-off + set with unused ENVO / UBERON terms as answers")
+    ap.add_argument("--flag_mass", type=float, default=0.2, help="Runner-up probability that flags ambiguous branches")
+    ap.add_argument("--flag_top", type=int, default=5, help="Labels after the top-1 searched for the runner-up")
     ap.add_argument("--bootstrap", type=int, default=500, help="Study bootstrap replicates (0 = none)")
     ap.add_argument("--no_rules", action="store_true", help="Skip rule_scores.tsv (no OBO needed)")
     ap.add_argument("--output_dir", required=True)
@@ -459,9 +516,10 @@ def main(argv=None):
                             {t: v / np.linalg.norm(v) for t, v in raw.items()}, relations)
         print(f"scorer: {len(scorer.synonyms)} synonym candidates, {scorer.n_pairs} near-duplicate pairs", flush=True)
 
-    summary, rules, decisions, settings = [], [], [], {"args": vars(args), "temperatures": {}, "thresholds": {}}
+    summary, rules, decisions, flags, flag_rows = [], [], [], [], []
+    settings = {"args": vars(args), "temperatures": {}, "thresholds": {}}
     for slot in SLOTS:
-        rows, answers, outcomes, thresholds = decode_slot(probs[slot], anc, args)
+        rows, answers, outcomes, thresholds, source = decode_slot(probs[slot], anc, args)
         gold = np.array([r["gold"] for r in rows])
         ids, studies = np.array([r["sample_id"] for r in rows]), np.array([r["study"] for r in rows])
         f_of = np.array([r["fold"] for r in rows])
@@ -472,8 +530,14 @@ def main(argv=None):
                 for row in scorer.score(slot, gold, ans, ids):
                     rules.append({"slot": slot, "method": name, **row})
         for name, ans in answers.items():
+            masses = [answer_masses(r, a) for r, a in zip(source[name], ans)]
             decisions.append(pd.DataFrame({"sample_id": ids, "study_code": studies, "slot": slot, "fold": f_of,
-                                           "gold": gold, "method": name, "answer": ["||".join(a) for a in ans]}))
+                                           "gold": gold, "method": name, "answer": ["||".join(a) for a in ans],
+                                           "masses": ["||".join(f"{v:.4f}" for v in m) for m, _ in masses],
+                                           "set_mass": [round(u, 4) for _, u in masses]}))
+        ft = flag_table(rows, answers["backoff"], anc, args.flag_mass)
+        flags.append(ft.assign(slot=slot))
+        flag_rows.append({"slot": slot, **flag_summary(ft, anc)})
         settings["temperatures"][slot] = [round(f["T"], 4) for f in probs[slot]]
         settings["thresholds"][slot] = thresholds
         print(pd.DataFrame([r for r in summary if r["slot"] == slot]).round(3).to_string(index=False), flush=True)
@@ -482,6 +546,11 @@ def main(argv=None):
     if rules:
         pd.DataFrame(rules).round(4).to_csv(os.path.join(out_dir, "rule_scores.tsv"), sep="\t", index=False)
     pd.concat(decisions).to_csv(os.path.join(out_dir, "decisions.tsv.gz"), sep="\t", index=False)
+    flag_cols = ["sample_id", "study_code", "slot", "fold", "gold", "gold_seen", "top1", "top1_p", "runner_up",
+                 "runner_up_p", "ambiguous_branches", "backoff"]
+    pd.concat(flags)[flag_cols].to_csv(os.path.join(out_dir, "flags.tsv.gz"), sep="\t", index=False)
+    pd.DataFrame(flag_rows).round(4).to_csv(os.path.join(out_dir, "flags_summary.tsv"), sep="\t", index=False)
+    print(pd.DataFrame(flag_rows).round(3).to_string(index=False))
     with open(os.path.join(out_dir, "settings.json"), "w") as handle:
         json.dump(settings, handle, indent=1, default=str)
     print(f"wrote {out_dir}")

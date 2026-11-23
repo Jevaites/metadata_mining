@@ -380,6 +380,41 @@ class TestBackoffColumns:
         assert c["candidates"][1] == "ENVO_FOREST:0.5;ENVO_TERRESTRIAL:0.4"  # (rows 0 and 2 have tied runners-up)
 
 
+# ============================================================================= set_columns
+class TestSetColumns:
+    """set_columns(scores, T, (SetDecoder, lambda, flag_mass, flag_top), label_of) for one slot: the toy slot of
+    TestBackoffColumns, equal label counts, scores log(P) and T = 1 (the probabilities are P)."""
+    classes, ancestors, label_of = TestBackoffColumns.classes, TestBackoffColumns.ancestors, TestBackoffColumns.label_of
+    P = np.array([
+        # forest terr.  marine lake   river
+        [0.90, 0.025, 0.025, 0.025, 0.025],  # sure of forest                    -> forest
+        [0.50, 0.025, 0.425, 0.025, 0.025],  # forest or marine: unrelated       -> {forest, marine}, flagged
+        [0.20, 0.20,  0.20,  0.20,  0.20],   # no idea                           -> nothing at lambda 3, flagged
+    ])
+    # row 0: forest .9 - 3 * .1 = .6 beats terrestrial (forest + terrestrial = .925, but its credit is only
+    # IC(terrestrial) / IC(forest) = log 2.5 / log 5 = .57 per label: .53 - 3 * .075 = .30)
+
+    def columns(self, predict, lam=3.0):
+        closure = hierarchy.Closure(self.classes, self.ancestors)
+        dec = hierarchy.SetDecoder(closure, hierarchy.label_share(self.classes, {c: 5 for c in self.classes}))
+        return predict.set_columns(np.log(self.P), 1.0, (dec, lam, 0.2, 5), self.label_of)
+
+    def test_single_set_and_none(self, predict):
+        c = self.columns(predict)
+        assert list(c["answer"]) == ["ENVO_FOREST", "ENVO_FOREST", ""]
+        assert list(c["answer_label"]) == ["forest biome", "forest biome", ""]
+        assert list(c["answer_p"]) == [0.9, 0.5, 0.0]       # the primary term's summed probability
+        assert c["alternatives"] == ["", "ENVO_MARINE:0.425", ""]
+        assert list(c["answer_set_p"]) == [0.9, 0.925, 0.0]
+        assert list(c["answer_kind"]) == ["single", "set", "none"]
+
+    def test_runner_up_and_flag(self, predict):
+        c = self.columns(predict)
+        # terrestrial is forest's parent: never the unrelated runner-up; marine is (row 2: the tie order)
+        assert list(c["runner_up"]) == ["ENVO_MARINE"] * 3 and list(c["runner_up_p"]) == [0.025, 0.425, 0.2]
+        assert list(c["ambiguous_branches"]) == [False, True, True]  # >= 0.2
+
+
 # ============================================================================= load_backoff
 class TestLoadBackoff:
     """load_backoff(args, model, terms, out_dir) -> {slot: (temperature, tau, Closure, broader)}."""

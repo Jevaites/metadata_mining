@@ -22,6 +22,11 @@ Functions under test, in the order the pipeline uses them:
     oof_backoff(folds, anc)         all of the above, cross-fitted over folds (mainly in the integration tests)
     decode_candidates(...)          the same climb over a short candidate list (LLM reranker)
     merge_calibrations(entries)     pool calibration curves of several fold seeds
+    label_share, SetDecoder         several answers: the reviewer-score set of <= 3 terms, vectorised (tested equal to
+                                    candidate_sets + set_table + reviewer_value_pick, the per-sample reference)
+    SetDecoder.runner_up            the unrelated runner-up of the top-1 (ambiguous_branches flag)
+    choose_lambda, set_outcomes, set_curve, oof_sets, answer_columns, merge_set_calibrations
+                                    lambda from a curve, out-of-fold set answers (5_evaluate), columns, pooling
 
 Tests named `..._quirk` pin down current behaviour that is surprising but harmless today.
 
@@ -560,3 +565,273 @@ class TestMergeCalibrations:
         with pytest.raises(SystemExit):
             hierarchy.merge_calibrations([calibration(0.1, [curve_row(0.5, 1, 0, 0, 0)], 0),
                                           calibration(0.1, [curve_row(0.6, 1, 0, 0, 0)], 1)])
+
+
+# ============================================================================= several answers (set-valued)
+# Equal training counts: every label has share 1/9, so IC(label) = log 9 and a term's credit for a label below it is
+# IC(term) / log 9: marine (2 labels) 0.685, aquatic (4 labels) 0.369; a label is worth 1 for itself.
+EQUAL = {v: 10 for v in VOCAB}
+
+
+def decoder(max_terms=3, discount=0.7, counts=EQUAL, vocab=VOCAB, anc=ANC, **kw):
+    closure = hierarchy.Closure(vocab, anc)
+    return hierarchy.SetDecoder(closure, hierarchy.label_share(vocab, counts), max_terms, discount, **kw)
+
+
+def decoded(dec, rows, lam, vocab=VOCAB):
+    """[(answer terms, primary first; their summed probabilities rounded; whole answer's)] for probability dicts."""
+    terms, masses, total = dec.decode(probs(*rows, vocab=vocab), lam)
+    nodes = dec.closure.nodes
+    return [([str(nodes[t]) for t in row if t >= 0], [round(float(m), 4) for t, m in zip(row, mr) if t >= 0],
+             round(float(u), 4)) for row, mr, u in zip(terms, masses, total)]
+
+
+def reference(dec, P, lam):
+    """The per-sample reference (candidate_sets + set_table + reviewer_value_pick), as sorted node indices."""
+    A, out = dec.closure.A > 0, []
+    for p in P:
+        sets = hierarchy.candidate_sets(p @ dec.closure.A, A, dec.closure.informative, dec.n_candidates,
+                                        dec.max_terms, dec.min_mass)
+        k = hierarchy.reviewer_value_pick(hierarchy.set_table(p, sets, A, dec.share), lam, dec.max_terms,
+                                          dec.discount) if sets else -1
+        out.append([] if k < 0 else sorted(sets[k]))
+    return out
+
+
+def random_dag(seed=0, n=60, n_labels=30):
+    """A random DAG with up to two parents per term (labels under several incomparable terms) and a vocabulary."""
+    rng = np.random.default_rng(seed)
+    names = [f"ENVO_{i:03d}" for i in range(n)]
+    parents = {0: []}
+    for i in range(1, n):
+        parents[i] = sorted(set(rng.integers(0, i, rng.integers(1, 3)).tolist()))
+    anc = {}
+    for i in range(n):
+        anc[names[i]] = set().union(*[{names[p]} | anc[names[p]] for p in parents[i]]) if parents[i] else set()
+    vocab = [names[i] for i in rng.choice(np.arange(5, n), n_labels, replace=False)]
+    return anc, vocab, {v: int(rng.integers(1, 50)) for v in vocab}, rng
+
+
+class TestLabelShare:
+    def test_counts_plus_half_normalised(self):
+        assert list(hierarchy.label_share(["a", "b", "c"], {"a": 3, "b": 1})) == [3.5 / 5.5, 1.5 / 5.5, 0.5 / 5.5]
+
+
+class TestSetDecoder:
+    def test_split_between_unrelated_branches_gives_a_set(self):
+        # ocean .5 / soil .5: one term is worth .5 (half right); {ocean, soil} is always right, worth d * 1 = .7
+        assert decoded(decoder(), [{OCEAN: .5, SOIL: .5}], lam=1.0) == [([OCEAN, SOIL], [.5, .5], 1.0)]
+
+    def test_confident_sample_gets_its_single_term(self):
+        # ocean .9: value .9 - lam * .1 = .8 beats {ocean, soil}: .7 * .95 - lam * .05 = .615
+        assert decoded(decoder(), [{OCEAN: .9, MARINE: .05, SOIL: .05}], lam=1.0) == [([OCEAN], [.9], .9)]
+
+    def test_nothing_when_no_set_is_worth_more_than_zero(self):
+        spread = {v: 1 / 9 for v in VOCAB}
+        assert decoded(decoder(), [spread], lam=20.0) == [([], [], 0.0)]
+
+    def test_discount_trades_a_set_for_the_risk_of_one_term(self):
+        # d = .4: {ocean, soil} is worth .4; ocean alone .5 - lam * .5 -> the single term at lam 0, the set at lam .5
+        dec = decoder(discount=0.4)
+        assert decoded(dec, [{OCEAN: .5, SOIL: .5}], lam=0.0)[0][0] == [OCEAN]
+        assert decoded(dec, [{OCEAN: .5, SOIL: .5}], lam=0.5)[0][0] == [OCEAN, SOIL]
+
+    def test_max_terms_1_never_answers_a_set(self):
+        assert decoded(decoder(max_terms=1), [{OCEAN: .5, SOIL: .5}], lam=0.5) == [([OCEAN], [.5], .5)]
+
+    def test_primary_answer_is_the_most_probable_term(self):
+        # soil .6, ocean .4 at a high lambda: the set, soil (more probable) first although ocean sorts first by id
+        assert decoded(decoder(), [{OCEAN: .4, SOIL: .6}], lam=2.0) == [([SOIL, OCEAN], [.6, .4], 1.0)]
+
+    def test_a_set_never_holds_a_term_and_its_ancestor(self):
+        # ocean .5 / marine .5, d = 1: {ocean, marine} would be worth 1 (ocean for the ocean half, marine for the
+        # other) but it is the same answer as marine, which is worth .5 * .685 + .5 = .84 and is the answer
+        assert decoded(decoder(discount=1.0), [{OCEAN: .5, MARINE: .5}], lam=1.0) == [([MARINE], [1.0], 1.0)]
+
+    def test_candidates_are_allowed_nodes_with_enough_mass(self):
+        # desert (.01 < min_mass .02) and the zero-probability labels are no candidates; terrestrial is no label
+        dec = decoder()
+        cand, _, _ = dec.tables(probs({OCEAN: .5, SOIL: .49, DESERT: .01}))
+        nodes = np.append(dec.closure.nodes, "")
+        assert {str(n) for n in nodes[cand[0]]} == {OCEAN, MARINE, AQUATIC, SOIL, ""}
+
+    def test_a_label_under_three_terms_counts_once(self):
+        # x has three incomparable parents p1, p2, p3 (all labels); z1-z3 make the vocabulary large enough for the
+        # parents to be informative. {p1, p2, p3} covers x once: mass 1, not 1.8, and its worth counts x once
+        root = BIOME
+        anc = {"ENVO_x": {"ENVO_p1", "ENVO_p2", "ENVO_p3", root}, **{f"ENVO_p{i}": {root} for i in (1, 2, 3)},
+               **{f"ENVO_z{i}": {root} for i in (1, 2, 3)}, root: set()}
+        vocab = ["ENVO_x", "ENVO_p1", "ENVO_p2", "ENVO_p3", "ENVO_z1", "ENVO_z2", "ENVO_z3"]
+        dec = decoder(counts={v: 10 for v in vocab}, vocab=vocab, anc=anc, discount=1.0)
+        row = {"ENVO_x": .4, "ENVO_p1": .2, "ENVO_p2": .2, "ENVO_p3": .2}
+        P = probs(row, vocab=vocab)
+        cand, mass, worth = dec.tables(P)
+        nodes = np.append(dec.closure.nodes, "")  # cand == dec.pad: no candidate
+        triple = [t for t, s in enumerate(dec.templates)
+                  if {str(nodes[cand[0, i]]) for i in s} == {"ENVO_p1", "ENVO_p2", "ENVO_p3"}]
+        assert len(triple) == 1 and mass[0, triple[0]] == pytest.approx(1.0)
+        for lam in (0.0, 0.5, 3.0):
+            k = dec.picks(mass, worth, lam)
+            mine = sorted(int(n) for n in dec.answer_nodes(cand, k)[0] if n >= 0)
+            assert mine == reference(dec, P, lam)[0], lam
+
+    @pytest.mark.parametrize("max_terms, discount", [(3, 0.7), (2, 0.9), (3, 1.0), (1, 0.7)])
+    def test_same_answers_as_the_per_sample_reference(self, max_terms, discount):
+        anc, vocab, counts, rng = random_dag()
+        dec = decoder(max_terms, discount, counts=counts, vocab=vocab, anc=anc)
+        P = rng.dirichlet(np.full(len(vocab), 0.3), 200)
+        for lam in (0.0, 0.3, 1.0, 3.0):
+            terms, _, total = dec.decode(P, lam)
+            assert [sorted(int(t) for t in row if t >= 0) for row in terms] == reference(dec, P, lam), lam
+            # the whole answer's summed probability = P of the labels under one of its terms, each label once
+            A = dec.closure.A > 0
+            union = np.array([P[i] @ A[:, [t for t in row if t >= 0]].any(1) if (row >= 0).any() else 0.0
+                              for i, row in enumerate(terms)])
+            assert np.allclose(total, union)
+
+    def test_batches_do_not_change_the_answers(self):
+        anc, vocab, counts, rng = random_dag(1)
+        P = rng.dirichlet(np.full(len(vocab), 0.3), 50)
+        one = decoder(counts=counts, vocab=vocab, anc=anc, batch=7).decode(P, 0.5)
+        all_ = decoder(counts=counts, vocab=vocab, anc=anc).decode(P, 0.5)
+        for a, b in zip(one, all_):
+            assert np.array_equal(a, b)
+
+    def test_fewer_allowed_nodes_than_candidates(self):
+        # 9 labels, 9 allowed nodes < n_candidates 10: the missing candidates are padding, never part of an answer
+        assert decoded(decoder(n_candidates=12), [{OCEAN: .5, SOIL: .5}], lam=1.0) == [([OCEAN, SOIL], [.5, .5], 1.0)]
+
+    def test_more_than_three_terms_refused(self):
+        with pytest.raises(ValueError):
+            decoder(max_terms=4)
+
+
+class TestSetDecoderRunnerUp:
+    def names(self, dec, rows, vocab=VOCAB):
+        ru, p = dec.runner_up(probs(*rows, vocab=vocab))
+        return [(vocab[r] if r >= 0 else "", round(float(x), 4)) for r, x in zip(ru, p)]
+
+    def test_skips_labels_sharing_an_allowed_ancestor(self):
+        # freshwater shares 'aquatic' (an allowed answer) with ocean: not another branch; soil is
+        assert self.names(decoder(), [{OCEAN: .5, FRESHWATER: .3, SOIL: .2}]) == [(SOIL, .2)]
+
+    def test_skips_an_ancestor_that_is_not_an_allowed_answer(self):
+        # 'e' is a label above a, b, c: 4 of 5 labels -> too vague to be an answer, but still the top-1's ancestor
+        anc = {"ENVO_a": {"ENVO_e", BIOME}, "ENVO_b": {"ENVO_e", BIOME}, "ENVO_c": {"ENVO_e", BIOME},
+               "ENVO_e": {BIOME}, "ENVO_d": {BIOME}, BIOME: set()}
+        vocab = ["ENVO_a", "ENVO_b", "ENVO_c", "ENVO_d", "ENVO_e"]
+        dec = decoder(counts={v: 1 for v in vocab}, vocab=vocab, anc=anc)
+        assert self.names(dec, [{"ENVO_a": .5, "ENVO_e": .3, "ENVO_d": .2}], vocab) == [("ENVO_d", .2)]
+
+    def test_none_among_the_next_labels(self):
+        ru, p = decoder().runner_up(probs({OCEAN: .6, MARINE: .4}), top=1)
+        assert (ru[0], p[0]) == (-1, 0.0)
+
+    def test_a_label_with_no_probability_can_be_the_runner_up_quirk(self):
+        # as unrelated_runner_up: the next labels in probability order include 0-probability ones. Harmless: the
+        # flag needs runner_up_p >= --flag_mass (0.2)
+        assert self.names(decoder(), [{OCEAN: .6, MARINE: .4}]) == [(SOIL, 0.0)]
+
+    def test_same_as_the_per_sample_reference(self):
+        anc, vocab, counts, rng = random_dag(2)
+        dec = decoder(counts=counts, vocab=vocab, anc=anc)
+        allowed_nodes = set(dec.closure.nodes[dec.closure.informative])
+        P = rng.dirichlet(np.full(len(vocab), 0.3), 200)
+        ru, p = dec.runner_up(P, 5)
+        for i in range(len(P)):
+            v, pv = hierarchy.unrelated_runner_up(P[i], np.array(vocab), anc, allowed_nodes, 5)
+            assert (vocab[ru[i]] if ru[i] >= 0 else "", round(p[i], 9)) == (v, round(pv, 9))
+
+
+class TestChooseLambda:
+    CURVE = [{"lambda": 0.0, "answered": 1.0, "accuracy_strict": 0.80},
+             {"lambda": 0.5, "answered": 0.9, "accuracy_strict": 0.90},
+             {"lambda": 1.0, "answered": 0.9, "accuracy_strict": 0.95},
+             {"lambda": 2.0, "answered": 0.5, "accuracy_strict": 0.99}]
+
+    def test_most_answered_reaching_the_target_ties_first(self):
+        assert hierarchy.choose_lambda(self.CURVE, 0.9) == 0.5
+
+    def test_a_lower_target_answers_more(self):
+        assert hierarchy.choose_lambda(self.CURVE, 0.8) == 0.0
+
+    def test_unreachable_target_takes_the_last(self):
+        assert hierarchy.choose_lambda(self.CURVE, 0.999) == 2.0
+
+
+class TestSetOutcomes:
+    def test_answered_covered_exact_and_sets(self):
+        dec = decoder()
+        P = probs({OCEAN: .5, SOIL: .5}, {OCEAN: .9, MARINE: .05, SOIL: .05}, {OCEAN: .9, MARINE: .05, SOIL: .05})
+        cand, mass, worth = dec.tables(P)
+        out = hierarchy.set_outcomes(dec, cand, mass, worth, [OCEAN, MARINE, OCEAN], ANC, lambdas=[1.0])
+        # {ocean, soil} covers ocean (a set: not exact although its first term is gold); ocean is more specific than
+        # marine: lenient only; ocean for ocean: exact
+        assert out["answered"][:, 0].tolist() == [1, 1, 1]
+        assert out["strict"][:, 0].tolist() == [1, 0, 1] and out["lenient"][:, 0].tolist() == [1, 1, 1]
+        assert out["exact"][:, 0].tolist() == [0, 0, 1] and out["set"][:, 0].tolist() == [1, 0, 0]
+        curve = hierarchy.set_curve(out)
+        assert curve[0]["accuracy_strict"] == 0.6667 and curve[0]["set"] == 0.3333
+
+
+class TestOofSets:
+    def folds(self):
+        rows = [{OCEAN: .9, SOIL: .1}, {OCEAN: .5, SOIL: .5}, {SOIL: .9, OCEAN: .1}, {OCEAN: .5, SOIL: .5}]
+        P = probs(*rows)
+        folds = [{"gold": [OCEAN, SOIL, SOIL, OCEAN]}, {"gold": [OCEAN, OCEAN, SOIL, SOIL]}]
+        return [(P, hierarchy.Closure(VOCAB, ANC)), (P.copy(), hierarchy.Closure(VOCAB, ANC))], folds
+
+    def test_report_columns_and_counts_from_the_other_folds(self):
+        fitted, folds = self.folds()
+        report, curve, per_fold = hierarchy.oof_sets(fitted, folds, ANC, target=1.0)
+        # target 100 %: the split samples need a set {ocean, soil}; the confident ones their single term
+        assert report["answered"] == 1.0 and report["accuracy_strict"] == 1.0 and report["set"] == 0.5
+        assert len(report["lambda_per_fold"]) == 2 and len(curve) == len(hierarchy.LAMBDAS)
+        assert per_fold[0]["label_counts"] == {OCEAN: 2, SOIL: 2} and per_fold[1]["label_counts"] == {OCEAN: 2, SOIL: 2}
+        nodes = per_fold[0]["nodes"]
+        answers = [[str(nodes[t]) for t in row if t >= 0] for row in per_fold[0]["terms"]]
+        assert answers == [[OCEAN], [OCEAN, SOIL], [SOIL], [OCEAN, SOIL]]
+        assert list(per_fold[0]["runner_up"]) == [SOIL, SOIL, OCEAN, SOIL]  # ties: the first column (ocean) is top-1
+
+    def test_label_counts_exclude_the_fold_itself(self):
+        fitted, folds = self.folds()
+        folds[1]["gold"] = [DESERT] * 4
+        _, _, per_fold = hierarchy.oof_sets(fitted, folds, ANC, target=0.9)
+        assert per_fold[0]["label_counts"] == {DESERT: 4}
+        assert per_fold[1]["label_counts"] == {OCEAN: 2, SOIL: 2}
+
+
+class TestAnswerColumns:
+    def test_columns(self):
+        nodes = np.array([OCEAN, SOIL])
+        c = hierarchy.answer_columns(np.array([[1, 0, -1], [0, -1, -1], [-1, -1, -1]]),
+                                     np.array([[.6, .4, 0], [.9, 0, 0], [0, 0, 0]]), np.array([1.0, .9, 0]), nodes,
+                                     np.array([OCEAN, SOIL, ""]), np.array([.4, .1, 0.0]), flag_mass=0.4)
+        assert c["answer"] == [f"{SOIL}||{OCEAN}", OCEAN, ""]
+        assert c["answer_masses"] == ["0.6000||0.4000", "0.9000", ""]
+        assert list(c["answer_kind"]) == ["set", "single", "none"]
+        assert list(c["ambiguous_branches"]) == [True, False, False]  # >= flag_mass
+
+
+class TestMergeSetCalibrations:
+    def entry(self, answered, strict, settings=None, counts=None):
+        row = {"lambda": 0.5, "answered": answered, "strict": strict, "lenient": strict, "exact": 0.1, "set": 0.2}
+        return {"sets": {"settings": settings or {"discount": 0.7}, "label_counts": counts or {OCEAN: 3},
+                         "lambda_per_fold": [0.5], "curve": [hierarchy._set_accuracies(dict(row))]}}
+
+    def test_one_entry_unchanged_none_without_sets(self):
+        e = self.entry(.8, .72)
+        assert hierarchy.merge_set_calibrations([e]) is e["sets"]
+        assert hierarchy.merge_set_calibrations([e, {"curve": []}]) is None
+
+    def test_shares_averaged_and_accuracy_recomputed(self):
+        merged = hierarchy.merge_set_calibrations([self.entry(.8, .72), self.entry(.6, .6)])
+        row = merged["curve"][0]
+        assert (row["answered"], row["strict"]) == (.7, .66) and row["accuracy_strict"] == round(.66 / .7, 4)
+        assert merged["lambda_per_fold"] == [[0.5], [0.5]]
+
+    def test_other_settings_or_counts_refused(self):
+        with pytest.raises(SystemExit):
+            hierarchy.merge_set_calibrations([self.entry(.8, .72), self.entry(.8, .72, settings={"discount": 0.9})])
+        with pytest.raises(SystemExit):
+            hierarchy.merge_set_calibrations([self.entry(.8, .72), self.entry(.8, .72, counts={OCEAN: 4})])

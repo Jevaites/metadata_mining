@@ -23,6 +23,7 @@ from sklearn.preprocessing import normalize
 from step_loader import load_step
 
 ev = load_step("5_evaluate.py", "evaluate")
+hierarchy = ev.hierarchy
 
 
 
@@ -516,8 +517,9 @@ def backoff_fold(first_row):
 def backoff_args(**overrides):
     args = dict(backoff_metric="strict", backoff_target=1.0, backoff_targets=[0.75], features=["x.npz"],
                 samples="samples.tsv", max_per_study=50, seed=22, fold_seed=0, fold_groups=None,
-                prototype_alpha=0.5, prototype_beta=0.1)
-    return SimpleNamespace(**{**args, **overrides})
+                prototype_alpha=0.5, prototype_beta=0.1,
+                set_max_terms=0, set_discount=0.7, set_candidates=10, set_min_mass=0.02, flag_mass=0.2, flag_top=5)
+    return SimpleNamespace(**{**args, **overrides})  # set_max_terms 0: back-off only (set answers: tests below)
 
 
 def test_backoff_all_climbs_to_the_common_parent_when_unsure():
@@ -555,6 +557,46 @@ def test_backoff_all_calibration_entry_for_step_6():
     assert entry["settings"]["method"] == "linear" and entry["settings"]["n_samples"] == 8
     assert entry["settings"]["prototype_alpha"] == 0  # only reported for the prototype method
     json.dumps(calibration)
+
+
+def test_backoff_all_set_answers():
+    # --set_max_terms 3: on the marine / freshwater ties (P .5 / .5) the back-off can only climb to 'aquatic';
+    # the set answer is {freshwater, marine} (always right, and each term is more informative than aquatic), the
+    # certain rows keep their single term. Target 100 %: the lambda chosen on the other fold must stay fully right
+    folds = {("biome", "linear"): [backoff_fold(0), backoff_fold(4)]}
+    reports, calibration, extra = ev.backoff_all(folds, BACKOFF_ANCESTORS, backoff_args(set_max_terms=3), n_samples=8)
+    assert {k: extra[(0, "biome", "linear")][k] for k in ev.SET_COLUMNS} == {
+        "answer": "soil", "answer_masses": "1.0000", "answer_mass": 1.0, "answer_kind": "single",
+        "runner_up": "marine", "runner_up_p": 0.0, "ambiguous_branches": False}
+    tie = extra[(2, "biome", "linear")]
+    assert tie["backoff"] == "aquatic"
+    assert (tie["answer"], tie["answer_masses"], tie["answer_mass"], tie["answer_kind"]) == \
+        ("freshwater||marine", "0.5000||0.5000", 1.0, "set")  # equal masses: by id
+    assert tie["runner_up"] == "soil"  # freshwater shares the allowed 'aquatic' with marine: not another branch
+    sets = reports[("biome", "linear")]["sets"]
+    assert (sets["answered"], sets["accuracy_strict"], sets["exact"], sets["set"]) == (1.0, 1.0, 0.5, 0.5)
+    assert sets["flagged"] == 0.0 and sets["flagged_among_backoff_abstentions"] is None  # the back-off never abstains
+    entry = calibration["biome"]["linear"]["sets"]
+    assert entry["label_counts"] == {"freshwater": 2, "marine": 4, "soil": 2}  # all folds' gold = the training labels
+    assert entry["settings"]["discount"] == 0.7 and entry["settings"]["max_terms"] == 3
+    assert [r["lambda"] for r in entry["curve"]] == list(hierarchy.LAMBDAS)
+    json.dumps(calibration)
+
+
+def test_backoff_all_set_answers_max_terms_1():
+    # --set_max_terms 1: one term or none; on the ties the expected value then prefers 'aquatic' (always right)
+    folds = {("biome", "linear"): [backoff_fold(0), backoff_fold(4)]}
+    _, _, extra = ev.backoff_all(folds, BACKOFF_ANCESTORS, backoff_args(set_max_terms=1), n_samples=8)
+    assert {extra[(r, "biome", "linear")]["answer_kind"] for r in range(8)} == {"single"}
+    assert extra[(2, "biome", "linear")]["answer"] == "aquatic"
+
+
+def test_backoff_all_without_set_answers():
+    # --set_max_terms 0 (as backoff_args): no set columns, no "sets" in metrics or calibration
+    folds = {("biome", "linear"): [backoff_fold(0), backoff_fold(4)]}
+    reports, calibration, extra = ev.backoff_all(folds, BACKOFF_ANCESTORS, backoff_args(), n_samples=8)
+    assert "sets" not in reports[("biome", "linear")] and "sets" not in calibration["biome"]["linear"]
+    assert set(extra[(0, "biome", "linear")]) == {"prob", "backoff", "backoff_q"}
 
 
 def test_backoff_all_needs_at_least_two_folds(capsys):

@@ -4,7 +4,9 @@ experiments/set_valued.py (subprocess style, as test_hierarchy_mutations.py; har
 Each Mutation is a one-line mistake (an ancestor allowed next to its descendant, a label counted twice under two
 parents, a threshold chosen with the held-out fold, ...) with the tests that must fail on it and a piece of their
 failure message. The script, its imports (_setup.py, acceptable_answers.py, common.py, hierarchy.py, methods.py) and
-the test files are copied into a temporary folder; the mutant replaces the copy of set_valued.py only.
+the test files are copied into a temporary folder; the mutant replaces the copy of set_valued.py, or of hierarchy.py for
+the mutations in IN_HIERARCHY (candidate sets, set table, reviewer pick, runner-up and cross-fit live there since they
+are shared with 5_evaluate.py / 6_predict_atlas.py; test_hierarchy_mutations.py covers the vectorised SetDecoder).
 
 ~2 s per mutation. Skip them with:  pytest -k "not mutation"
 """
@@ -17,6 +19,7 @@ from mutation_harness import Mutation, build_copy, check_caught, check_unmutated
 HERE = Path(__file__).resolve().parent
 SCRIPTS = HERE.parent
 SCRIPT = SCRIPTS / "experiments" / "set_valued.py"
+HIERARCHY = SCRIPTS / "hierarchy.py"
 TEST_FILES = ["test_set_valued_unit.py", "test_set_valued_integration.py"]
 HELPERS = ["toy_hierarchy.py", "step5_toy.py"]
 MODULES = ["common.py", "hierarchy.py", "methods.py"]
@@ -61,7 +64,7 @@ MUTATIONS = [
              "conformal_m1 answers with pairs: the single-term baseline is no longer single-term",
              {U + "TestConformalPick::test_max_terms_and_abstention": "assert 1 == -1"}),
     Mutation("ev_answers_at_zero_value",
-             [("return k if value[k] > 0 else -1", "return k if value[k] >= 0 else -1")],
+             [("    return k if value[k] > 0 else -1\n", "    return k if value[k] >= 0 else -1\n")],
              "a set worth nothing (no expected credit, no risk) is answered instead of abstaining",
              {U + "TestExpectedValuePick::test_abstains_when_no_set_has_positive_value": "assert 0 == -1"}),
     Mutation("ev_penalises_the_right_mass",
@@ -115,13 +118,56 @@ MUTATIONS = [
                "return term == gold or term in anc.get(gold, ()) or gold in anc.get(term, ())")],
              "an answer more specific than gold counts as right: accuracy at the target is overstated",
              {U + "TestHelpers::test_covers": "assert not True"}),
+    # ------------------------------------------------------------------ reviewer score
+    Mutation("reviewer_credit_takes_the_worst_term",
+             [("best = np.array([np.max([term_credit[n] for n in s], axis=0) for s in sets])",
+               "best = np.array([np.min([term_credit[n] for n in s], axis=0) for s in sets])")],
+             "a set is worth its least informative term per label: labels covered by one term only score 0",
+             {U + "TestReviewerCredit::test_a_set_is_worth_its_best_term_per_label": "assert"}),
+    Mutation("reviewer_discount_on_every_term",
+             [("discount ** (table[\"n_terms\"] - 1.0)", "discount ** table[\"n_terms\"]")],
+             "the discount also hits single terms: with a small d the rule abstains instead of giving the single term",
+             {U + "TestReviewerValuePick::test_small_discount_keeps_the_single_term": "assert -1 == 0"}),
+    # ------------------------------------------------------------------ flags and masses
+    Mutation("runner_up_may_be_an_ancestor",
+             [("        if v in anc.get(first, ()) or first in anc.get(v, ()):\n            continue\n", "")],
+             "the 'unrelated' runner-up can be the top-1's own parent (ocean / marine biome): every confident sample "
+             "looks ambiguous",
+             {U + "TestUnrelatedRunnerUp::test_skips_ancestors_and_labels_sharing_an_allowed_ancestor": "ENVO_marine"}),
+    Mutation("union_mass_counts_shared_labels_twice",
+             [("return per_term, float(r[\"p\"] @ r[\"A\"][:, cols].any(1))",
+               "return per_term, float(r[\"p\"] @ r[\"A\"][:, cols].sum(1))")],
+             "set_mass adds a label under two of the terms twice (several parents): masses above 1",
+             {U + "TestAnswerMasses::test_per_term_and_union": "1.5"}),
+    Mutation("primary_answer_is_the_least_probable",
+             [("key=lambda x: (-x[0], x[1])", "key=lambda x: (x[0], x[1])")],
+             "the alternatives come first and the primary answer last",
+             {U + "TestAnswerMasses::test_by_mass": "assert"}),
+    Mutation("flag_threshold_exclusive",
+             [("\"ambiguous_branches\": [r[\"runner_up_p\"] >= flag_mass for r in rows]",
+               "\"ambiguous_branches\": [r[\"runner_up_p\"] > flag_mass for r in rows]")],
+             "a runner-up exactly at --flag_mass is not flagged (off by one at the boundary)",
+             {U + "TestFlags::test_table_and_threshold_is_inclusive": "assert"}),
+    # ------------------------------------------------------------------ ontology answers
+    Mutation("ontology_mode_never_used",
+             [("onto = sample_rows(folds, anc, args, answers=\"ontology\", max_terms=min(2, args.max_terms))",
+               "onto = sample_rows(folds, anc, args, answers=\"labels\", max_terms=min(2, args.max_terms))")],
+             "--answers ontology silently reruns the labels-only back-off: backoff@onto equals backoff",
+             {U + "TestOntologyAnswers::test_ontology_back_off_answers_the_shared_parent": "assert"}),
 ]
 
 
-def run_on_copy(tmp_path, source, node_ids=()):
+IN_HIERARCHY = {"candidates_allow_any_node", "candidates_min_mass_exclusive", "sets_may_hold_an_ancestor",
+                "union_counts_a_label_twice", "expected_credit_is_plain_mass", "cross_fit_on_own_fold",
+                "cross_fit_infeasible_takes_the_first", "reviewer_credit_takes_the_worst_term",
+                "reviewer_discount_on_every_term", "runner_up_may_be_an_ancestor"}
+
+
+def run_on_copy(tmp_path, source, node_ids=(), hierarchy=None):
     files = {"experiments/set_valued.py": source,
              **{f"experiments/{m}": SCRIPTS / "experiments" / m for m in EXPERIMENT_MODULES},
              **{m: SCRIPTS / m for m in MODULES},
+             **({"hierarchy.py": hierarchy} if hierarchy is not None else {}),
              **{f"tests/{name}": HERE / name for name in TEST_FILES + HELPERS}}
     tests = build_copy(tmp_path, files)
     return run_pytest(tmp_path, tests, node_ids or TEST_FILES, verbose=True)
@@ -133,4 +179,17 @@ def test_unmutated_copy_passes(tmp_path):
 
 @pytest.mark.parametrize("mutation", MUTATIONS, ids=[m.name for m in MUTATIONS])
 def test_mutation_is_caught(mutation, tmp_path):
-    check_caught(mutation, run_on_copy(tmp_path, mutate(SCRIPT, mutation.edits), mutation.caught_by))
+    if mutation.name in IN_HIERARCHY:
+        outcomes = run_on_copy(tmp_path, SCRIPT.read_text(), mutation.caught_by, hierarchy=mutate(HIERARCHY, mutation.edits))
+    else:
+        outcomes = run_on_copy(tmp_path, mutate(SCRIPT, mutation.edits), mutation.caught_by)
+    check_caught(mutation, outcomes)
+
+
+def test_hierarchy_mutations_target_hierarchy():
+    """Every IN_HIERARCHY snippet is in hierarchy.py and no longer in set_valued.py (so it really was moved)."""
+    assert IN_HIERARCHY <= {m.name for m in MUTATIONS}
+    for m in MUTATIONS:
+        if m.name in IN_HIERARCHY:
+            for find, _ in m.edits:
+                assert HIERARCHY.read_text().count(find) == 1 and find not in SCRIPT.read_text(), m.name

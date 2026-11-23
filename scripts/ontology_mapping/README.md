@@ -31,7 +31,7 @@ MicrobeAtlas sample.info.gz ──────┴──2──> metalog_training
 GPT_{keywords,sub_biomes}.txt ─┐                                     │                 │
 unique GPT embeddings (.h5) ───┴──3──> keywords.npz, sub_biomes.npz ─┤                 │
                                                                      ├──5──> metrics, predictions, calibration.json  (cross-validation)
-                                                                     ├──6──> atlas_predictions.tsv.gz  (3.4M samples: term, p, back-off, candidates)
+                                                                     ├──6──> atlas_predictions.tsv.gz  (3.4M samples: term, p, back-off, set answer, flag, candidates)
                                                                      ├──6b─> atlas_coverage.tsv.gz     (outside what Metalog covers?)
                                                                      ├──6c─> atlas_controls.tsv.gz     (blank / mock community?)
                                                                      └──7──> atlas_final.tsv.gz        (optional LLM reranking of the unsure ones)
@@ -200,6 +200,16 @@ is comparable with sample vectors. `.npz` files store each distinct vector once 
 
   Example: P(ocean biome) 0.55, P(marine biome) 0.15, P(freshwater biome) 0.15, τ = 0.8 → *aquatic biome*
   (q = 0.85) rather than a 55 %-sure *ocean biome*.
+- **Several answers** (`hierarchy.SetDecoder`, `--set_max_terms 3`, `--set_discount 0.7`; experiments §21): where
+  the back-off can only abstain because the probability is split between unrelated branches (host-associated vs
+  terrestrial), the answer may be a small set of incomparable slot labels. Per sample, the set of ≤ 3 terms worth
+  the most, 0.7^(terms − 1) × E[credit of its best term] − λ × P(wrong) (credit = IC(term) / IC(gold), IC from
+  the training labels' shares), or nothing when no set is worth more than 0; λ chosen on the other folds for 90 %
+  accuracy (one term of the set is gold or coarser). Out of fold (3 fold seeds): biome answered 100 % (back-off
+  76 %) at exact 48 % (45 %), 27 % of answers sets; feature 71 % (59 %), exact 50 % (50 %); material 88 % (81 %),
+  exact 62 % (67 %). Each sample also gets its unrelated runner-up and `ambiguous_branches` (runner-up ≥ 0.2):
+  5–8 % of samples, 18–28 % of back-off abstentions. ENVO / Uberon terms no curator used are not answers: tested,
+  they replaced most feature labels by equivalent unused terms (exact 49 % → 6 %).
 
 ### 6. Atlas labels
 The model is trained on exactly the evaluated samples (same cap and seed). Scores are split by block, e.g.
@@ -208,7 +218,10 @@ keyword text (1.5M) and sub-biome text (32k) is scored once. `prototype` splits 
 is expanded algebraically); `knn_study` needs similarities to every training sample (slower). With
 `--calibration` (several fold seeds are pooled, `hierarchy.merge_calibrations`) each slot gets `_p`, `_backoff`,
 `_backoff_label`, `_backoff_p`, `_backoff_kind` (`top1` / `coarser` / `abstain`) and `_candidates` (top-5 +
-their broader slot labels, the reranker's options).
+their broader slot labels, the reranker's options). When the calibration has set answers (step 5 default;
+`--no_sets` to skip): `_answer` (the primary term), `_answer_label`, `_answer_p`, `_alternatives` (the other terms
+of a set, `id:p;...`), `_answer_set_p`, `_answer_kind` (`single` / `set` / `none`), `_runner_up`, `_runner_up_p`
+and `_ambiguous_branches`, with the λ and d evaluated in step 5 (about 11 extra minutes for the atlas).
 
 ### 6b. Coverage flag
 `coverage_sim` = cosine to the nearest training sample in the model's space; threshold = 5th percentile of the

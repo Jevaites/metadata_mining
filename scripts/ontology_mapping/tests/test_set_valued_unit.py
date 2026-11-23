@@ -221,8 +221,9 @@ class TestDecodeSlot:
         return out
 
     def run(self, **kw):
-        args = type("Args", (), {"n_candidates": 10, "max_terms": 2, "min_mass": 0.02, "target": 0.9, **kw})
-        return sv.decode_slot(self.folds(), ANC, args)
+        args = type("Args", (), {"n_candidates": 10, "max_terms": 2, "min_mass": 0.02, "target": 0.9,
+                                 "discounts": [0.7, 1.0], "answers": "labels", "flag_top": 5, **kw})
+        return sv.decode_slot(self.folds(), ANC, args)[:4]
 
     def test_back_off_answers_confident_samples_and_abstains_on_split_ones(self):
         rows, answers, outcomes, thresholds = self.run()
@@ -233,7 +234,7 @@ class TestDecodeSlot:
     def test_sets_answer_the_split_samples_and_keep_the_rest(self):
         rows, answers, outcomes, thresholds = self.run()
         split = np.array([i % 20 >= 14 for i in range(40)])
-        for name in ["conformal_m2", "ev_m2", "backoff+set", "ev1+ev2set"]:
+        for name in ["conformal_m2", "ev_m2", "backoff+set", "ev1+ev2set", "evr_d0.7"]:
             assert all(set(a) == {OCEAN, SOIL} for a, s in zip(answers[name], split) if s), name
             assert all(len(a) == 1 for a, s in zip(answers[name], split) if not s), name
         assert (outcomes["backoff+set"][:, 1] == 1).all()  # every answer covers gold
@@ -244,13 +245,145 @@ class TestDecodeSlot:
         rows, answers, outcomes, thresholds = self.run()
         assert all(len(a) == 1 for a in answers["top1"])
         assert set(thresholds) == {"backoff", "conformal_m1", "ev_m1", "conformal_m2", "ev_m2", "backoff+set",
-                                   "backoff+set@0.8", "ev1+ev2set"}
+                                   "backoff+set@0.8", "ev1+ev2set", "evr_d0.7", "evr_d1"}
         assert set(thresholds["backoff"]) == {0, 1}
+
+    def test_reviewer_score_without_discount_answers_sets_everywhere(self):
+        # d = 1: an extra term never lowers the score, so even confident samples get {label, desert}
+        rows, answers, outcomes, thresholds = self.run()
+        assert all(len(a) == 2 for a in answers["evr_d1"])
+        assert all(set(a) == {OCEAN, SOIL} for i, a in enumerate(answers["evr_d1"]) if i % 20 >= 14)
+
+    def test_answers_are_ordered_by_mass(self):
+        rows, answers, outcomes, thresholds = self.run()
+        split = [a for i, a in enumerate(answers["conformal_m2"]) if i % 20 >= 14]
+        assert split and all(a == [OCEAN, SOIL] for a in split)  # ocean .5 before soil .45
 
     def test_max_terms_one_has_no_sets(self):
         rows, answers, outcomes, thresholds = self.run(max_terms=1)
         assert set(answers) == {"top1", "backoff", "conformal_m1", "ev_m1"}
         assert all(len(a) <= 1 for v in answers.values() for a in v)
+
+
+# ----------------------------------------------------------------------------- reviewer score
+class TestReviewerCredit:
+    A = TestSetTable.A  # x under nodes 0 and 1, y under 0, z under 1
+
+    def test_a_set_is_worth_its_best_term_per_label(self):
+        p, share = np.array([.5, .3, .2]), np.array([.5, .25, .25])
+        t = sv.set_table(p, [(0, 1)], self.A, share)
+        ic_node, ic_x, ic_y = -np.log(.75), -np.log(.5), -np.log(.25)
+        # x: best of the two terms (both IC .29) .29/.69; y: only node 0 covers it; z: only node 1
+        expected = .5 * ic_node / ic_x + .3 * ic_node / ic_y + .2 * ic_node / ic_y
+        assert t["reviewer_credit"][0] == pytest.approx(expected)
+        assert t["expected_credit"][0] == pytest.approx(0.0)  # the union covers every label: IC 0, credit 0
+
+    def test_single_terms_score_as_the_credit_score(self):
+        p, share = np.array([.5, .3, .2]), np.array([.5, .25, .25])
+        t = sv.set_table(p, [(0,), (1,)], self.A, share)
+        assert t["reviewer_credit"] == pytest.approx(t["expected_credit"])
+
+
+class TestReviewerValuePick:
+    # single: reviewer credit .5, mass .55; pair: reviewer credit .6, mass .95
+    t = {"reviewer_credit": np.array([.5, .6]), "mass": np.array([.55, .95]), "n_terms": np.array([1, 2])}
+
+    def test_discount_one_takes_the_pair(self):
+        assert sv.reviewer_value_pick(self.t, 1.0, 2, 1.0) == 1  # .5 - .45 vs .6 - .05
+
+    def test_small_discount_keeps_the_single_term(self):
+        assert sv.reviewer_value_pick(self.t, 1.0, 2, 0.05) == 0  # pair .03 - .05 < 0, single .05
+
+    def test_max_terms_and_abstention(self):
+        assert sv.reviewer_value_pick(self.t, 1.0, 1, 1.0) == 0
+        assert sv.reviewer_value_pick(self.t, 20.0, 2, 1.0) == -1
+
+
+# ----------------------------------------------------------------------------- flags and masses
+class TestUnrelatedRunnerUp:
+    def test_skips_ancestors_and_labels_sharing_an_allowed_ancestor(self):
+        vocab = np.array(VOCAB)
+        p = probs({OCEAN: .45, MARINE: .25, FRESHWATER: .2, SOIL: .1})[0]
+        # marine: ancestor of ocean; freshwater: shares the label 'aquatic' with ocean -> soil
+        assert sv.unrelated_runner_up(p, vocab, ANC, {AQUATIC, MARINE, OCEAN, FRESHWATER, SOIL}) == (SOIL, pytest.approx(.1))
+        # if aquatic is not an allowed answer, freshwater is a separate branch
+        assert sv.unrelated_runner_up(p, vocab, ANC, {OCEAN, FRESHWATER, SOIL})[0] == FRESHWATER
+
+    def test_none_within_top(self):
+        vocab = np.array(VOCAB)
+        p = probs({OCEAN: .6, MARINE: .3, AQUATIC: .1})[0]
+        assert sv.unrelated_runner_up(p, vocab, ANC, set(), top=2) == ("", 0.0)
+
+
+class TestAnswerMasses:
+    def row(self):
+        A = TestSetTable.A
+        return {"p": np.array([.5, .3, .2]), "A": A, "col": {"N0": 0, "N1": 1}}
+
+    def test_per_term_and_union(self):
+        per_term, union = sv.answer_masses(self.row(), ["N1", "N0"])
+        assert per_term == pytest.approx([.7, .8]) and union == pytest.approx(1.0)  # x counted once
+        assert sv.answer_masses(self.row(), []) == ([], 0.0)
+
+    def test_by_mass(self):
+        assert sv.by_mass(self.row(), ["N1", "N0"]) == ["N0", "N1"]
+
+
+class TestFlags:
+    def rows(self):
+        base = {"study": "s", "fold": 0, "gold_seen": True, "top1_p": .5}
+        return [{**base, "sample_id": "a", "gold": OCEAN, "top1": OCEAN, "runner_up": SOIL, "runner_up_p": .2},
+                {**base, "sample_id": "b", "gold": SOIL, "top1": OCEAN, "runner_up": SOIL, "runner_up_p": .4},
+                {**base, "sample_id": "c", "gold": SOIL, "top1": SOIL, "runner_up": "", "runner_up_p": 0.0}]
+
+    def test_table_and_threshold_is_inclusive(self):
+        ft = sv.flag_table(self.rows(), [[], [OCEAN], [SOIL]], ANC, 0.2)
+        assert ft["ambiguous_branches"].tolist() == [True, True, False]
+        assert ft["backoff"].tolist() == ["", OCEAN, SOIL]
+
+    def test_summary(self):
+        ft = sv.flag_table(self.rows(), [[], [OCEAN], [SOIL]], ANC, 0.2)
+        s = sv.flag_summary(ft, ANC)
+        assert s["flagged"] == pytest.approx(2 / 3) and s["flagged_among_abstentions"] == 1.0
+        assert s["top1_right_if_flagged"] == .5 and s["runner_up_right_if_flagged"] == .5
+        assert s["either_right_if_flagged"] == 1.0
+
+
+# ----------------------------------------------------------------------------- ontology terms as answers
+class TestOntologyAnswers:
+    """8 labels under a non-label ENVO_big (80 % of the labels: never an answer) and 2 labels under a non-label
+    ENVO_small (20 % < Closure's 25 % floor: an answer in 'ontology' mode only). 6 split samples per fold put .5 / .45
+    on the two small labels (half of their top-1s wrong, so answering them breaks the 90 % target): with labels only
+    the back-off abstains on them, with ontology terms it answers ENVO_small."""
+    BIG = [f"ENVO_b{i}" for i in range(8)]
+    SMALL = ["ENVO_s1", "ENVO_s2"]
+    VOC = np.array(sorted(BIG + SMALL))
+    ANC2 = {**{b: {"ENVO_big"} for b in BIG}, **{t: {"ENVO_small"} for t in SMALL}, "ENVO_big": set(), "ENVO_small": set()}
+
+    def folds(self):
+        out = []
+        for k in range(2):
+            rows, gold = [], []
+            for i in range(16):
+                g = self.VOC[i % 10]
+                rows.append({g: .95, self.VOC[(i + 1) % 10]: .05}); gold.append(g)
+            for i in range(6):
+                rows.append({"ENVO_s1": .5, "ENVO_s2": .45, "ENVO_b0": .05}); gold.append(self.SMALL[i % 2])
+            P = np.array([[r.get(v, 0.0) for v in self.VOC] for r in rows])
+            out.append({"P": P, "vocab": self.VOC, "gold": np.array(gold),
+                        "sample_id": np.array([f"f{k}_{i}" for i in range(22)]),
+                        "study": np.array([f"st{k}_{i // 2}" for i in range(22)])})
+        return out
+
+    def test_ontology_back_off_answers_the_shared_parent(self):
+        args = type("Args", (), {"n_candidates": 10, "max_terms": 2, "min_mass": 0.02, "target": 0.9,
+                                 "discounts": [1.0], "answers": "ontology", "flag_top": 5})
+        rows, answers, outcomes, thresholds, source = sv.decode_slot(self.folds(), self.ANC2, args)
+        split = [i % 22 >= 16 for i in range(44)]
+        assert all(a == [] for a, s_ in zip(answers["backoff"], split) if s_)
+        assert all(a == ["ENVO_small"] for a, s_ in zip(answers["backoff@onto"], split) if s_)
+        assert "backoff+set@onto" in answers and source["backoff@onto"] is not rows
+        assert "ENVO_small" not in {t for a in answers["evr_d1"] for t in a}  # other methods keep the labels
 
 
 # ----------------------------------------------------------------------------- small helpers
