@@ -27,6 +27,7 @@ Run (from the repository root or from scripts/ontology_mapping):
                                                                        one row per distinct cleaned text)
   --term_vectors               4_embed_terms.py                    .h5: texts = 'label; synonym; ...', embeddings
   --calibration                5_evaluate.py                       JSON: {slot: {method: {temperature, curve, settings}}}
+                                                                   (+ "sets" with add_set_calibration)
                                                                        (the real file also has p_top1_quantiles: unused here)
 """
 import gzip
@@ -126,6 +127,25 @@ def write_calibration(p, method, temperature, curve, settings, slots=("biome", "
     entry = {"temperature": temperature, "curve": rows, "settings": {"method": method, **settings}}
     with open(p, "w") as handle:
         json.dump({slot: {method: entry} for slot in slots}, handle)
+    return p
+
+
+def add_set_calibration(p, label_counts, curve=((0.0, 1.0, 0.7), (1.0, 0.9, 0.92), (3.0, 0.5, 0.99)),
+                        discount=0.7, max_terms=3):
+    """Add the "sets" part of 5_evaluate.py's calibration.json (--set_max_terms) to every slot and method of the file
+    at p. label_counts: {slot: {label: training samples}}; curve: [(lambda, answered, accuracy)] (strict = lenient)."""
+    data = json.load(open(p))
+    rows = [{"lambda": lam, "answered": ans, "strict": round(ans * acc, 4), "lenient": round(ans * acc, 4),
+             "exact": round(ans * acc, 4), "set": 0.1, "accuracy_strict": acc, "accuracy_lenient": acc}
+            for lam, ans, acc in curve]
+    settings = {"discount": discount, "max_terms": max_terms, "n_candidates": 10, "min_mass": 0.02, "target": 0.9,
+                "metric": "strict", "flag_top": 5, "flag_mass": 0.2}
+    for slot, methods in data.items():
+        for entry in methods.values():
+            entry["sets"] = {"settings": settings, "lambda_per_fold": [1.0], "lambda_all": 1.0, "curve": rows,
+                             "label_counts": label_counts[slot]}
+    with open(p, "w") as handle:
+        json.dump(data, handle)
     return p
 
 

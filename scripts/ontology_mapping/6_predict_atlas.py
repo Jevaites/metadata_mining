@@ -43,6 +43,19 @@ tau per slot = the lowest tau whose out-of-fold accuracy (--accuracy strict: the
 coarser true term; lenient: also a more specific one) reaches --target_accuracy in 5_evaluate's curve.
 The accuracy is that of Metalog-like studies; check it on hand-labelled atlas samples before relying on it.
 
+Several answers (when calibration.json has "sets": 5_evaluate.py --set_max_terms, default; --no_sets to skip;
+hierarchy.SetDecoder, experiments README §21): one term, a small set of incomparable terms (probability split between
+unrelated branches) or nothing, by the reviewer-score expected value with the evaluated discount d and up to 3 terms;
+lambda = the one answering most out-of-fold samples at --target_accuracy (--accuracy) in the pooled set curve.
+  <slot>_answer             the primary term (the most probable of the answer's terms); "" = no answer
+  <slot>_answer_label / _answer_p   its label / summed probability
+  <slot>_alternatives       the other terms of a set answer with their summed probabilities, "id:p;id:p"
+  <slot>_answer_set_p       summed probability of the whole answer (each label once)
+  <slot>_answer_kind        single, set or none
+  <slot>_runner_up / _runner_up_p   the most probable of the next labels after the top-1 that is unrelated to it
+                            (neither ancestor nor descendant, no allowed answer above both)
+  <slot>_ambiguous_branches runner-up probability >= the evaluated --flag_mass (0.2): worth a look
+
 Resumable: model.npz, index.npz and every finished chunk are kept in --output_dir, and
 --max_seconds stops cleanly; rerun the same command to continue. Delete --output_dir
 to retrain (for example after changing the training options).
@@ -211,6 +224,8 @@ def load_backoff(args, model, terms, out_dir):
     run = {"calibration": [file_md5(p) for p in args.calibration] if args.calibration else None,  # content, not path
            "target_accuracy": args.target_accuracy, "accuracy": args.accuracy, "topk": args.topk,
            "max_candidates": args.max_candidates}
+    if getattr(args, "no_sets", False):
+        run["no_sets"] = True  # only when set: output dirs of runs from before the set answers still resume
     settings_path = os.path.join(out_dir, "run_settings.json")
     if os.path.exists(settings_path):
         previous = json.load(open(settings_path))
@@ -260,6 +275,54 @@ def load_backoff(args, model, terms, out_dir):
     return out
 
 
+def load_set_decoders(args, model, terms):
+    """Per slot: (hierarchy.SetDecoder over the model's labels, lambda, flag_mass, flag_top) from the "sets" part of
+    the calibration.json files (pooled over fold seeds); {} if they have none or --no_sets. The label counts of the
+    calibration must be those of the model's labels (the same training samples)."""
+    if not args.calibration or args.no_sets:
+        return {}
+    calibrations = [json.load(open(path(p))) for p in args.calibration]
+    anc = term_ancestors(terms)
+    out = {}
+    for slot in SLOTS:
+        sets = hierarchy.merge_set_calibrations([c[slot][args.method] for c in calibrations])
+        if sets is None:
+            print(f"{slot}: calibration.json has no set answers (5_evaluate.py from before --set_max_terms): skipped")
+            continue
+        classes = model[f"{slot}_classes"]
+        if set(sets["label_counts"]) != set(classes):
+            raise SystemExit(f"the set calibration of {slot} counts other labels than the model's: not the same training set")
+        st = sets["settings"]
+        lam = hierarchy.choose_lambda(sets["curve"], args.target_accuracy, f"accuracy_{args.accuracy}")
+        row = next(r for r in sets["curve"] if r["lambda"] == lam)
+        print(f"{slot}: set answers d {st['discount']}, <= {st['max_terms']} terms, lambda {lam} -> out-of-fold answered "
+              f"{row['answered']:.2f}, accuracy {row['accuracy_' + args.accuracy]:.3f}, exact {row['exact']:.2f}, "
+              f"sets {row['set']:.2f}")
+        closure = hierarchy.Closure(classes, anc)
+        decoder = hierarchy.SetDecoder(closure, hierarchy.label_share(classes, sets["label_counts"]), st["max_terms"],
+                                       st["discount"], st["n_candidates"], st["min_mass"])
+        out[slot] = (decoder, lam, st["flag_mass"], st["flag_top"])
+    return out
+
+
+def set_columns(scores, T, slot_sets, label_of):
+    """The set-answer columns of one slot for a chunk (see the module docstring)."""
+    decoder, lam, flag_mass, flag_top = slot_sets
+    prob = hierarchy.softmax(scores.astype(np.float64), T)
+    terms, masses, total = decoder.decode(prob, lam)
+    nodes = np.append(decoder.closure.nodes.astype(object), "")  # index -1 -> ""
+    ru, ru_p = decoder.runner_up(prob, flag_top)
+    classes = np.append(np.asarray(decoder.closure.vocab, dtype=object), "")
+    n_terms = (terms >= 0).sum(1)
+    return {"answer": nodes[terms[:, 0]], "answer_label": [label_of.get(t, "") for t in nodes[terms[:, 0]]],
+            "answer_p": np.round(masses[:, 0], 4),
+            "alternatives": [";".join(f"{nodes[t]}:{m:.4g}" for t, m in zip(row[1:], mr[1:]) if t >= 0)
+                             for row, mr in zip(terms, masses)],
+            "answer_set_p": np.round(total, 4),
+            "answer_kind": np.where(n_terms == 0, "none", np.where(n_terms == 1, "single", "set")),
+            "runner_up": classes[ru], "runner_up_p": np.round(ru_p, 4), "ambiguous_branches": ru_p >= flag_mass}
+
+
 def candidate_strings(P, classes, k, broader, max_candidates):
     """Per row 'id:p;id:p;...': the k most probable classes, then the classes that are broader terms of
     those (broader[c] = their indices), most probable first, up to max_candidates in all
@@ -304,6 +367,8 @@ def main():
     parser.add_argument("--topk", type=int, default=5, help="With --calibration: top terms written in <slot>_candidates (0 = none)")
     parser.add_argument("--max_candidates", type=int, default=10,
                         help="<slot>_candidates: top-k + their broader slot labels, up to this many (= --topk: no broader terms)")
+    parser.add_argument("--no_sets", action="store_true",
+                        help="With --calibration: skip the set answers (<slot>_answer ... columns)")
     parser.add_argument("--chunk_rows", type=int, default=20_000, help="Keyword .h5 rows per chunk (memory)")
     parser.add_argument("--max_seconds", type=float, default=None, help="Stop after this long (resume later)")
     args = parser.parse_args()
@@ -318,6 +383,7 @@ def main():
     if not args.calibration:
         args.topk = 0
     backoff = load_backoff(args, model, terms, out_dir)
+    sets = load_set_decoders(args, model, terms) if backoff else {}
     with h5py.File(path(args.sub_biomes_h5), "r") as handle:
         sb = BLOCK_WEIGHT * normalize(handle["embeddings"][:])  # all distinct sub-biome texts (32k x 1024)
     parts = sub_biome_parts(args.method, model, sb)
@@ -348,6 +414,8 @@ def main():
                     best[slot], confidence[slot] = top1_and_margin(scores)
                     if backoff:
                         extra[slot] = backoff_columns(scores, backoff[slot], model[f"{slot}_classes"], label_of, args)
+                    if slot in sets:
+                        extra[slot].update(set_columns(scores, backoff[slot][0], sets[slot], label_of))
             for slot in SLOTS:
                 terms_out = model[f"{slot}_classes"][best[slot]]
                 out[slot], out[f"{slot}_label"] = terms_out, [label_of.get(t, "") for t in terms_out]

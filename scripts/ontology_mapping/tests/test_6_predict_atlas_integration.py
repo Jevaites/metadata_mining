@@ -41,6 +41,7 @@ WORKFLOW (what main() does, and what the tests below check stage by stage) -----
 Stages 1-3 are cached: rerunning the same command resumes (and never recomputes a finished part).
 """
 import gzip
+import json
 import os
 
 import numpy as np
@@ -48,7 +49,7 @@ import pandas as pd
 import pytest
 
 from common import load_terms
-from step6_toy import (predict, read_predictions, run_predict,  # noqa: F401  (predict: a fixture)
+from step6_toy import (add_set_calibration, predict, read_predictions, run_predict,  # noqa: F401  (predict: fixture)
                         write_calibration, write_sample_vectors, write_samples,
                        write_terms, write_text_embeddings, write_texts)
 
@@ -133,6 +134,13 @@ class Toy:
         return write_calibration(self.root / name, method, temperature, [(0.5, 0.95), (0.8, 0.99)], settings)
 
 
+LABEL_COUNTS = {"biome": {"ENVO_FOREST": 2, "ENVO_GRASSLAND": 2, "ENVO_MARINE": 3},  # the TRAINING labels
+                "feature": {"ENVO_WOODLAND": 2, "ENVO_MEADOW": 2, "ENVO_OCEAN": 2},
+                "material": {"ENVO_LITTER": 2, "ENVO_SOIL": 2, "ENVO_SEAWATER": 3}}
+SET_COLUMNS = ["answer", "answer_label", "answer_p", "alternatives", "answer_set_p", "answer_kind", "runner_up",
+               "runner_up_p", "ambiguous_branches"]
+
+
 @pytest.fixture
 def toy(tmp_path):
     return Toy(tmp_path)
@@ -141,6 +149,63 @@ def toy(tmp_path):
 def answers(table):
     """{sample_id: (biome, feature, material)} of a prediction table."""
     return {s: (r["biome"], r["feature"], r["material"]) for s, r in table.iterrows()}
+
+
+# ============================================================================= several answers
+class TestSetAnswers:
+    """With a calibration.json that has "sets" (5_evaluate.py --set_max_terms), every slot also gets the SET_COLUMNS.
+    The toy curve: lambda 0 answers all at 70 %, lambda 1 answers 90 % at 92 %, lambda 3 half at 99 % -> lambda 1
+    for the 0.9 target."""
+
+    def test_a_confident_model_answers_its_single_top1(self, predict, toy, capsys):
+        cal = add_set_calibration(toy.calibration(temperature=0.001), LABEL_COUNTS)
+        run_predict(predict, *toy.argv("out", "linear", "--calibration", cal))
+        assert "lambda 1.0 -> out-of-fold answered 0.90" in capsys.readouterr().out
+        table = read_predictions(toy.root / "out")
+        assert list(table.columns[9:18]) == [f"biome_{c}" for c in SET_COLUMNS]  # after the 9 back-off columns
+        assert len(table.columns) == 54  # 18 per slot
+        assert (table["biome_answer"] == table["biome"]).all() and set(table["biome_answer_kind"]) == {"single"}
+        assert set(table["biome_answer_p"]) == {"1.0"} and set(table["biome_alternatives"]) == {""}
+        assert table.loc["A_FOREST", "biome_answer_label"] == "forest biome"
+        assert set(table["material_ambiguous_branches"]) == {"False"}
+
+    def test_an_unsure_model_answers_the_set_of_its_labels(self, predict, toy):
+        # T huge: every label 1/3. One term is worth 1/3 - lambda * 2/3 < 0, a pair .7 * 2/3 - 1/3 = .13, the three
+        # labels .49 * 1 = .49: the answer is all three (always right), where the back-off abstains
+        cal = add_set_calibration(toy.calibration(temperature=1e6), LABEL_COUNTS)
+        run_predict(predict, *toy.argv("out", "linear", "--calibration", cal))
+        table = read_predictions(toy.root / "out")
+        assert set(table["biome_backoff_kind"]) == {"abstain"} and set(table["biome_answer_kind"]) == {"set"}
+        assert set(table["biome_answer_set_p"]) == {"1.0"} and set(table["biome_answer_p"]) == {"0.3333"}
+        row = table.loc["A_FOREST"]
+        assert {row["biome_answer"]} | {a.split(":")[0] for a in row["biome_alternatives"].split(";")} == \
+            set(LABEL_COUNTS["biome"])
+        assert set(table["biome_ambiguous_branches"]) == {"True"}  # runner-up 1/3 >= 0.2
+
+    def test_no_sets_option(self, predict, toy):
+        cal = add_set_calibration(toy.calibration(), LABEL_COUNTS)
+        run_predict(predict, *toy.argv("out", "linear", "--calibration", cal, "--no_sets"))
+        assert len(read_predictions(toy.root / "out").columns) == 27
+        assert json.load(open(toy.root / "out" / "run_settings.json"))["no_sets"] is True
+
+    def test_calibration_without_sets_gives_the_back_off_columns_only(self, predict, toy, capsys):
+        run_predict(predict, *toy.argv("out", "linear", "--calibration", toy.calibration()))
+        assert len(read_predictions(toy.root / "out").columns) == 27
+        assert "calibration.json has no set answers" in capsys.readouterr().out
+        assert "no_sets" not in json.load(open(toy.root / "out" / "run_settings.json"))  # old output dirs resume
+
+    def test_label_counts_of_another_training_set_are_refused(self, predict, toy):
+        counts = {**LABEL_COUNTS, "biome": {"ENVO_FOREST": 2, "ENVO_MARINE": 3}}
+        cal = add_set_calibration(toy.calibration(), counts)
+        with pytest.raises(SystemExit, match="counts other labels than the model's"):
+            run_predict(predict, *toy.argv("out", "linear", "--calibration", cal))
+
+    def test_several_calibrations_are_pooled(self, predict, toy, capsys):
+        # fold seed 1 reaches 0.9 only at lambda 3; seed 2 at lambda 1 (.96); pooled at lambda 1: (.86 + .96) / 2
+        a = add_set_calibration(toy.calibration("a.json"), LABEL_COUNTS, curve=((0.0, 1.0, .7), (1.0, .9, .86), (3.0, .5, .99)))
+        b = add_set_calibration(toy.calibration("b.json"), LABEL_COUNTS, curve=((0.0, 1.0, .7), (1.0, .9, .96), (3.0, .5, .99)))
+        run_predict(predict, *toy.argv("out", "linear", "--calibration", a, b))
+        assert "lambda 1.0 -> out-of-fold answered 0.90, accuracy 0.910" in capsys.readouterr().out
 
 
 # ============================================================================= the basic workflow

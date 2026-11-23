@@ -87,7 +87,8 @@ MUTATIONS = [
              "so the atlas vote can differ from the evaluated methods.knn_study",
              [U + "TestScoreDecomposition::test_knn_study_chunk_ties_among_identical_training_vectors"]),
     Mutation("accuracy_option_ignored",
-             'f"accuracy_{args.accuracy}")', '"accuracy_strict")',
+             'args.target_accuracy, f"accuracy_{args.accuracy}")\n        row = next(r for r in c["curve"]',
+             'args.target_accuracy, "accuracy_strict")\n        row = next(r for r in c["curve"]',
              "--accuracy lenient silently uses the strict curve: a higher tau, more back-off than asked for",
              [U + "TestLoadBackoff::test_accuracy_option_chooses_the_curve_column"]),
     # ------------------------------------------------------------------ the two bugs fixed on 2026-10-19
@@ -112,6 +113,26 @@ MUTATIONS = [
              "knn_study: k >= the number of training samples crashes in np.argpartition",
              [U + "TestKnnStudyTop2::test_k_larger_than_the_training_set_means_every_sample_votes",
               I + "TestSmallVocabulariesAndLargeK::test_knn_study_with_k_larger_than_the_training_set"]),
+    # ------------------------------------------------------------------ several answers
+    Mutation("set_answers_without_temperature",
+             "extra[slot].update(set_columns(scores, backoff[slot][0], sets[slot], label_of))",
+             "extra[slot].update(set_columns(scores, 1.0, sets[slot], label_of))",
+             "the set answers use uncalibrated probabilities (T = 1 on cosines ~0.2): every sample looks unsure",
+             [I + "TestSetAnswers::test_a_confident_model_answers_its_single_top1"]),
+    Mutation("set_lambda_ignores_the_target",
+             'lam = hierarchy.choose_lambda(sets["curve"], args.target_accuracy, f"accuracy_{args.accuracy}")',
+             'lam = sets["curve"][0]["lambda"]',
+             "the boldest lambda is used whatever --target_accuracy: the atlas answers more but at 70 % accuracy",
+             [I + "TestSetAnswers::test_a_confident_model_answers_its_single_top1"]),
+    Mutation("set_label_counts_not_checked",
+             "        if set(sets[\"label_counts\"]) != set(classes):\n",
+             "        if False:\n",
+             "a calibration of another training set gives the labels wrong information contents, silently",
+             [I + "TestSetAnswers::test_label_counts_of_another_training_set_are_refused"]),
+    Mutation("set_primary_is_an_alternative",
+             '"answer": nodes[terms[:, 0]]', '"answer": nodes[terms[:, -1]]',
+             "the atlas <slot>_answer column holds the least probable term of a set (or nothing for one term)",
+             [U + "TestSetColumns::test_single_set_and_none"]),
 ]
 
 

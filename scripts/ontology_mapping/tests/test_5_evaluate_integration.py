@@ -45,7 +45,9 @@ OPEN_METHODS = ["retrieval_open", "hybrid_open", "prototype_open"]
 ALL_METHODS = ["majority"] + CLOSED_METHODS + OPEN_METHODS
 # predictions.tsv.gz header, as in the real ontology_mapping/cv_backoff/predictions.tsv.gz
 PREDICTION_COLUMNS = ["sample_id", "study_code", "domain", "slot", "method", "top5", "confidence", "gold_seen_in_train",
-                      "gold", "prob", "backoff", "backoff_q", "pred", "gold_label", "pred_label", "backoff_label"]
+                      "gold", "prob", "backoff", "backoff_q", "answer", "answer_masses", "answer_mass", "answer_kind",
+                      "runner_up", "runner_up_p", "ambiguous_branches", "pred", "gold_label", "pred_label", "backoff_label",
+                      "answer_label"]
 
 
 def run_main(paths, *options):
@@ -194,6 +196,33 @@ def test_basic_calibration_for_step_6(basic_run):
             assert entry["temperature"] > 0
             assert {"tau", "coverage", "accuracy_strict", "accuracy_lenient", "exact"} <= set(entry["curve"][0])
             assert set(entry["p_top1_quantiles"]) == {"0.1", "0.2", "0.3", "0.4", "0.5"}
+
+
+def test_basic_set_answers_are_the_single_right_term(basic_run):
+    # several answers (default --set_max_terms 3): the classifier is always right and sure, so every answer is its
+    # single top-1 term; methods without back-off leave the set columns empty
+    metrics, calibration, predictions = basic_run
+    backed = predictions[predictions["method"].isin(["prototype", "linear"])]
+    assert (backed["answer"] == backed["gold"]).all() and (backed["answer_label"] == backed["gold_label"]).all()
+    assert set(backed["answer_kind"]) == {"single"} and (backed["answer_mass"].astype(float) > 0.5).all()
+    assert set(backed["ambiguous_branches"]) == {"False"}
+    others = predictions[~predictions["method"].isin(["prototype", "linear"])]
+    assert (others[ev.SET_COLUMNS + ["answer_label"]] == "").all().all()
+    for slot in ev.SLOTS:
+        for method in ("prototype", "linear"):
+            report = metrics[slot][method]["backoff"]["sets"]
+            assert report["answered"] == 1.0 and report["exact"] == 1.0 and report["set"] == 0.0
+            entry = calibration[slot][method]["sets"]
+            labelled = predictions[(predictions["slot"] == slot) & (predictions["method"] == method)]
+            assert entry["label_counts"] == labelled["gold"].value_counts().to_dict()  # for 6_predict_atlas.py
+            assert {"lambda", "answered", "accuracy_strict", "accuracy_lenient", "exact", "set"} <= set(entry["curve"][0])
+
+
+def test_set_answers_switched_off(tmp_path):
+    paths = toy.write_project(tmp_path)
+    metrics, calibration, predictions = run_main(paths, *embedding_options(paths), "--set_max_terms", "0")
+    assert list(predictions.columns) == [c for c in PREDICTION_COLUMNS if c not in ev.SET_COLUMNS + ["answer_label"]]
+    assert "sets" not in metrics["biome"]["linear"]["backoff"] and "sets" not in calibration["biome"]["linear"]
 
 
 # =============================================================================================== edge cases

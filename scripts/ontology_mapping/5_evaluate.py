@@ -44,7 +44,20 @@ Outputs in --output_dir:
                     --calibration and 7_rerank_atlas.py fit)
   predictions.tsv.gz one row per test sample x slot x method: gold, top-1, top-5, confidence; back-off
                     methods also: prob (calibrated top-1 probability), backoff (answer at
-                    --backoff_target, "" = abstain), backoff_q (its summed probability)
+                    --backoff_target, "" = abstain), backoff_q (its summed probability), and the set answers below
+
+Several answers (--set_max_terms, default 3; 0 = off; hierarchy.SetDecoder; experiments README §21): per
+sample, the set of <= --set_max_terms incomparable slot labels worth the most, d ** (terms - 1) * E[credit of
+the set's best term] - lambda * P(wrong) (d = --set_discount, credit = min(1, IC(term) / IC(gold)), IC from the
+training labels' shares), or nothing when no set is worth more than 0. Usually one term; a set where the
+probability is split between unrelated branches. lambda is chosen on the other folds (the most answers at
+--backoff_target accuracy, --backoff_metric: one term of the set is gold or coarser). Columns: answer ('||'-joined,
+the most probable term first: the primary answer, then the alternatives), answer_label, answer_masses (each term's
+summed probability), answer_mass (the whole answer's, each label once), answer_kind (single / set / none),
+runner_up / runner_up_p (the most probable of the next --flag_top labels unrelated to the top-1: neither its
+ancestor nor descendant, no allowed answer above both) and ambiguous_branches (runner_up_p >= --flag_mass).
+metrics.json gets "sets" (lambda per fold, answered / accuracy / exact / sets shares, flags) and calibration.json
+"sets" (settings, the pooled curve per lambda, the label counts) for 6_predict_atlas.py.
 
 python 5_evaluate.py \
   --ontology_terms ~/MicrobeAtlasProject/ontology_terms.tsv.gz \
@@ -184,12 +197,16 @@ def score(g, parents, term_vector_of, ancestors):
 
 
 # ----------------------------------------------------------------------------- back-off
+SET_COLUMNS = ["answer", "answer_masses", "answer_mass", "answer_kind", "runner_up", "runner_up_p", "ambiguous_branches"]
+
+
 def backoff_all(backoff_folds, ancestors, args, n_samples):
     """Calibrated probabilities + hierarchical back-off for every (slot, method) in --backoff_methods
     (hierarchy.oof_backoff). -> (report per (slot, method) for metrics.json,
     calibration.json content for 6_predict_atlas.py, per (row, slot, method): prob = calibrated top-1
     probability, backoff = the answer at --backoff_target (tau chosen on the other folds; "" =
-    abstain), backoff_q = its summed probability)."""
+    abstain), backoff_q = its summed probability, and with --set_max_terms the SET_COLUMNS of
+    hierarchy.answer_columns, lambda chosen on the other folds)."""
     reports, calibration, extra = {}, {}, {}
     name = f"{args.backoff_metric}_{args.backoff_target}"  # e.g. "strict_0.9"
     targets = sorted(set(args.backoff_targets) | {args.backoff_target})
@@ -207,6 +224,27 @@ def backoff_all(backoff_folds, ancestors, args, n_samples):
                 extra[(r, slot, method)] = {"prob": round(float(p), 4), "backoff": C.nodes[k] if k >= 0 else "",
                                             "backoff_q": round(float(qq), 4)}
         p_top1 = np.concatenate(p_top1)
+        sets = None
+        if args.set_max_terms > 0:
+            sets_report, curve, decoded = hierarchy.oof_sets(
+                fitted, folds, ancestors, args.backoff_target, args.backoff_metric, args.set_discount,
+                args.set_max_terms, args.set_candidates, args.set_min_mass, args.flag_top)
+            abstain = []
+            for f, d in zip(folds, decoded):
+                columns = hierarchy.answer_columns(d["terms"], d["masses"], d["set_mass"], d["nodes"], d["runner_up"],
+                                                   d["runner_up_p"], args.flag_mass)
+                for i, r in enumerate(f["rows"]):
+                    extra[(r, slot, method)].update({c: v[i] for c, v in columns.items()})
+                    abstain.append(extra[(r, slot, method)]["backoff"] == "")
+            flagged = np.concatenate([np.asarray(d["runner_up_p"]) >= args.flag_mass for d in decoded])
+            abstain = np.array(abstain)
+            sets_report["flagged"] = round(float(flagged.mean()), 4)
+            sets_report["flagged_among_backoff_abstentions"] = round(float(flagged[abstain].mean()), 4) if abstain.any() else None
+            sets_report["settings"]["flag_mass"] = args.flag_mass
+            report["sets"] = sets_report
+            sets = {"settings": sets_report["settings"], "lambda_per_fold": sets_report["lambda_per_fold"],
+                    "lambda_all": sets_report["lambda_all"], "curve": curve,
+                    "label_counts": dict(sorted(Counter(g for f in folds for g in f["gold"]).items()))}
         calibration.setdefault(slot, {})[method] = {
             "temperature": report["temperature_all"],
             "curve": report["curve"],  # pooled out-of-fold outcome shares per tau: pick tau for any target
@@ -216,6 +254,8 @@ def backoff_all(backoff_folds, ancestors, args, n_samples):
                          "fold_groups": args.fold_groups,
                          "prototype_alpha": args.prototype_alpha if method == "prototype" else 0,
                          "prototype_beta": args.prototype_beta}}
+        if sets:
+            calibration[slot][method]["sets"] = sets
     return reports, calibration, extra
 
 
@@ -230,6 +270,12 @@ def print_backoff(backoff, metrics, targets):
             st, le = r[f"strict_{t}"], r[f"lenient_{t}"]
             cells.append(f"@{t}: strict cov {st['coverage']:.2f} exact {st['exact']:.2f} | lenient cov {le['coverage']:.2f}")
         print(f"  {slot:8} {method:15} top1 {metrics[slot][method]['top1']:.3f} T {r['temperature_all']:.3f} | " + " || ".join(cells))
+    sets = [(k, r["sets"]) for k, r in sorted(backoff.items()) if "sets" in r]
+    if sets:
+        print("\nSeveral answers (lambda chosen on the other folds; shares of all samples, accuracy among answered)")
+        for (slot, method), r in sets:
+            print(f"  {slot:8} {method:15} answered {r['answered']:.2f} accuracy {r['accuracy_strict']:.3f} "
+                  f"exact {r['exact']:.2f} sets {r['set']:.2f} | flagged {r['flagged']:.2f}")
 
 
 # ----------------------------------------------------------------------------- one fold
@@ -326,6 +372,17 @@ def main():
                         help="Target accuracy of the backoff column in predictions.tsv.gz")
     parser.add_argument("--backoff_metric", choices=["strict", "lenient"], default="strict",
                         help="strict: the answer is gold or a coarser true term; lenient: also a more specific term")
+    parser.add_argument("--set_max_terms", type=int, default=3,
+                        help="Several answers: up to this many terms per answer (0 = no set answers; 1 = one term "
+                             "or none, chosen by expected value)")
+    parser.add_argument("--set_discount", type=float, default=0.7,
+                        help="Several answers: worth of a set x this per term beyond the first (README §21: 0.7)")
+    parser.add_argument("--set_candidates", type=int, default=10, help="Several answers: candidate terms per sample")
+    parser.add_argument("--set_min_mass", type=float, default=0.02,
+                        help="Several answers: least summed probability of a candidate term")
+    parser.add_argument("--flag_mass", type=float, default=0.2,
+                        help="ambiguous_branches: the unrelated runner-up has at least this probability")
+    parser.add_argument("--flag_top", type=int, default=5, help="Labels after the top-1 searched for the runner-up")
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--fold_seed", type=int, default=0, help="Which study-to-fold assignment (see study_folds)")
     parser.add_argument("--fold_groups", default=None,
@@ -374,7 +431,7 @@ def main():
     pred["gold"] = [samples.at[r, s] for r, s in zip(pred["row"], pred["slot"])]
     ancestors = term_ancestors(terms)
     backoff, calibration, extra = backoff_all(backoff_folds, ancestors, args, len(samples))
-    for column in ["prob", "backoff", "backoff_q"]:
+    for column in ["prob", "backoff", "backoff_q"] + (SET_COLUMNS if args.set_max_terms > 0 else []):
         pred[column] = [extra.get((r, s, m), {}).get(column, "") for r, s, m in zip(pred["row"], pred["slot"], pred["method"])]
     info = samples.loc[pred["row"], ["sample_id", "study_code", "domain"]].reset_index(drop=True)
     pred = pd.concat([info, pred.drop(columns="row")], axis=1)
@@ -393,6 +450,8 @@ def main():
     pred["pred"] = pred["top5"].str[0]
     pred["gold_label"], pred["pred_label"] = pred["gold"].map(label_of), pred["pred"].map(label_of)
     pred["backoff_label"] = pred["backoff"].map(label_of).fillna("")
+    if args.set_max_terms > 0:
+        pred["answer_label"] = ["||".join(label_of.get(t, "") for t in a.split("||")) if a else "" for a in pred["answer"]]
     pred["top5"] = pred["top5"].str.join("||")
     pred.to_csv(os.path.join(out_dir, "predictions.tsv.gz"), sep="\t", index=False)
 

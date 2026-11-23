@@ -21,8 +21,8 @@ folds, ≤ 50 samples per study (17.7k samples, 539 studies). Biome excludes hum
 | 6 | Does cleaning Metalog help? | `cleaning_effect.py`, `selective_prediction.py` | Not the model; it changes the measurement. Confidence triage works |
 | 7 | Does hierarchical back-off (+ reranking) help? | `hierarchical_backoff.py`, `draft_biome_label_map.py` | Back-off: +20–30 % coverage at equal accuracy on biome; the biome label map is the larger gain |
 | 7c | Does a real LLM reranker help? | `rerank_pilot.py` | Biome and feature, a little (+2 points overall top-1); material no |
-| 7d | Can Jev (TypeSafe) rerank, choose from the whole slot vocabulary, or walk the ontology top-down? | `jev_pilot.py`, `jev_questions.py`, `jev_baselines.py`, `jev_analyses.py`, `jev_followups.py` | Rerank: as good as gpt-4.1-mini, cheaper and faster; gated (30 %) +3 / +2 / +1 points overall on random samples, ungated it hurts feature. Whole vocabulary: far below the prototype; vs our best zero-shot retrieval better on biome / material, worse on feature; as extra candidates only +0–2.4 points over the prototype's next 3. Top-down: worst, also on random samples |
-| 8 | Does the atlas back-off hold outside Metalog? | `gold_check_extract.sh`, `gold_check.py` | At the coarse level, yes for animal / soil / water; abstains more out of domain |
+| 7d | Can Jev (TypeSafe) rerank, choose from the whole slot vocabulary, or walk the ontology top-down? | `jev_pilot.py`, `jev_questions.py`, `jev_baselines.py`, `jev_analyses.py`, `jev_followups.py`, `jev_open_topdown.py` (+ `curated_top_layer.tsv`, `run_jev_followups.sh`) | Rerank: as good as gpt-4.1-mini, cheaper and faster; gated (30 %) +3 / +2 / +1 points overall on random samples, ungated it hurts feature. Whole vocabulary: far below the prototype; vs our best zero-shot retrieval better on biome / material, worse on feature; as extra candidates only +0–2.4 points over the prototype's next 3. Top-down: worst over the slot trees and the whole open ontology; with a curated top layer on par with open + similar samples for feature, a little under for material, and best so far on gated unseen material (CIs include 0) |
+| 8 | Does the atlas back-off hold outside Metalog? | `gold_check_extract.sh`, `gold_check.py`, `gold_check_sets.py` | At the coarse level, yes for animal / soil / water; abstains more out of domain. Set answers: biome 100 % answered (back-off 58 %), a right term in 98 % of the sets but sets are realm choices |
 | 9 | Do sister studies leak across folds? | `project_groups.py`, `5_evaluate.py --fold_groups` | A little: ~1.3 biome points |
 | 10 | Can we flag samples Metalog does not cover? | `6b_coverage.py`, `coverage_check.py` | Yes (8.5 % of the atlas); within Metalog the probability already holds this signal |
 | 11–13 | How are plant / food samples labelled; does keeping PO / FOODON help? | `5_evaluate.py` on old vs new labels | Plant feature +10 points, plant material back-off answers 23 → 49 % |
@@ -34,6 +34,7 @@ folds, ≤ 50 samples per study (17.7k samples, 539 studies). Biome excludes hum
 | 18 | Should human samples get a biome label (the obsolete human biome mapped to animal-associated environment)? | `human_biome.py` | No: they are all right (+14 points micro, nothing learned), the prototype loses 9 points on animal samples, and the 90 % back-off threshold gives 82 % on non-human samples. Keep blank, report separately |
 | 19 | Questions from the deck review (Oct 2026): label ceiling on near-duplicates, retrieval ablation and slot subsets, feature / material maps, back-off vs answering everything, cap, balancing, encoders, clusters, atlas checks | `deck_review/` (see `deck_review/README.md`) | 61 / 81 / 96 % of errors on near-duplicates are curator disagreements; restricting biome to ENVO biomes makes zero-shot 13× better; a reviewed feature map would add ~3 points; back-off trades exact answers for 3–6× fewer errors |
 | 20 | Does the LLM-checked biome label map improve the model? | `draft_biome_label_map.py --llm`, `biome_map_compare.py` | Taken as is, no (−2 points top-1 for linear / knn_study on samples it does not relabel). A reviewed mix (11 LLM choices, 4 own, rest as now) gives +1.3 points for the production prototype and ±0 for the others; to be confirmed by a researcher |
+| 21 | When the probability is split between branches, should we answer with several terms? Do better decision rules (conformal sets, expected value) help? | `set_valued.py` | Biome yes: back-off + a 2-term set where it abstains answers 94.5 % instead of 75.7 % at 90 % accuracy, exact unchanged; expected-value single-term decoding +5.6 exact. Feature / material: ≤ 2 points unless a reviewer resolves the set. Reviewer score with d 0.7 keeps more exact single answers than the credit score on every slot; unused ontology terms add ~3 points answered to back-off + set (biome, feature) but not to the reviewer score (feature exact 49 → 6 %). The reviewer score d 0.7 is now the pipeline's set answer (steps 5–6); restricting broad terms gives no more useful answers (§21, 11-12) |
 | – | Is step 6 the model of step 5? | `verify_atlas_methods.py` | Identical top-1 for every method and slot |
 
 `run_all.sh` reproduces §1–4 (≈ 1.5–3 h). `_setup.py` holds the shared loading code.
@@ -582,6 +583,25 @@ consistent on the 24 linked gold samples). The 2026-10-05 material drop is rhizo
 convention, counted as "not plant"). Out of domain the model abstains more rather than erring more; weak spots:
 plant anatomy, food, laboratory, air.
 
+**Set answers on the gold samples** (`gold_check_sets.py`, atlas_sets_g, 2026-11-12; 1,021 samples; lenient = a term
+compatible with the gold coarse biome; 'any' = one of the set's terms, 'split' = mean over its terms):
+
+| | biome | feature | material |
+|---|---|---|---|
+| answered: set rule / back-off | 1.00 / 0.58 | 0.28 / 0.16 | 0.66 / 0.50 |
+| lenient among answered: set rule any ; split / back-off | 0.95 ; 0.74 / 0.93 | 0.89 ; 0.87 / 0.89 | 0.73 ; 0.66 / 0.74 |
+| sets (share of samples) / sets with a compatible term / decisive (all terms one coarse biome) | 0.42 / 0.99 / 0.03 | 0.15 / 0.86 / 0.91 | 0.24 / 0.63 / 0.31 |
+| on the back-off's abstentions: answered / lenient any ; split | 1.00 / 0.98 ; 0.51 | 0.15 / 0.88 ; 0.85 | 0.33 / 0.65 ; 0.43 |
+| re-weighted to the atlas mix: answered / lenient any (back-off) | 1.00 / 0.98 (0.72 / 0.96) | 0.41 / 0.90 (0.31 / 0.87) | 0.57 / 0.86 (0.43 / 0.83) |
+| flagged: n / top-1 compatible / runner-up / either | 98 / 0.40 / 0.70 / 0.98 | 75 / 0.83 / 0.85 / 0.87 | 125 / 0.58 / 0.62 / 0.83 |
+
+- Biome sets are realm choices (terrestrial | animal-associated for 101 of the 210 plant samples): almost always one
+  term is right, but the set does not pin the coarse biome (decisive 3 %), so it is a 2-option review, not a label.
+- Flagged biome samples: the runner-up is right more often than the top-1 (70 vs 40 %): mostly plant samples whose
+  top-1 is animal-associated with cropland as runner-up (26 of 98), the plant weakness of §8.
+- Material sets fail on plant and "other" samples (soil | organic material for rhizosphere / leaf samples: Metalog's
+  convention, counted as not plant, as above).
+
 ## 9. Project-level folds (`project_groups.py`)
 
 Study codes sharing an SRA study / BioProject accession are merged (Stewart 2018/2019, Alneberg 2018/2020), plus
@@ -908,6 +928,330 @@ python experiments/biome_map_compare.py --runs $X/runs --arms current llm review
   --output $X/results
 ```
 
+## 21. More than one answer: set-valued decoding over the DAG (`set_valued.py`; 2026-11-09)
+
+When the probability is split between unrelated branches (host-associated or terrestrial? waste water or the
+treatment plant?), the back-off can only abstain. Tested: answering with a small set of terms, and better
+single-term decoding, on the production prototype's out-of-fold probabilities (project-grouped folds, seeds 0–2).
+
+```bash
+for s in 0 1 2; do
+python experiments/set_valued.py \
+  --samples ~/MicrobeAtlasProject/metalog/clean/training_set.clean.tsv.gz \
+  --fold_groups ~/MicrobeAtlasProject/metalog/clean/project_groups.tsv \
+  --envo_obo ~/MicrobeAtlasProject/ontologies/envo.obo --answers ontology --fold_seed $s \
+  --output_dir ~/MicrobeAtlasProject/ontology_mapping/experiments/set_valued/seed$s   # ~15 min each
+done
+# study pooling (seed 0): add --study_pool 0.3 (or 0.6) --no_rules and another --output_dir
+```
+
+**Methods** (all thresholds chosen on the other folds: most answers at ≥ 90 % accuracy among answered, where a set is
+right if one of its terms is the gold label or an ancestor of it):
+
+| method | rule |
+|---|---|
+| back-off | production: most specific allowed node on the top-1 path with summed probability ≥ τ |
+| conformal, ≤ k terms | smallest set (fewest labels below) of ≤ k unrelated nodes whose summed probability ≥ τ (Zhang, Li & Bastani, *Conformal Structured Prediction*, ICLR 2025; τ cross-fitted, not split-conformal) |
+| expected value, ≤ k terms | set maximising E[credit] − λ·P(wrong), credit = min(1, IC(set) / IC(gold)); abstain if ≤ 0 (Bayes-optimal set-valued prediction: Mortier et al., DAMI 2021; Mortier, Hüllermeier, Dembczyński & Waegeman 2022) |
+| back-off + set | back-off; where it abstains, a conformal ≤ 2-term set with its own τ (tuned on the other folds' abstentions) |
+| expected value 1 + set | expected value, 1 term; where it abstains, an expected-value ≤ 2-term set |
+| reviewer score, d (`evr_d<d>`, 2026-11-11) | expected value of a different score: a set is worth the credit of its best term covering gold, times d for each term beyond the first (`--discounts`, default 0.7 0.8 0.9 1); d = 1 does not penalise sets, d → 0 is the 1-term rule |
+| `backoff@onto`, `backoff+set@onto` (2026-11-11) | with `--answers ontology`: back-off and back-off + set where ENVO / UBERON terms no curator used can be answers too (`Closure(answers="ontology")`); kept to back-off-based rules, because expected value with them picks broad terms (feature exact 50 → 5 %, seed 0) |
+
+**Scores** are over every labelled sample (abstain = 0). *Exact* = a single term equal to gold. *Set credit* =
+min(1, IC(set) / IC(gold)) if the set covers gold, IC(set) = −log of the training share of the labels it covers (a
+2-term set gets less than either term). Rule scores use §15's rules with two set conventions: **any** (a set scores if
+one term does: a reviewer picks the right one) and **split** (mean over its terms: a random pick).
+
+**Summary, mean of fold seeds 0–2** (`summary.tsv`; %, credit as a fraction):
+
+| method | biome: answered / accuracy / exact / sets / set credit | feature | material |
+|---|---|---|---|
+| top-1 (answers all) | 100.0 / 74.9 / 64.7 / 0.0 / – | 100.0 / 64.6 / 63.2 / 0.0 / – | 100.0 / 75.6 / 72.5 / 0.0 / – |
+| back-off (production) | 75.7 / 90.3 / 44.9 / 0.0 / 0.472 | 59.1 / 90.1 / 50.3 / 0.0 / 0.521 | 80.8 / 90.2 / 66.9 / 0.0 / 0.686 |
+| conformal, 1 term | 75.7 / 90.3 / 44.9 / 0.0 / 0.472 | 59.1 / 90.1 / 50.3 / 0.0 / 0.521 | 80.8 / 90.2 / 66.9 / 0.0 / 0.686 |
+| expected value, 1 term | 81.4 / 89.9 / 50.5 / 0.0 / 0.514 | 60.5 / 90.1 / 50.9 / 0.0 / 0.532 | 82.9 / 90.1 / 65.9 / 0.0 / 0.692 |
+| conformal, ≤ 2 terms | 94.1 / 90.1 / 40.7 / 26.7 / 0.521 | 64.9 / 90.3 / 46.9 / 13.6 / 0.543 | 85.3 / 90.5 / 62.2 / 13.8 / 0.700 |
+| expected value, ≤ 2 terms | 94.7 / 89.9 / 44.4 / 26.1 / 0.558 | 69.1 / 90.9 / 45.2 / 21.2 / 0.579 | 87.3 / 89.9 / 52.1 / 28.9 / 0.705 |
+| conformal, ≤ 3 terms | 99.9 / 90.3 / 40.6 / 33.9 / 0.530 | 68.2 / 90.4 / 46.1 / 18.2 / 0.559 | 86.8 / 90.4 / 59.4 / 19.9 / 0.696 |
+| expected value, ≤ 3 terms | 96.9 / 90.0 / 45.2 / 27.7 / 0.565 | 73.8 / 90.2 / 45.2 / 25.9 / 0.598 | 88.7 / 90.0 / 51.7 / 30.7 / 0.701 |
+| back-off + 2-term set on abstentions | 94.5 / 90.3 / 45.3 / 17.9 / 0.529 | 60.8 / 89.7 / 50.3 / 1.7 / 0.529 | 82.7 / 90.0 / 66.9 / 1.8 / 0.694 |
+| same, sets at an 80 % target | 99.4 / 88.1 / 49.3 / 14.9 / 0.565 | 65.4 / 88.7 / 50.3 / 6.3 / 0.552 | 84.3 / 89.8 / 66.9 / 3.5 / 0.700 |
+| expected value 1 term + 2-term set on abstentions | 91.0 / 89.5 / 50.5 / 9.3 / 0.549 | 62.7 / 89.7 / 50.9 / 2.2 / 0.544 | 84.2 / 90.0 / 65.9 / 1.4 / 0.699 |
+
+Conformal, 1 term gives exactly the back-off's answers on every seed (a check of both implementations).
+
+**Set credit minus back-off, in points, seeds 0 / 1 / 2 [95 % study bootstrap, seed 0]:**
+
+| method | biome | feature | material |
+|---|---|---|---|
+| conformal, 1 term | +0.0 / +0.0 / +0.0 [+0.0, +0.0] | +0.0 / +0.0 / +0.0 [-0.0, +0.0] | +0.0 / +0.0 / +0.0 [-0.0, -0.0] |
+| expected value, 1 term | +3.3 / +4.1 / +5.3 [+1.9, +4.8] | +0.6 / +1.0 / +1.6 [-0.2, +1.5] | +0.3 / +0.5 / +0.9 [-0.6, +1.2] |
+| conformal, ≤ 2 terms | +2.9 / +6.7 / +5.3 [+1.2, +4.5] | +1.8 / +3.5 / +1.5 [+0.4, +3.3] | +1.3 / +1.3 / +1.6 [+0.4, +2.6] |
+| expected value, ≤ 2 terms | +7.3 / +9.4 / +9.1 [+5.3, +9.7] | +5.2 / +6.8 / +5.4 [+3.7, +6.9] | +1.5 / +1.9 / +2.0 [+0.3, +2.8] |
+| conformal, ≤ 3 terms | +3.8 / +7.7 / +6.0 [+2.0, +5.6] | +3.0 / +5.5 / +3.0 [+1.3, +5.0] | +1.0 / +0.6 / +1.3 [-0.0, +2.3] |
+| expected value, ≤ 3 terms | +8.3 / +10.6 / +9.1 [+5.9, +10.6] | +7.4 / +8.6 / +7.1 [+5.7, +9.3] | +1.1 / +1.6 / +1.7 [-0.2, +2.5] |
+| back-off + 2-term set on abstentions | +5.1 / +6.6 / +5.5 [+3.8, +6.5] | +1.0 / +0.6 / +1.0 [+0.3, +1.9] | +1.2 / +0.5 / +0.5 [+0.6, +2.1] |
+| same, sets at an 80 % target | +8.6 / +10.6 / +9.0 [+6.4, +10.8] | +2.6 / +4.5 / +2.2 [+1.6, +3.9] | +1.5 / +1.5 / +1.2 [+0.8, +2.3] |
+| expected value 1 term + 2-term set on abstentions | +5.5 / +8.8 / +8.8 [+3.8, +7.4] | +1.9 / +2.7 / +2.3 [+0.8, +3.2] | +1.0 / +1.5 / +1.3 [-0.0, +2.2] |
+
+**Sets added where the back-off abstains** (`decisions.tsv.gz`): share of all samples, and share of them right (held
+out), seeds 0 / 1 / 2:
+
+| | biome | feature | material |
+|---|---|---|---|
+| back-off + set | 17.4 / 20.7 / 18.1 %, right 89 / 90 / 91 % | 2.4 / 1.3 / 1.5 %, right 63 / 77 / 95 % | 2.2 / 1.4 / 1.8 %, right 91 / 82 / 67 % |
+| same, sets at 80 % | 21.8 / 26.3 / 22.9 %, right 81 / 81 / 81 % | 5.4 / 8.8 / 4.8 %, right 75 / 80 / 68 % | 3.5 / 3.3 / 3.7 %, right 78 / 80 / 78 % |
+| expected value 1 + set | 6.6 / 12.4 / 9.8 %, right 81 / 88 / 88 % | 2.3 / 3.2 / 1.2 %, right 79 / 80 / 81 % | 1.4 / 2.1 / 0.7 %, right 90 / 89 / 86 % |
+
+Commonest sets (back-off + set, seed 0, share right): biome (1,668 samples) animal-associated environment + terrestrial
+biome 328 (86 %), anthropogenic terrestrial + urban biome 268 (64 %), animal-associated environment + aquatic biome
+258 (97 %), aquatic + terrestrial biome 221 (100 %), animal-associated environment + anthropogenic terrestrial biome
+153 (86 %); feature (419) waste water + wastewater treatment plant 212 (69 %), agricultural field + soil 61 (41 %),
+marine photic zone + water body 48 (100 %), peatland + soil 30 (100 %), brackish water + water body 28 (0 %);
+material (395) activated sludge + waste water 141 (87 %), rumen + ruminal fluid 58 (95 %), organic material + soil 55
+(100 %), liquid water + sediment 53 (94 %).
+
+**§15's rules, mean of seeds 0–2** (`rule_scores.tsv`): micro / macro / macro over learnable labels, %. Single-answer
+methods score the same under both conventions.
+
+Biome, any:
+
+| measure | top-1 (answers all) | back-off (production) | expected value, 1 term | conformal, ≤ 2 terms | expected value, ≤ 2 terms | back-off + set | EV 1 + set |
+|---|---|---|---|---|---|---|---|
+| exact | 64.7 / 25.5 / 42.8 | 44.9 / 12.8 / 21.5 | 50.5 / 16.1 / 27.0 | 55.3 / 16.9 / 28.3 | 59.7 / 20.2 / 33.9 | 55.1 / 16.1 / 27.0 | 56.0 / 18.5 / 31.0 |
+| broader | 74.9 / 71.1 / 75.9 | 68.4 / 67.0 / 71.9 | 73.2 / 70.2 / 75.4 | 84.8 / 82.0 / 84.8 | 85.1 / 82.0 / 85.7 | 85.3 / 82.0 / 85.2 | 81.5 / 78.2 / 82.6 |
+| narrower | 76.1 / 29.8 / 50.1 | 48.7 / 14.2 / 23.9 | 53.9 / 17.4 / 29.3 | 60.4 / 18.9 / 31.7 | 64.3 / 22.0 / 36.9 | 59.3 / 17.7 / 29.8 | 59.9 / 20.0 / 33.6 |
+| synonyms | 65.3 / 30.2 / 50.8 | 45.0 / 13.9 / 23.3 | 50.7 / 17.7 / 29.7 | 55.4 / 17.3 / 29.1 | 60.1 / 23.0 / 38.2 | 55.2 / 17.2 / 28.9 | 56.3 / 20.2 / 33.7 |
+| co-labels | 73.5 / 30.5 / 51.3 | 57.5 / 19.7 / 33.0 | 62.8 / 22.9 / 38.4 | 70.9 / 25.0 / 42.1 | 73.1 / 27.7 / 46.5 | 69.6 / 23.8 / 40.0 | 69.4 / 25.8 / 43.4 |
+| facets | 64.7 / 25.5 / 42.8 | 44.9 / 12.8 / 21.5 | 50.5 / 16.1 / 27.0 | 55.3 / 16.9 / 28.3 | 59.7 / 20.2 / 33.9 | 55.1 / 16.1 / 27.0 | 56.0 / 18.5 / 31.0 |
+| synonyms + co-labels | 74.1 / 35.3 / 59.3 | 57.7 / 20.8 / 34.9 | 63.0 / 24.5 / 41.1 | 71.0 / 25.5 / 42.8 | 73.5 / 30.5 / 50.8 | 69.8 / 24.9 / 41.9 | 69.6 / 27.5 / 46.0 |
+| all | 87.0 / 75.7 / 83.6 | 72.2 / 68.5 / 74.4 | 76.7 / 71.5 / 77.7 | 90.2 / 84.1 / 88.4 | 90.1 / 84.0 / 89.0 | 89.9 / 83.8 / 88.2 | 85.7 / 79.9 / 85.3 |
+| credit depth 0.5^k | 68.9 / 41.7 / 56.9 | 54.7 / 29.7 / 41.0 | 59.7 / 32.6 / 45.4 | 67.2 / 36.7 / 49.8 | 69.8 / 39.3 / 53.9 | 67.2 / 36.3 / 49.1 | 66.3 / 36.3 / 50.5 |
+| credit IC ratio | 69.8 / 44.0 / 57.1 | 56.3 / 30.9 / 41.1 | 61.5 / 34.1 / 45.8 | 69.6 / 38.1 / 50.6 | 71.9 / 41.1 / 54.5 | 69.5 / 38.0 / 49.6 | 68.3 / 38.0 / 51.1 |
+| credit full credit | 74.9 / 71.1 / 75.9 | 68.4 / 67.0 / 71.9 | 73.2 / 70.2 / 75.4 | 84.8 / 82.0 / 84.8 | 85.1 / 82.0 / 85.7 | 85.3 / 82.0 / 85.2 | 81.5 / 78.2 / 82.6 |
+| credit hierarchical F | 90.6 / 83.8 / 89.4 | 71.1 / 64.9 / 69.4 | 76.0 / 68.2 / 73.5 | 88.0 / 78.9 / 83.9 | 88.7 / 79.6 / 85.5 | 87.8 / 78.8 / 83.8 | 84.8 / 76.3 / 82.7 |
+
+Biome, split:
+
+| measure | top-1 (answers all) | back-off (production) | expected value, 1 term | conformal, ≤ 2 terms | expected value, ≤ 2 terms | back-off + set | EV 1 + set |
+|---|---|---|---|---|---|---|---|
+| exact | 64.7 / 25.5 / 42.8 | 44.9 / 12.8 / 21.5 | 50.5 / 16.1 / 27.0 | 48.0 / 13.5 / 22.6 | 52.0 / 16.7 / 28.0 | 50.2 / 14.5 / 24.4 | 53.3 / 17.3 / 29.1 |
+| broader | 74.9 / 71.1 / 75.9 | 68.4 / 67.0 / 71.9 | 73.2 / 70.2 / 75.4 | 73.2 / 70.0 / 72.9 | 73.6 / 68.4 / 75.2 | 77.2 / 75.8 / 78.8 | 77.5 / 74.3 / 79.1 |
+| narrower | 76.1 / 29.8 / 50.1 | 48.7 / 14.2 / 23.9 | 53.9 / 17.4 / 29.3 | 52.7 / 15.3 / 25.7 | 56.3 / 18.3 / 30.8 | 54.2 / 16.1 / 27.0 | 57.0 / 18.7 / 31.4 |
+| synonyms | 65.3 / 30.2 / 50.8 | 45.0 / 13.9 / 23.3 | 50.7 / 17.7 / 29.7 | 48.1 / 13.9 / 23.3 | 52.4 / 19.4 / 32.3 | 50.4 / 15.6 / 26.3 | 53.5 / 19.0 / 31.7 |
+| co-labels | 73.5 / 30.5 / 51.3 | 57.5 / 19.7 / 33.0 | 62.8 / 22.9 / 38.4 | 62.1 / 21.0 / 35.2 | 64.1 / 23.5 / 39.4 | 63.9 / 21.9 / 36.7 | 66.2 / 24.4 / 40.9 |
+| facets | 64.7 / 25.5 / 42.8 | 44.9 / 12.8 / 21.5 | 50.5 / 16.1 / 27.0 | 48.0 / 13.5 / 22.6 | 52.0 / 16.7 / 28.0 | 50.2 / 14.5 / 24.4 | 53.3 / 17.3 / 29.1 |
+| synonyms + co-labels | 74.1 / 35.3 / 59.3 | 57.7 / 20.8 / 34.9 | 63.0 / 24.5 / 41.1 | 62.1 / 21.4 / 36.0 | 64.5 / 26.2 / 43.7 | 64.1 / 23.0 / 38.6 | 66.4 / 26.0 / 43.6 |
+| all | 87.0 / 75.7 / 83.6 | 72.2 / 68.5 / 74.4 | 76.7 / 71.5 / 77.7 | 78.3 / 72.0 / 76.3 | 78.2 / 70.2 / 78.1 | 81.6 / 77.6 / 81.7 | 81.4 / 75.9 / 81.7 |
+| credit depth 0.5^k | 68.9 / 41.7 / 56.9 | 54.7 / 29.7 / 41.0 | 59.7 / 32.6 / 45.4 | 58.4 / 30.8 / 41.9 | 60.9 / 33.2 / 46.3 | 61.2 / 33.2 / 45.2 | 63.0 / 34.5 / 48.0 |
+| credit IC ratio | 69.8 / 44.0 / 57.1 | 56.3 / 30.9 / 41.1 | 61.5 / 34.1 / 45.8 | 60.4 / 32.2 / 42.5 | 62.6 / 34.9 / 46.7 | 63.2 / 34.7 / 45.5 | 65.0 / 36.1 / 48.5 |
+| credit full credit | 74.9 / 71.1 / 75.9 | 68.4 / 67.0 / 71.9 | 73.2 / 70.2 / 75.4 | 73.2 / 70.0 / 72.9 | 73.6 / 68.4 / 75.2 | 77.2 / 75.8 / 78.8 | 77.5 / 74.3 / 79.1 |
+| credit hierarchical F | 90.6 / 83.8 / 89.4 | 71.1 / 64.9 / 69.4 | 76.0 / 68.2 / 73.5 | 82.6 / 74.7 / 78.9 | 83.6 / 75.1 / 80.8 | 83.7 / 76.0 / 80.4 | 82.7 / 74.5 / 80.4 |
+
+Feature, any:
+
+| measure | top-1 (answers all) | back-off (production) | expected value, 1 term | conformal, ≤ 2 terms | expected value, ≤ 2 terms | back-off + set | EV 1 + set |
+|---|---|---|---|---|---|---|---|
+| exact | 63.2 / 8.4 / 24.2 | 50.3 / 3.1 / 9.0 | 50.9 / 3.3 / 9.6 | 54.0 / 4.8 / 14.0 | 54.1 / 5.1 / 14.6 | 50.9 / 3.3 / 9.6 | 51.5 / 3.6 / 10.3 |
+| broader | 64.6 / 12.1 / 26.5 | 53.3 / 5.7 / 13.1 | 54.4 / 5.6 / 12.9 | 58.6 / 9.2 / 21.0 | 62.8 / 11.9 / 27.0 | 54.6 / 6.5 / 14.5 | 56.2 / 6.6 / 15.1 |
+| narrower | 64.9 / 10.7 / 28.0 | 50.8 / 3.4 / 9.9 | 51.0 / 3.4 / 9.9 | 54.3 / 5.0 / 14.5 | 54.2 / 5.2 / 14.9 | 51.4 / 3.6 / 10.5 | 51.6 / 3.7 / 10.6 |
+| synonyms | 63.9 / 9.6 / 26.3 | 50.3 / 3.2 / 9.0 | 51.0 / 3.8 / 9.9 | 54.2 / 5.2 / 14.3 | 54.3 / 5.7 / 14.9 | 50.9 / 3.5 / 9.6 | 51.6 / 4.1 / 10.5 |
+| co-labels | 64.7 / 9.0 / 26.0 | 51.1 / 3.3 / 9.6 | 51.8 / 3.5 / 10.2 | 55.2 / 5.2 / 14.9 | 55.5 / 5.4 / 15.7 | 51.7 / 3.5 / 10.2 | 52.3 / 3.8 / 10.9 |
+| facets | 67.1 / 13.3 / 34.3 | 50.6 / 3.7 / 9.1 | 51.5 / 4.6 / 10.6 | 55.2 / 6.8 / 17.2 | 55.9 / 7.5 / 18.3 | 51.3 / 4.0 / 9.9 | 52.2 / 4.9 / 11.5 |
+| synonyms + co-labels | 65.4 / 10.2 / 28.2 | 51.1 / 3.4 / 9.6 | 51.9 / 4.0 / 10.5 | 55.4 / 5.6 / 15.2 | 55.7 / 6.1 / 16.0 | 51.8 / 3.7 / 10.2 | 52.5 / 4.3 / 11.1 |
+| all | 71.2 / 19.8 / 41.7 | 54.5 / 6.7 / 14.2 | 55.5 / 6.9 / 14.2 | 59.7 / 10.8 / 23.2 | 63.9 / 13.8 / 29.2 | 55.8 / 7.5 / 15.7 | 57.3 / 8.0 / 16.4 |
+| credit depth 0.5^k | 63.9 / 10.0 / 25.3 | 51.5 / 3.9 / 10.3 | 52.4 / 4.2 / 11.0 | 55.9 / 6.6 / 16.5 | 57.4 / 7.7 / 19.1 | 52.2 / 4.3 / 11.1 | 53.2 / 4.7 / 12.0 |
+| credit IC ratio | 64.3 / 10.8 / 26.0 | 52.5 / 4.6 / 11.6 | 53.7 / 4.9 / 12.1 | 57.3 / 7.5 / 18.3 | 60.8 / 9.5 / 23.1 | 53.6 / 5.1 / 12.8 | 55.2 / 5.7 / 13.8 |
+| credit full credit | 64.6 / 12.1 / 26.5 | 53.3 / 5.7 / 13.1 | 54.4 / 5.6 / 12.9 | 58.6 / 9.2 / 21.0 | 62.8 / 11.9 / 27.0 | 54.6 / 6.5 / 14.5 | 56.2 / 6.6 / 15.1 |
+| credit hierarchical F | 73.8 / 32.1 / 48.4 | 54.3 / 7.5 / 15.5 | 55.1 / 7.5 / 15.2 | 60.1 / 12.7 / 25.2 | 63.5 / 15.5 / 29.9 | 55.6 / 8.4 / 17.2 | 56.8 / 8.7 / 17.6 |
+
+Feature, split:
+
+| measure | top-1 (answers all) | back-off (production) | expected value, 1 term | conformal, ≤ 2 terms | expected value, ≤ 2 terms | back-off + set | EV 1 + set |
+|---|---|---|---|---|---|---|---|
+| exact | 63.2 / 8.4 / 24.2 | 50.3 / 3.1 / 9.0 | 50.9 / 3.3 / 9.6 | 50.5 / 3.6 / 10.4 | 49.7 / 3.7 / 10.7 | 50.6 / 3.2 / 9.3 | 51.2 / 3.4 / 9.9 |
+| broader | 64.6 / 12.1 / 26.5 | 53.3 / 5.7 / 13.1 | 54.4 / 5.6 / 12.9 | 53.5 / 6.1 / 14.7 | 54.3 / 7.4 / 17.0 | 53.9 / 6.1 / 13.8 | 55.3 / 6.1 / 14.0 |
+| narrower | 64.9 / 10.7 / 28.0 | 50.8 / 3.4 / 9.9 | 51.0 / 3.4 / 9.9 | 50.8 / 3.8 / 10.9 | 49.8 / 3.8 / 10.9 | 51.1 / 3.5 / 10.2 | 51.3 / 3.5 / 10.2 |
+| synonyms | 63.9 / 9.6 / 26.3 | 50.3 / 3.2 / 9.0 | 51.0 / 3.8 / 9.9 | 50.6 / 3.9 / 10.6 | 49.8 / 4.1 / 10.9 | 50.6 / 3.3 / 9.3 | 51.3 / 3.9 / 10.2 |
+| co-labels | 64.7 / 9.0 / 26.0 | 51.1 / 3.3 / 9.6 | 51.8 / 3.5 / 10.2 | 52.2 / 4.0 / 11.7 | 51.7 / 4.0 / 11.6 | 51.4 / 3.4 / 9.9 | 52.1 / 3.7 / 10.6 |
+| facets | 67.1 / 13.3 / 34.3 | 50.6 / 3.7 / 9.1 | 51.5 / 4.6 / 10.6 | 51.3 / 4.9 / 12.1 | 50.9 / 5.3 / 12.8 | 50.9 / 3.9 / 9.5 | 51.9 / 4.7 / 11.0 |
+| synonyms + co-labels | 65.4 / 10.2 / 28.2 | 51.1 / 3.4 / 9.6 | 51.9 / 4.0 / 10.5 | 52.3 / 4.3 / 11.8 | 51.8 / 4.4 / 11.9 | 51.5 / 3.5 / 9.9 | 52.2 / 4.2 / 10.8 |
+| all | 71.2 / 19.8 / 41.7 | 54.5 / 6.7 / 14.2 | 55.5 / 6.9 / 14.2 | 55.7 / 7.8 / 17.5 | 57.2 / 9.3 / 20.0 | 55.2 / 7.1 / 15.0 | 56.5 / 7.5 / 15.4 |
+| credit depth 0.5^k | 63.9 / 10.0 / 25.3 | 51.5 / 3.9 / 10.3 | 52.4 / 4.2 / 11.0 | 51.8 / 4.6 / 12.1 | 51.4 / 5.1 / 13.0 | 51.8 / 4.1 / 10.7 | 52.8 / 4.5 / 11.5 |
+| credit IC ratio | 64.3 / 10.8 / 26.0 | 52.5 / 4.6 / 11.6 | 53.7 / 4.9 / 12.1 | 52.6 / 5.1 / 13.1 | 53.2 / 6.1 / 15.0 | 53.0 / 4.8 / 12.2 | 54.5 / 5.3 / 12.9 |
+| credit full credit | 64.6 / 12.1 / 26.5 | 53.3 / 5.7 / 13.1 | 54.4 / 5.6 / 12.9 | 53.5 / 6.1 / 14.7 | 54.3 / 7.4 / 17.0 | 53.9 / 6.1 / 13.8 | 55.3 / 6.1 / 14.0 |
+| credit hierarchical F | 73.8 / 32.1 / 48.4 | 54.3 / 7.5 / 15.5 | 55.1 / 7.5 / 15.2 | 55.8 / 9.6 / 19.6 | 56.6 / 11.4 / 21.9 | 55.1 / 8.1 / 16.6 | 56.1 / 8.3 / 16.7 |
+
+Material, any:
+
+| measure | top-1 (answers all) | back-off (production) | expected value, 1 term | conformal, ≤ 2 terms | expected value, ≤ 2 terms | back-off + set | EV 1 + set |
+|---|---|---|---|---|---|---|---|
+| exact | 72.5 / 7.1 / 20.4 | 66.9 / 4.4 / 12.8 | 65.9 / 4.6 / 13.2 | 70.8 / 6.1 / 17.7 | 69.5 / 6.5 / 18.9 | 67.9 / 4.8 / 13.9 | 66.7 / 5.0 / 14.4 |
+| broader | 75.6 / 13.8 / 31.7 | 72.9 / 13.3 / 27.5 | 74.6 / 14.8 / 30.3 | 77.2 / 16.2 / 33.6 | 78.5 / 19.5 / 36.4 | 74.4 / 14.5 / 30.3 | 75.9 / 16.5 / 32.0 |
+| narrower | 74.1 / 9.6 / 24.0 | 67.5 / 5.9 / 13.9 | 66.4 / 5.9 / 13.7 | 71.5 / 7.7 / 19.2 | 70.1 / 8.2 / 19.8 | 68.6 / 6.3 / 15.3 | 67.1 / 6.3 / 14.9 |
+| synonyms | 72.8 / 7.9 / 20.7 | 66.9 / 4.7 / 12.9 | 66.0 / 5.0 / 13.4 | 70.9 / 6.5 / 17.9 | 69.6 / 6.9 / 19.1 | 67.9 / 5.1 / 14.0 | 66.8 / 5.4 / 14.5 |
+| co-labels | 74.1 / 8.4 / 24.3 | 69.0 / 5.9 / 17.0 | 68.7 / 6.1 / 17.7 | 73.0 / 7.7 / 22.2 | 71.7 / 8.0 / 23.0 | 70.1 / 6.3 / 18.2 | 69.6 / 6.5 / 18.9 |
+| facets | 73.1 / 9.0 / 20.7 | 67.3 / 6.0 / 12.9 | 66.3 / 6.0 / 13.4 | 71.2 / 7.6 / 17.9 | 70.0 / 8.0 / 19.2 | 68.3 / 6.3 / 14.0 | 67.1 / 6.4 / 14.5 |
+| synonyms + co-labels | 74.4 / 9.2 / 24.4 | 69.1 / 6.2 / 17.1 | 68.8 / 6.5 / 17.8 | 73.0 / 8.0 / 22.4 | 71.7 / 8.3 / 23.2 | 70.1 / 6.6 / 18.3 | 69.6 / 7.0 / 19.1 |
+| all | 77.8 / 18.4 / 35.8 | 74.1 / 16.4 / 29.1 | 75.5 / 17.6 / 31.3 | 78.4 / 19.3 / 35.8 | 79.5 / 22.2 / 37.6 | 75.6 / 17.7 / 32.1 | 76.7 / 19.3 / 32.9 |
+| credit depth 0.5^k | 74.0 / 10.2 / 25.7 | 69.5 / 8.1 / 18.5 | 69.6 / 8.7 / 19.8 | 73.6 / 10.3 / 24.1 | 73.2 / 11.7 / 25.6 | 70.7 / 8.8 / 20.4 | 70.6 / 9.6 / 21.2 |
+| credit IC ratio | 74.2 / 10.2 / 25.7 | 70.1 / 7.9 / 19.1 | 70.9 / 8.8 / 20.9 | 74.1 / 10.4 / 24.4 | 74.9 / 12.2 / 27.0 | 71.4 / 8.6 / 20.8 | 72.0 / 9.8 / 22.4 |
+| credit full credit | 75.6 / 13.8 / 31.7 | 72.9 / 13.3 / 27.5 | 74.6 / 14.8 / 30.3 | 77.2 / 16.2 / 33.6 | 78.5 / 19.5 / 36.4 | 74.4 / 14.5 / 30.3 | 75.9 / 16.5 / 32.0 |
+| credit hierarchical F | 84.1 / 38.8 / 47.1 | 75.5 / 20.1 / 31.5 | 76.3 / 21.1 / 33.4 | 80.2 / 27.4 / 41.2 | 80.9 / 33.0 / 46.8 | 77.1 / 22.3 / 34.5 | 77.5 / 23.1 / 35.2 |
+
+Material, split:
+
+| measure | top-1 (answers all) | back-off (production) | expected value, 1 term | conformal, ≤ 2 terms | expected value, ≤ 2 terms | back-off + set | EV 1 + set |
+|---|---|---|---|---|---|---|---|
+| exact | 72.5 / 7.1 / 20.4 | 66.9 / 4.4 / 12.8 | 65.9 / 4.6 / 13.2 | 66.5 / 4.7 / 13.5 | 60.8 / 4.6 / 13.4 | 67.4 / 4.6 / 13.3 | 66.3 / 4.8 / 13.8 |
+| broader | 75.6 / 13.8 / 31.7 | 72.9 / 13.3 / 27.5 | 74.6 / 14.8 / 30.3 | 72.2 / 13.3 / 28.0 | 67.0 / 13.7 / 27.1 | 73.7 / 13.9 / 28.9 | 75.2 / 15.7 / 31.1 |
+| narrower | 74.1 / 9.6 / 24.0 | 67.5 / 5.9 / 13.9 | 66.4 / 5.9 / 13.7 | 67.1 / 5.8 / 14.7 | 61.3 / 6.0 / 14.1 | 68.1 / 6.1 / 14.6 | 66.8 / 6.1 / 14.3 |
+| synonyms | 72.8 / 7.9 / 20.7 | 66.9 / 4.7 / 12.9 | 66.0 / 5.0 / 13.4 | 66.6 / 5.0 / 13.6 | 60.9 / 5.0 / 13.6 | 67.4 / 4.9 / 13.5 | 66.4 / 5.2 / 13.9 |
+| co-labels | 74.1 / 8.4 / 24.3 | 69.0 / 5.9 / 17.0 | 68.7 / 6.1 / 17.7 | 69.3 / 6.3 / 18.4 | 63.4 / 6.1 / 17.8 | 69.7 / 6.1 / 17.7 | 69.2 / 6.3 / 18.4 |
+| facets | 73.1 / 9.0 / 20.7 | 67.3 / 6.0 / 12.9 | 66.3 / 6.0 / 13.4 | 66.9 / 5.7 / 13.6 | 61.1 / 5.8 / 13.6 | 67.8 / 6.2 / 13.5 | 66.7 / 6.2 / 13.9 |
+| synonyms + co-labels | 74.4 / 9.2 / 24.4 | 69.1 / 6.2 / 17.1 | 68.8 / 6.5 / 17.8 | 69.3 / 6.6 / 18.4 | 63.4 / 6.5 / 17.9 | 69.7 / 6.4 / 17.9 | 69.3 / 6.8 / 18.5 |
+| all | 77.8 / 18.4 / 35.8 | 74.1 / 16.4 / 29.1 | 75.5 / 17.6 / 31.3 | 73.9 / 15.8 / 30.3 | 68.8 / 16.6 / 28.9 | 75.0 / 17.1 / 30.7 | 76.2 / 18.5 / 32.1 |
+| credit depth 0.5^k | 74.0 / 10.2 / 25.7 | 69.5 / 8.1 / 18.5 | 69.6 / 8.7 / 19.8 | 69.0 / 8.3 / 19.3 | 63.4 / 8.4 / 18.8 | 70.1 / 8.4 / 19.4 | 70.1 / 9.1 / 20.5 |
+| credit IC ratio | 74.2 / 10.2 / 25.7 | 70.1 / 7.9 / 19.1 | 70.9 / 8.8 / 20.9 | 69.5 / 8.3 / 19.6 | 64.3 / 8.5 / 19.5 | 70.8 / 8.2 / 19.9 | 71.4 / 9.3 / 21.6 |
+| credit full credit | 75.6 / 13.8 / 31.7 | 72.9 / 13.3 / 27.5 | 74.6 / 14.8 / 30.3 | 72.2 / 13.3 / 28.0 | 67.0 / 13.7 / 27.1 | 73.7 / 13.9 / 28.9 | 75.2 / 15.7 / 31.1 |
+| credit hierarchical F | 84.1 / 38.8 / 47.1 | 75.5 / 20.1 / 31.5 | 76.3 / 21.1 / 33.4 | 77.1 / 24.1 / 36.4 | 73.1 / 26.3 / 37.6 | 76.6 / 21.7 / 33.7 | 77.1 / 22.6 / 34.6 |
+
+**Study pooling** (seed 0, `--study_pool`; set credit back-off / expected value 1 term / back-off + set / expected
+value ≤ 2 terms, and top-1 exact):
+
+| pooling | biome | feature | material |
+|---|---|---|---|
+| none | .483 / .516 / .534 / .556; top-1 .655 | .520 / .526 / .529 / .571; .626 | .691 / .694 / .703 / .706; .726 |
+| 0.3 | .475 / .533 / .529 / .561; .656 | .528 / .530 / .535 / .575; .628 | .688 / .692 / .700 / .702; .729 |
+| 0.6 | .478 / .534 / .536 / .554; .661 | .513 / .526 / .523 / .570; .625 | .685 / .690 / .695 / .696; .727 |
+
+**Findings.**
+- Biome: sets help under every rule, average and convention, on all 3 seeds. Back-off + set answers 94.5 % instead of
+  75.7 % at the same 90 % accuracy, its added sets are right 89–91 % of the time held out, exact matches are kept,
+  and credit gains +5 to +7 points (CI excludes 0). The sets are mostly "host-associated or free-living?".
+- Expected value, 1 term (no sets) is a free gain on biome: +5.7 answered, +5.6 exact, +3 to +5 credit; neutral on
+  feature, −1 exact on material.
+- Feature and material: gains mostly come from the lenient 'any' convention (a reviewer resolves the set). Under
+  'split' they are ≤ 3 points, and expected value ≤ 2 terms costs material 6 exact points (it turns single answers
+  into sets). Set thresholds for feature do not transfer between projects (63–95 % right at a 90 % target).
+- Sets replacing single answers (conformal / expected value ≤ k without fallback) lower exact matches; adding sets only
+  where the back-off abstains does not.
+- Study pooling: no gain (≤ 1 point either way).
+
+Limits: thresholds are cross-fitted, not split-conformal (no finite-sample guarantee, and samples within a project are
+not exchangeable); the atlas is shifted (amplicon, non-Metalog habitats), so the 90 % holds on Metalog-like samples
+only; set accuracy is one-of-the-terms; rule scores inherit §15's limits (unreviewed pair kinds, direct ENVO relations).
+
+### Reviewer score, unused ontology terms, masses and flags (2026-11-11)
+
+New outputs: `decisions.tsv.gz` gives each term's summed probability (`masses`, terms ordered by it: the first is the
+primary answer, the rest the alternatives) and the set's (`set_mass`); `flags.tsv.gz` gives per sample and slot the
+top-1, the unrelated runner-up (the most probable of the next 5 labels that is neither an ancestor nor a descendant of
+the top-1 and shares no allowed ancestor with it), `ambiguous_branches` (runner-up probability ≥ `--flag_mass`, 0.2)
+and whether gold was a training label; `flags_summary.tsv` summarises them. All earlier methods give the same answers
+as before on all 3 seeds (0 of 498,861 decisions differ per seed); the `evr_d<d>` rows match the scratch test of
+2026-11-10 within rounding.
+
+**Mean of fold seeds 0–2** (answered / accuracy / exact single term / sets, %; set credit):
+
+| method | biome | feature | material |
+|---|---|---|---|
+| back-off | 75.7 / 90.3 / 44.9 / 0 ; .472 | 59.1 / 90.1 / 50.3 / 0 ; .521 | 80.8 / 90.2 / 66.9 / 0 ; .686 |
+| back-off@onto | 77.3 / 90.5 / 42.5 / 0 ; .473 | 60.0 / 90.4 / 49.7 / 0 ; .523 | 81.0 / 90.1 / 66.6 / 0 ; .686 |
+| back-off + set | 94.5 / 90.3 / 45.3 / 17.9 ; .529 | 60.8 / 89.7 / 50.3 / 1.7 ; .529 | 82.7 / 90.0 / 66.9 / 1.8 ; .694 |
+| back-off + set@onto | **97.6** / 90.5 / 44.1 / 16.0 ; .543 | **64.1** / 89.9 / 49.7 / 4.1 ; .544 | 82.7 / 89.9 / 66.6 / 1.7 ; .692 |
+| expected value ≤ 3 (credit score) | 96.9 / 90.1 / 45.2 / 27.7 ; .565 | 73.8 / 90.2 / 45.2 / 25.9 ; .598 | 88.7 / 90.0 / 51.7 / 30.7 ; .701 |
+| reviewer score, d 0.7 | 100 / 89.6 / **48.5** / 26.8 ; .553 | 70.8 / 89.8 / **49.5** / 14.3 ; .579 | 88.3 / 90.0 / **61.9** / 15.3 ; .696 |
+| reviewer score, d 0.8 | 100 / 89.6 / 46.2 / 32.6 ; .545 | 72.2 / 90.3 / 47.9 / 20.3 ; .580 | 89.2 / 90.0 / 58.5 / 22.9 ; .683 |
+| reviewer score, d 0.9 | 100 / 89.7 / 41.0 / 44.3 ; .515 | 74.3 / 90.5 / 43.6 / 29.0 ; .575 | 90.3 / 90.1 / 52.4 / 33.8 ; .664 |
+| reviewer score, d 1 | 100 / 89.7 / 28.2 / 61.5 ; .435 | 74.8 / 90.4 / 41.7 / 31.6 ; .573 | 90.4 / 90.2 / 46.0 / 41.5 ; .651 |
+
+**§15's information credit, mean of seeds 0–2** (micro / macro over learnable labels, %; reviewer picks = 'any',
+random pick = 'split'):
+
+| method | biome: reviewer picks ; random pick | feature | material |
+|---|---|---|---|
+| back-off | 56.3 / 41.1 ; 56.3 / 41.1 | 52.5 / 11.6 ; 52.5 / 11.6 | 70.1 / 19.1 ; 70.1 / 19.1 |
+| back-off + set | 69.5 / 49.6 ; 63.2 / 45.5 | 53.6 / 12.8 ; 53.0 / 12.2 | 71.4 / 20.8 ; 70.8 / 19.9 |
+| back-off + set@onto | 70.8 / 50.2 ; 65.2 / 46.4 | 55.5 / 15.2 ; 54.1 / 13.6 | 71.2 / 20.9 ; 70.6 / 20.0 |
+| expected value ≤ 3 | 74.3 / 57.6 ; 63.1 / 47.6 | 64.2 / 29.2 ; 52.8 / 15.2 | 75.8 / 31.5 ; 63.4 / 19.8 |
+| reviewer score, d 0.7 | 75.9 / 58.6 ; **65.3 / 49.8** | 61.5 / 23.3 ; **56.1 / 16.3** | 74.8 / 26.4 ; **69.6 / 20.2** |
+| reviewer score, d 0.8 | 76.8 / 59.8 ; 63.7 / 48.2 | 62.8 / 25.9 ; 55.0 / 15.4 | 75.5 / 28.2 ; 67.3 / 18.5 |
+| reviewer score, d 0.9 | 78.0 / 61.5 ; 59.5 / 43.9 | 64.7 / 29.7 ; 52.3 / 13.7 | 76.9 / 31.7 ; 63.2 / 17.1 |
+| reviewer score, d 1 | **78.7 / 63.4** ; 50.2 / 36.3 | **65.3 / 30.4** ; 51.0 / 13.1 | **77.3 / 32.1** ; 59.3 / 16.4 |
+
+**Ambiguous-branches flag** (`flags_summary.tsv`, mean of seeds; runner-up ≥ 0.2): flagged 6.8 / 7.5 / 5.1 % of
+samples (biome / feature / material; range over seeds ≤ 1.6 points), 28.0 / 18.2 / 23.0 % of the back-off abstentions;
+when flagged, the top-1 covers gold 47 / 45 / 29 %, the runner-up 23 / 15 / 26 %, one of the two 69 / 60 / 55 %.
+
+- **The reviewer score's d is a dial between single answers and sets.** d 1 maximises the reviewer-picks scores but
+  turns most answers into sets (biome exact single 28 %); d 0.7 keeps exact single answers above back-off on biome
+  (feature −0.8, material −5 points), beats the credit score (expected value ≤ 3) on exact singles and on random-pick credit for all
+  slots, and gives up 1–3 points of reviewer-picks credit on feature / material (biome gains). All at 89.6–90.5 %.
+- **Unused ontology terms help back-off + set** on biome (+3.1 answered, +1.4 credit) and feature (+3.3, +1.5);
+  material is unchanged. Alone (`backoff@onto`) they add 0.2–1.6 points answered and cost up to 2.4 exact (a climb
+  stops at an unused term instead of a label).
+- **The flag marks genuine two-branch cases**: for flagged samples the top-1 or the runner-up covers gold 55–69 % of
+  the time, against 29–47 % for the top-1 alone, so a 2-option review is worth showing there.
+
+### Reviewer score with unused ontology terms; the rule moves into the pipeline (2026-11-11)
+
+**Unused ENVO / Uberon terms with the reviewer score** (d 0.7 / 0.8, `hierarchy.Closure(answers="ontology")`, fold
+seeds 0–1, scratch test `evr_onto.py`; answered / exact / sets / answers using an unused term, %; reviewer-picks ;
+random-pick information credit, micro):
+
+| slot | labels only, d 0.7 | unused terms too, d 0.7 | labels only, d 0.8 | unused terms too, d 0.8 |
+|---|---|---|---|---|
+| biome | 100 / 48.2 / 26.7 / 0 ; 75.7 ; 65.2 | 100 / 47.2 / 22.1 / 19.6 ; 74.9 ; 66.7 | 100 / 46.3 / 32.3 / 0 | 100 / 46.7 / 31.2 / 20.0 |
+| feature | 70.8 / 49.3 / 14.3 / 0 ; 61.5 ; 56.0 | 74.5 / **6.0** / 17.4 / **79.1** ; 63.2 ; 57.3 | 72.1 / 47.9 / 20.0 / 0 | 76.5 / 5.4 / 23.7 / 82.3 |
+| material | 88.3 / 61.7 / 15.6 / 0 ; 74.9 ; 69.6 | 91.1 / 60.8 / 18.1 / 13.1 ; 76.4 ; 70.4 | 89.7 / 58.7 / 23.5 / 0 | 93.1 / 58.1 / 26.6 / 16.8 |
+
+Not adopted: on feature the rule swaps 79 % of its answers for unused terms that cover the same labels (same mass,
+same information content: a tie the candidate order breaks by id), so exact single answers fall from 49 % to 6 %
+while the credit hardly moves. Material gains 2.8 points answered for 0.9 exact; worth revisiting with a tie-break
+that prefers a label over an unused term covering the same labels.
+
+**In the pipeline** (decisions of 2026-11-11: up to 3 terms, reviewer score d 0.7 for every slot, labels only, sets
+and flags in the atlas output, no review queue yet): candidate_sets, set_table, reviewer_value_pick,
+unrelated_runner_up and cross_fit moved to `hierarchy.py` (this script imports them); `hierarchy.SetDecoder` is their
+vectorised equivalent (inclusion-exclusion over the candidates' pairwise overlaps, exact triples where all three pairs
+overlap). `5_evaluate.py` (`--set_max_terms 3 --set_discount 0.7`, the defaults) cross-fits lambda, writes the set
+columns of `predictions.tsv.gz`, metrics.json `sets` and calibration.json `sets` (curve per lambda, label counts);
+`6_predict_atlas.py` adds `<slot>_answer`, `_answer_p`, `_alternatives`, `_answer_set_p`, `_answer_kind`,
+`_runner_up(_p)` and `_ambiguous_branches`. Check on real data: `hierarchy.oof_sets` on this script's out-of-fold
+probabilities (seed 0) gives the same answers, masses and lambda per fold as `evr_d0.7` for all 45,351 sample-slots;
+decoding costs ~1.5 s per 20,000 samples and slot (~11 min for the 3.44M atlas samples).
+
+### Finer lambda grid; how broad is too broad? (2026-11-12)
+
+**Lambda grid.** `hierarchy.LAMBDAS` now steps by 0.05 up to 5 (before: 0.5 from 2 on). On the first atlas run the
+pooled feature curve reached 89.98 % at lambda 2.0, so 2.5 was used: 67.5 % answered out of fold instead of 70.9 %
+(now lambda 2.05). Biome (0.95) and material (1.6) do not change; on single seeds the feature lambdas above 2 move to
+2.15–2.75. The §21 tables above used the old grid (`ev_m*`, `evr_*` rows where lambda ≥ 2: mostly feature).
+
+**Breadth restrictions on the reviewer score** (scratch `broad_test.py`, d 0.7, lambda cross-fitted for 90 %, mean of
+fold seeds 0–2; % of all samples; useful = answered and gold covered by a term carrying ≥ half of gold's information,
+min(1, IC(term) / IC(gold)) ≥ 0.5; vague set = a set with a term covering ≥ 20 % of the training samples):
+
+| variant | biome: answered / useful / exact / sets (3 terms) / vague / IC split | feature | material |
+|---|---|---|---|
+| as now | 100 / 63.9 / 48.5 / 26.8 (9.1) / 21.2 / 55.2 | 71.5 / 62.4 / 49.6 / 14.8 (2.9) / 3.0 / 55.7 | 88.3 / 73.4 / 61.9 / 15.3 (5.2) / 3.7 / 68.0 |
+| ≤ 2 terms | 98.4 / 63.2 / 47.5 / 26.3 / 19.6 / 54.9 | 69.4 / 61.1 / 49.5 / 13.1 / 2.6 / 55.2 | 87.6 / 73.2 / 62.2 / 14.2 / 3.1 / 68.4 |
+| coverage counts only if useful (credit ≥ 0.3) | 97.1 / 64.6 / 45.5 / 28.0 / 21.4 / 53.4 | 71.3 / 62.3 / 49.6 / 14.6 / 3.0 / 55.6 | 87.2 / 73.5 / 62.1 / 14.5 / 2.3 / 68.0 |
+| coverage counts only if useful (credit ≥ 0.5) | 72.6 / 61.8 / 43.1 / 13.4 / 4.3 / 47.5 | 69.7 / 61.6 / 49.7 / 13.1 / 2.9 / 55.3 | 83.6 / 72.7 / 62.5 / 13.4 / 1.7 / 67.1 |
+| no term ≥ 20 % of samples in a set | 84.3 / 57.7 / 47.1 / 7.8 / 0 / 51.1 | 69.9 / 61.0 / 50.6 / 11.7 / 0 / 55.6 | 87.8 / 73.5 / 63.0 / 12.6 / 0 / 68.6 |
+| a set covers ≤ 50 % of samples | 94.1 / 63.8 / 47.4 / 20.3 / 14.1 / 53.9 | 71.5 / 62.3 / 49.7 / 14.7 / 2.9 / 55.7 | 88.0 / 73.4 / 62.1 / 14.3 / 2.2 / 68.1 |
+
+No restriction gives clearly more useful answers (best: κ 0.3 on biome, +0.7, but −3.0 exact and −1.8 IC split);
+the others turn answers into abstentions at the same 90 % accuracy. The
+reviewer score already prices breadth on the worth side (a broad term earns little credit); a broad term enters a set
+only when the probability it adds is worth more than the 30 % discount, i.e. the model does not know the finer answer.
+The one principled change, counting coverage only where the answer is informative (credit ≥ κ), changes little at
+κ 0.3 and costs biome 27 points answered at κ 0.5. Kept as is; broad sets are better handled in the display (masses,
+the flag, 3-term biome sets shown as "realm unknown").
+
+
 ## Verification (2026-10-05 review)
 
 Every pipeline step was re-run with the reviewed code and compared with the production outputs:
@@ -928,3 +1272,6 @@ Every pipeline step was re-run with the reviewed code and compared with the prod
 | experiments, reviewed vs original code: `gold_check`, `coverage_check`, `coarsen_labels`, `project_groups`, `hierarchical_backoff` | identical (`term_to_coarse_biome.tsv`: same rows, tie order differed; the sort is now deterministic) |
 | `analyses.py` | identical except `granularity` for feature / material at min_support 300 (and material at 100): the bug fix keeps coarsening inside ENVO / Uberon, e.g. material @300: 42 labels, top-1 0.779 (was 31 labels, 0.782) |
 | `draft_biome_label_map.py` (2026-10-27, on the Mac) | identical to the previous version of the script on all 55 biome rows; vs the stored `clean/biome_label_map.tsv`: same to_id, status and evidence, only the example sample text differs (an earlier sample order); rows tied on n_samples are now ordered by id. The flags / per-study / LLM columns are additions |
+| `set_valued.py` (2026-11-09) | reproduces the session analysis behind §21 (claude/set-valued-answers.md): summary identical, rule scores within 5e-5 (4-decimal rounding); conformal, 1 term == back-off on every seed; 63 tests (unit, integration, 19 mutations) |
+| `set_valued.py` reviewer score, `--answers ontology`, masses and flags (2026-11-11) | earlier methods unchanged on seeds 0–2 (0 of 498,861 decisions differ per seed; summary and rule scores identical); `evr_d<d>` matches the scratch test (`ev_reviewer.py`) within 4-decimal rounding; 86 tests (47 unit, 12 integration, 26 + 1 mutations) |
+| set answers in steps 5–6 (`hierarchy.SetDecoder`, 2026-11-11) | `hierarchy.oof_sets` on `set_valued.py`'s seed-0 probabilities = `evr_d0.7`: identical answers, masses and lambda per fold for all 45,351 sample-slots; `SetDecoder` = the per-sample reference on a random two-parent DAG (4 settings x 4 lambdas); set_valued tests unchanged after the move (59 + 28 with the moved mutations); new: 32 hierarchy unit tests and 12 mutations, step 5 +5 tests and 3 mutations, step 6 +8 tests and 4 mutations |
